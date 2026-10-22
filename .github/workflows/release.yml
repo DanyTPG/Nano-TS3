@@ -1,0 +1,201 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (leave empty for latest / tag ref)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_zig: true
+            run_tests: true
+            archive_format: tar
+
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_zig: true
+            run_tests: false
+            archive_format: tar
+
+          - name: linux-armv7
+            os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            use_zig: true
+            run_tests: false
+            archive_format: tar
+
+          - name: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_zig: false
+            run_tests: true
+            archive_format: zip
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up Zig
+        if: matrix.use_zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zig
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Run unit & integration tests
+        if: matrix.run_tests
+        run: cargo test --release
+
+      - name: Build binary (with cargo-zigbuild)
+        if: matrix.use_zig
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build binary (with native cargo)
+        if: "!matrix.use_zig"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Linux release (.tar.gz)
+        if: matrix.archive_format == 'tar'
+        shell: bash
+        run: |
+          mkdir -p pkg
+          cp "target/${{ matrix.target }}/release/nano-ts3" pkg/
+          [ -f "target/${{ matrix.target }}/release/dump_cmd" ] && cp "target/${{ matrix.target }}/release/dump_cmd" pkg/ || true
+          [ -f "target/${{ matrix.target }}/release/test_cmds" ] && cp "target/${{ matrix.target }}/release/test_cmds" pkg/ || true
+          [ -f "README.md" ] && cp README.md pkg/ || true
+
+          ARCHIVE_NAME="nano-ts3-${{ matrix.name }}.tar.gz"
+          tar -czvf "${ARCHIVE_NAME}" -C pkg .
+          sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+
+          # Provide aarch64 alias for arm64 if applicable
+          if [ "${{ matrix.name }}" = "linux-arm64" ]; then
+            cp "${ARCHIVE_NAME}" "nano-ts3-linux-aarch64.tar.gz"
+            cp "${ARCHIVE_NAME}.sha256" "nano-ts3-linux-aarch64.tar.gz.sha256"
+          fi
+
+          mkdir -p dist
+          mv nano-ts3-*.tar.gz* dist/
+
+      - name: Package Windows release (.zip)
+        if: matrix.archive_format == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pkg
+          Copy-Item "target/${{ matrix.target }}/release/nano-ts3.exe" pkg/
+          if (Test-Path "target/${{ matrix.target }}/release/dump_cmd.exe") {
+            Copy-Item "target/${{ matrix.target }}/release/dump_cmd.exe" pkg/
+          }
+          if (Test-Path "target/${{ matrix.target }}/release/test_cmds.exe") {
+            Copy-Item "target/${{ matrix.target }}/release/test_cmds.exe" pkg/
+          }
+          if (Test-Path "README.md") {
+            Copy-Item "README.md" pkg/
+          }
+
+          $archiveName = "nano-ts3-${{ matrix.name }}.zip"
+          Compress-Archive -Path "pkg/*" -DestinationPath $archiveName
+          $hash = (Get-FileHash $archiveName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archiveName" | Out-File "$archiveName.sha256" -Encoding ascii
+
+          New-Item -ItemType Directory -Force -Path dist
+          Move-Item nano-ts3-*.zip* dist/
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nano-ts3-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish to GitHub Releases
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'nano-ts3-*'
+          path: dist
+          merge-multiple: true
+
+      - name: Generate unified SHA256 checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          sha256sum nano-ts3-*.tar.gz nano-ts3-*.zip > SHA256SUMS.txt 2>/dev/null || true
+          echo "Release assets prepared:"
+          ls -lh
+
+      - name: Determine release tag and names
+        id: release_info
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG_NAME="${{ github.ref_name }}"
+            IS_PRERELEASE="false"
+            MAKE_LATEST="true"
+          elif [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG_NAME="${{ github.event.inputs.tag_name }}"
+            IS_PRERELEASE="false"
+            MAKE_LATEST="true"
+          else
+            TAG_NAME="latest"
+            IS_PRERELEASE="true"
+            MAKE_LATEST="false"
+          fi
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "make_latest=${MAKE_LATEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag_name }}
+          name: ${{ steps.release_info.outputs.tag_name == 'latest' && 'Latest Automated Build' || steps.release_info.outputs.tag_name }}
+          draft: false
+          prerelease: ${{ steps.release_info.outputs.is_prerelease == 'true' }}
+          make_latest: ${{ steps.release_info.outputs.make_latest }}
+          files: |
+            dist/*
+          generate_release_notes: true
