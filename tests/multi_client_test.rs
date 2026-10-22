@@ -606,7 +606,7 @@ async fn test_uid_derivation_and_admin_survives_reconnect() {
     );
 
     // Reconnect with the same identity: no privilege-key prompt, admin group.
-    let mut returning =
+    let returning =
         ClientSession::connect_with_secret(server_addr, "Dany", Some(&secret)).await;
     assert_eq!(
         returning.uid, expected_uid,
@@ -645,7 +645,6 @@ async fn test_channelcreate_returns_cid_and_rejects_duplicates() {
     let mut created_cid = None;
     let mut notify_cid = None;
     let mut notify_invoker = None;
-    let mut err_cid = None;
     for _ in 0..10 {
         match admin.recv_command(Duration::from_secs(2)).await {
             Some(cmd) => match cmd.name.as_str() {
@@ -655,8 +654,7 @@ async fn test_channelcreate_returns_cid_and_rejects_duplicates() {
                 }
                 "error" => {
                     assert_eq!(cmd.get("id"), Some("0"));
-                    err_cid = cmd.get("cid").map(|v| v.to_string());
-                    created_cid = err_cid.clone();
+                    created_cid = cmd.get("cid").map(|v| v.to_string());
                     break;
                 }
                 _ => {}
@@ -692,6 +690,343 @@ async fn test_channelcreate_returns_cid_and_rejects_duplicates() {
             "duplicate name must be rejected"
         );
     }
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_channel_edit_and_delete() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "Admin").await;
+    let mut guest = ClientSession::connect(server_addr, "Guest").await;
+
+    // Redeem admin token
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    let _ = admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await;
+
+    // 1. Admin creates channel
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "OriginalName");
+    create.set("channel_topic", "OriginalTopic");
+    create.set("channel_flag_permanent", "1");
+    admin.send_command(&create).await;
+
+    let ch_created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let test_cid = ch_created.get("cid").unwrap().to_string();
+
+    // 2. Guest requests channelgetdescription
+    let mut get_desc = Command::new("channelgetdescription");
+    get_desc.set("cid", &test_cid);
+    guest.send_command(&get_desc).await;
+
+    let desc_cmd = guest
+        .recv_until("notifychanneledited", Duration::from_secs(2))
+        .await
+        .expect("should receive notifychanneledited for description");
+    assert_eq!(desc_cmd.get("cid"), Some(test_cid.as_str()));
+    assert_eq!(desc_cmd.get("reasonid"), Some("9"));
+    let desc_err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("desc error response");
+    assert_eq!(desc_err.get("id"), Some("0"));
+
+    // 3. Guest tries to edit channel -> rejected with 2563
+    let mut guest_edit = Command::new("channeledit");
+    guest_edit.set("cid", &test_cid);
+    guest_edit.set("channel_name", "HackedName");
+    guest.send_command(&guest_edit).await;
+
+    let guest_err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("guest edit error");
+    assert_eq!(guest_err.get("id"), Some("2563"));
+
+    // 4. Admin edits channel -> success and broadcast with reasonid=10
+    let mut admin_edit = Command::new("channeledit");
+    admin_edit.set("cid", &test_cid);
+    admin_edit.set("channel_name", "EditedName");
+    admin_edit.set("channel_topic", "EditedTopic");
+    admin.send_command(&admin_edit).await;
+
+    let guest_sees_edit = guest
+        .recv_until("notifychanneledited", Duration::from_secs(2))
+        .await
+        .expect("guest receives notifychanneledited");
+    assert_eq!(guest_sees_edit.get("cid"), Some(test_cid.as_str()));
+    assert_eq!(guest_sees_edit.get("reasonid"), Some("10"));
+    assert_eq!(guest_sees_edit.get("channel_name"), Some("EditedName"));
+    assert_eq!(guest_sees_edit.get("channel_topic"), Some("EditedTopic"));
+
+    let admin_edit_err = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin edit error");
+    assert_eq!(admin_edit_err.get("id"), Some("0"));
+
+    // 5. Guest moves into the channel
+    let mut mv = Command::new("clientmove");
+    mv.set("cid", &test_cid);
+    guest.send_command(&mv).await;
+    let _ = guest.recv_until("notifyclientmoved", Duration::from_secs(2)).await;
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+    let _ = admin
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await;
+
+    // 6. Admin attempts to delete occupied channel without force -> returns 770
+    let mut del_no_force = Command::new("channeldelete");
+    del_no_force.set("cid", &test_cid);
+    del_no_force.set("force", "0");
+    admin.send_command(&del_no_force).await;
+
+    let del_err = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("delete error");
+    assert_eq!(
+        del_err.get("id"),
+        Some("770"),
+        "occupied channel without force must return error 770"
+    );
+
+    // 7. Admin deletes occupied channel with force=1 -> moves guest to default channel and deletes
+    let mut del_force = Command::new("channeldelete");
+    del_force.set("cid", &test_cid);
+    del_force.set("force", "1");
+    admin.send_command(&del_force).await;
+
+    let guest_moved = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("guest moved to default channel");
+    assert_eq!(
+        guest_moved.get("clid"),
+        Some(guest.clid.to_string().as_str())
+    );
+    assert_eq!(guest_moved.get("ctid"), Some("1"));
+
+    let guest_ch_del = guest
+        .recv_until("notifychanneldeleted", Duration::from_secs(2))
+        .await
+        .expect("guest receives notifychanneldeleted");
+    assert_eq!(guest_ch_del.get("cid"), Some(test_cid.as_str()));
+
+    let admin_del_ok = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin delete error");
+    assert_eq!(admin_del_ok.get("id"), Some("0"));
+
+    // 8. Admin attempts to delete default channel (cid=1) -> rejected with 771
+    let mut del_def = Command::new("channeldelete");
+    del_def.set("cid", "1");
+    del_def.set("force", "1");
+    admin.send_command(&del_def).await;
+
+    let def_err = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("default channel delete error");
+    assert_eq!(def_err.get("id"), Some("771"));
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_client_kick_and_ban() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "Admin").await;
+    let mut guest = ClientSession::connect(server_addr, "Guest").await;
+
+    // Admin privileges
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    let _ = admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await;
+
+    // Create a sub-channel
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "KickChannel");
+    create.set("channel_flag_permanent", "1");
+    admin.send_command(&create).await;
+    let ch_created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let sub_cid = ch_created.get("cid").unwrap().to_string();
+
+    // Guest moves to KickChannel
+    let mut mv = Command::new("clientmove");
+    mv.set("cid", &sub_cid);
+    guest.send_command(&mv).await;
+    let _ = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await;
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+    let _ = admin
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await;
+
+    // 1. Kick Guest from Channel (reasonid=4)
+    let mut kick_ch = Command::new("clientkick");
+    kick_ch.set("reasonid", "4");
+    kick_ch.set("reasonmsg", "Out\\sof\\shere");
+    kick_ch.set("clid", guest.clid.to_string());
+    admin.send_command(&kick_ch).await;
+
+    let guest_kicked_ch = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("guest receives kick moved");
+    assert_eq!(
+        guest_kicked_ch.get("clid"),
+        Some(guest.clid.to_string().as_str())
+    );
+    assert_eq!(guest_kicked_ch.get("ctid"), Some("1"));
+    assert_eq!(guest_kicked_ch.get("reasonid"), Some("4"));
+    assert_eq!(guest_kicked_ch.get("reasonmsg"), Some("Out\\sof\\shere"));
+
+    let admin_kick_ok = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin kick error");
+    assert_eq!(admin_kick_ok.get("id"), Some("0"));
+
+    // 2. Kick Guest from Server (reasonid=5)
+    let mut kick_srv = Command::new("clientkick");
+    kick_srv.set("reasonid", "5");
+    kick_srv.set("reasonmsg", "Goodbye");
+    kick_srv.set("clid", guest.clid.to_string());
+    admin.send_command(&kick_srv).await;
+
+    let guest_kicked_srv = guest
+        .recv_until("notifyclientleftview", Duration::from_secs(2))
+        .await
+        .expect("guest receives server kick");
+    assert_eq!(
+        guest_kicked_srv.get("clid"),
+        Some(guest.clid.to_string().as_str())
+    );
+    assert_eq!(guest_kicked_srv.get("reasonid"), Some("5"));
+    assert_eq!(guest_kicked_srv.get("reasonmsg"), Some("Goodbye"));
+
+    let admin_sees_left = admin
+        .recv_until("notifyclientleftview", Duration::from_secs(2))
+        .await
+        .expect("admin sees guest left");
+    assert_eq!(
+        admin_sees_left.get("clid"),
+        Some(guest.clid.to_string().as_str())
+    );
+
+    let admin_kick_srv_ok = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin server kick error");
+    assert_eq!(admin_kick_srv_ok.get("id"), Some("0"));
+
+    // 3. Guest connects again with a stable identity to test banning
+    let secret_bob = p256::SecretKey::from_slice(&[42u8; 32]).expect("valid secret");
+    let mut bob = ClientSession::connect_with_secret(server_addr, "Bob", Some(&secret_bob)).await;
+    assert_ne!(bob.clid, 0);
+
+    // 4. Admin bans Bob with banclient
+    let mut ban_cmd = Command::new("banclient");
+    ban_cmd.set("clid", bob.clid.to_string());
+    ban_cmd.set("time", "3600");
+    ban_cmd.set("banreason", "No\\sTrolling");
+    admin.send_command(&ban_cmd).await;
+
+    let bob_banned = bob
+        .recv_until("notifyclientleftview", Duration::from_secs(2))
+        .await
+        .expect("bob receives ban leftview");
+    assert_eq!(bob_banned.get("clid"), Some(bob.clid.to_string().as_str()));
+    assert_eq!(bob_banned.get("reasonid"), Some("6"));
+    assert_eq!(bob_banned.get("reasonmsg"), Some("No\\sTrolling"));
+
+    let admin_ban_err = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin ban error");
+    assert_eq!(admin_ban_err.get("id"), Some("0"));
+    let ban_id = admin_ban_err
+        .get("banid")
+        .expect("banid in error response")
+        .to_string();
+
+    // 4b. Verify Bob is rejected on reconnect
+    let bob_rejected =
+        ClientSession::connect_with_secret(server_addr, "Bob", Some(&secret_bob)).await;
+    assert_eq!(
+        bob_rejected.clid, 0,
+        "banned client must not be assigned a clid"
+    );
+
+    // 5. Admin lists bans
+    let banlist_cmd = Command::new("banlist");
+    admin.send_command(&banlist_cmd).await;
+    let list_notify = admin
+        .recv_until("notifybanlist", Duration::from_secs(2))
+        .await
+        .expect("admin receives notifybanlist");
+    assert_eq!(list_notify.get("banid"), Some(ban_id.as_str()));
+    assert_eq!(list_notify.get("reason"), Some("No\\sTrolling"));
+
+    // 6. Admin deletes the ban
+    let mut bandel_cmd = Command::new("bandel");
+    bandel_cmd.set("banid", &ban_id);
+    admin.send_command(&bandel_cmd).await;
+    let del_ok = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("bandel response");
+    assert_eq!(del_ok.get("id"), Some("0"));
+
+    // 7. Verify Bob can reconnect successfully now that ban is removed
+    let bob_reconnected =
+        ClientSession::connect_with_secret(server_addr, "Bob", Some(&secret_bob)).await;
+    assert_ne!(
+        bob_reconnected.clid, 0,
+        "unbanned client can now connect"
+    );
 
     server_handle.abort();
 }
