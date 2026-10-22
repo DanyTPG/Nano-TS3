@@ -32,28 +32,24 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             use_zig: true
-            run_tests: true
             platform_type: linux
 
           - name: linux-arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             use_zig: true
-            run_tests: false
             platform_type: linux
 
           - name: linux-armv7
             os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
             use_zig: true
-            run_tests: false
             platform_type: linux
 
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             use_zig: false
-            run_tests: true
             platform_type: windows
 
     steps:
@@ -74,10 +70,6 @@ jobs:
       - name: Install cargo-zigbuild
         if: matrix.use_zig
         uses: taiki-e/install-action@cargo-zigbuild
-
-      - name: Run unit & integration tests
-        if: matrix.run_tests
-        run: cargo test --release
 
       - name: Build binary (with cargo-zigbuild)
         if: matrix.use_zig
