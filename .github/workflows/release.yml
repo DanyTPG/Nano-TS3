@@ -34,15 +34,33 @@ jobs:
             use_zig: true
             platform_type: linux
 
+          - name: linux-amd64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_zig: true
+            platform_type: linux
+
           - name: linux-arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             use_zig: true
             platform_type: linux
 
+          - name: linux-arm64-musl
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_zig: true
+            platform_type: linux
+
           - name: linux-armv7
             os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
+            use_zig: true
+            platform_type: linux
+
+          - name: linux-armv7-musl
+            os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
             use_zig: true
             platform_type: linux
 
@@ -87,10 +105,14 @@ jobs:
           cp "target/${{ matrix.target }}/release/nano-ts3" "dist/nano-ts3-${{ matrix.name }}"
           chmod +x "dist/nano-ts3-${{ matrix.name }}"
 
-          # Provide aarch64 alias for arm64 if applicable
+          # Provide aarch64 aliases for arm64 targets
           if [ "${{ matrix.name }}" = "linux-arm64" ]; then
             cp "dist/nano-ts3-${{ matrix.name }}" "dist/nano-ts3-linux-aarch64"
             chmod +x "dist/nano-ts3-linux-aarch64"
+          fi
+          if [ "${{ matrix.name }}" = "linux-arm64-musl" ]; then
+            cp "dist/nano-ts3-${{ matrix.name }}" "dist/nano-ts3-linux-aarch64-musl"
+            chmod +x "dist/nano-ts3-linux-aarch64-musl"
           fi
 
           if [ -f "target/${{ matrix.target }}/release/dump_cmd" ]; then
