@@ -12,7 +12,7 @@ use tsproto_packets::packets::*;
 
 use crate::command::Command;
 use crate::crypto::*;
-use crate::database::{ChannelEdit, ChannelRecord, Database};
+use crate::database::{BanRecord, ChannelEdit, ChannelRecord, Database};
 use crate::permissions;
 use crate::state::{ClientAudioState, HandshakePhase, ServerState};
 
@@ -60,9 +60,8 @@ fn build_client_enter_view(
     cmd.set("client_output_hardware", bool_wire(audio.output_hardware));
     cmd.set("client_meta_data", "");
     cmd.set("client_is_recording", "0");
-    // Official servers keep administrators in the default channel group
-    // (Guest, cgid 8); the admin rights come from the server group.
-    cmd.set("client_channel_group_id", "8");
+    // Channel group 5 is Channel Admin, 8 is Guest.
+    cmd.set("client_channel_group_id", if is_admin { "5" } else { "8" });
     cmd.set(
         "client_channel_group_inherited_channel_id",
         channel_id.to_string(),
@@ -849,6 +848,29 @@ impl Server {
                     }
                 }
 
+                let client_ip = peer.ip().to_string();
+                let ban_reason = {
+                    let db = self.db.lock().await;
+                    db.is_banned(&client_ip, &uid, base_nickname).unwrap_or(None)
+                };
+                if let Some(reason) = ban_reason {
+                    info!(
+                        "Banned client connection rejected: {} (uid: {}, ip: {}, reason: {})",
+                        clid, uid, client_ip, reason
+                    );
+                    let mut err_resp = Command::new("error");
+                    err_resp.set("id", "3329");
+                    err_resp.set("msg", "connection failed, you are banned");
+                    if !reason.is_empty() {
+                        err_resp.set("extra_msg", &reason);
+                    }
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    self.send_encrypted_command(peer, &err_resp).await?;
+                    return Ok(());
+                }
+
                 // 1. initserver
                 let mut initserver = Command::new("initserver");
                 {
@@ -1505,7 +1527,7 @@ impl Server {
                 resp.set("cid", cid.to_string());
                 resp.set("reasonid", "9"); // Channelupdate
                 resp.set("channel_description", &desc);
-                self.send_encrypted_low_command(peer, &resp).await?;
+                self.send_encrypted_command(peer, &resp).await?;
 
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
@@ -1744,10 +1766,10 @@ impl Server {
                     };
 
                     if !channel_exists || is_default {
-                        err_resp.set("id", "1024");
-                        err_resp.set("msg", "invalid channel");
+                        err_resp.set("id", "771");
+                        err_resp.set("msg", "invalid channel flags");
                     } else if !force && !occupied_clients.is_empty() {
-                        err_resp.set("id", "1024");
+                        err_resp.set("id", "770");
                         err_resp.set("msg", "channel is not empty");
                     } else {
                         let deleted = {
@@ -1864,7 +1886,7 @@ impl Server {
                     // "nickname is already in use", dropping the connection.
                     let _ = &nickname;
                     notify.set("client_servergroups", "6");
-                    notify.set("client_channel_group_id", "8");
+                    notify.set("client_channel_group_id", "5");
                     notify.set("client_needed_serverquery_view_power", "75");
 
                     let all_endpoints: Vec<SocketAddr> = {
@@ -1875,11 +1897,11 @@ impl Server {
                         let _ = self.send_encrypted_command(ep, &notify).await;
                     }
 
-                    // Push the Server Admin permissions so the UI enables
-                    // channel creation immediately, without a reconnect.
+                    // Push Server Admin and Channel Admin permissions immediately
                     let _ = self
                         .send_encrypted_raw(peer, permissions::get_server_admin_perms_wire())
                         .await;
+                    let _ = self.send_channel_group_perm_list(peer, 5).await;
 
                     let port = self.local_addr().map(|a| a.port()).unwrap_or(9988);
                     let server_updated = build_server_updated(false, port);
@@ -1950,6 +1972,506 @@ impl Server {
                 }
 
                 info!("Client {} disconnecting (reason {})", clid, reason_id);
+            }
+            "clientkick" => {
+                let reason_id = cmd.get("reasonid").unwrap_or("4");
+                let reason_msg = cmd.get("reasonmsg").unwrap_or("");
+                let target_clid: Option<u16> = cmd.get("clid").and_then(|v| v.parse().ok());
+
+                let (invoker_nickname, invoker_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2563");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else if let Some(target_clid) = target_clid {
+                    let target_info = {
+                        let state = self.state.lock().await;
+                        state
+                            .clients
+                            .values()
+                            .find(|c| {
+                                c.clid == target_clid
+                                    && c.handshake_phase == HandshakePhase::Connected
+                            })
+                            .map(|c| (c.endpoint, c.current_channel_id, c.nickname.clone()))
+                    };
+
+                    match target_info {
+                        None => {
+                            err_resp.set("id", "512");
+                            err_resp.set("msg", "invalid clientID");
+                        }
+                        Some((target_ep, old_cid, target_nick)) => {
+                            if reason_id == "4" {
+                                // Channel Kick -> move to default channel
+                                let default_cid = {
+                                    let db = self.db.lock().await;
+                                    let channels = db.get_channels().unwrap_or_default();
+                                    channels
+                                        .iter()
+                                        .find(|ch| ch.is_default)
+                                        .map(|ch| ch.cid)
+                                        .unwrap_or(1)
+                                };
+
+                                if old_cid == default_cid {
+                                    err_resp.set("id", "1024");
+                                    err_resp.set("msg", "client is already in default channel");
+                                } else {
+                                    {
+                                        let mut state = self.state.lock().await;
+                                        if let Some(c) = state.clients.get_mut(&target_ep) {
+                                            c.current_channel_id = default_cid;
+                                            c.subscribed_channels.insert(default_cid);
+                                        }
+                                    }
+
+                                    let mut moved = Command::new("notifyclientmoved");
+                                    moved.set("clid", target_clid.to_string());
+                                    moved.set("cfid", old_cid.to_string());
+                                    moved.set("ctid", default_cid.to_string());
+                                    moved.set("reasonid", "4");
+                                    if !reason_msg.is_empty() {
+                                        moved.set("reasonmsg", reason_msg);
+                                    }
+                                    moved.set("invokerid", clid.to_string());
+                                    moved.set("invokername", &invoker_nickname);
+                                    moved.set("invokeruid", &invoker_uid);
+
+                                    let all_peers: Vec<SocketAddr> = {
+                                        let state = self.state.lock().await;
+                                        state
+                                            .clients
+                                            .values()
+                                            .filter(|c| {
+                                                c.handshake_phase == HandshakePhase::Connected
+                                            })
+                                            .map(|c| c.endpoint)
+                                            .collect()
+                                    };
+                                    for ep in all_peers {
+                                        let _ = self.send_encrypted_command(ep, &moved).await;
+                                    }
+
+                                    info!(
+                                        "Client {} kicked {} ({}) from channel {} to default channel {}",
+                                        clid, target_clid, target_nick, old_cid, default_cid
+                                    );
+                                    err_resp.set("id", "0");
+                                    err_resp.set("msg", "ok");
+                                }
+                            } else if reason_id == "5" {
+                                // Server Kick
+                                let mut notify = Command::new("notifyclientleftview");
+                                notify.set("clid", target_clid.to_string());
+                                notify.set("cfid", old_cid.to_string());
+                                notify.set("ctid", "0");
+                                notify.set("reasonid", "5");
+                                if !reason_msg.is_empty() {
+                                    notify.set("reasonmsg", reason_msg);
+                                }
+                                notify.set("invokerid", clid.to_string());
+                                notify.set("invokername", &invoker_nickname);
+                                notify.set("invokeruid", &invoker_uid);
+
+                                // Send to kicked client first
+                                let _ = self.send_encrypted_command(target_ep, &notify).await;
+
+                                let other_peers: Vec<SocketAddr> = {
+                                    let mut state = self.state.lock().await;
+                                    if let Some(c) = state.clients.get_mut(&target_ep) {
+                                        c.handshake_phase = HandshakePhase::Disconnected;
+                                        c.disconnect_time = Some(std::time::Instant::now());
+                                    }
+                                    state
+                                        .clients
+                                        .values()
+                                        .filter(|c| {
+                                            c.endpoint != target_ep
+                                                && c.handshake_phase == HandshakePhase::Connected
+                                        })
+                                        .map(|c| c.endpoint)
+                                        .collect()
+                                };
+
+                                for ep in other_peers {
+                                    let _ = self.send_encrypted_command(ep, &notify).await;
+                                }
+
+                                info!(
+                                    "Client {} kicked {} ({}) from server",
+                                    clid, target_clid, target_nick
+                                );
+                                err_resp.set("id", "0");
+                                err_resp.set("msg", "ok");
+                            } else {
+                                err_resp.set("id", "1024");
+                                err_resp.set("msg", "invalid reasonid");
+                            }
+                        }
+                    }
+                } else {
+                    err_resp.set("id", "512");
+                    err_resp.set("msg", "invalid clientID");
+                }
+
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "banclient" => {
+                let target_clid: Option<u16> = cmd.get("clid").and_then(|v| v.parse().ok());
+                let duration: i64 = cmd.get("time").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let ban_reason = cmd.get("banreason").unwrap_or("");
+
+                let (invoker_nickname, invoker_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2563");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else if let Some(target_clid) = target_clid {
+                    let target_info = {
+                        let state = self.state.lock().await;
+                        state
+                            .clients
+                            .values()
+                            .find(|c| {
+                                c.clid == target_clid
+                                    && c.handshake_phase == HandshakePhase::Connected
+                            })
+                            .map(|c| {
+                                (
+                                    c.endpoint,
+                                    c.current_channel_id,
+                                    c.nickname.clone(),
+                                    c.uid.clone(),
+                                )
+                            })
+                    };
+
+                    match target_info {
+                        None => {
+                            err_resp.set("id", "512");
+                            err_resp.set("msg", "invalid clientID");
+                        }
+                        Some((target_ep, old_cid, target_nick, target_uid)) => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+
+                            let target_ip = target_ep.ip().to_string();
+                            let ban_record = BanRecord {
+                                ip: target_ip,
+                                name: target_nick.clone(),
+                                uid: target_uid,
+                                mytsid: String::new(),
+                                lastnickname: target_nick.clone(),
+                                created: now,
+                                duration,
+                                invokercldbid: clid as u64,
+                                invokername: invoker_nickname.clone(),
+                                invokeruid: invoker_uid.clone(),
+                                reason: ban_reason.to_string(),
+                                enforcements: 0,
+                                ..Default::default()
+                            };
+
+                            let ban_id = {
+                                let db = self.db.lock().await;
+                                db.add_ban(&ban_record).unwrap_or(0)
+                            };
+
+                            // Disconnect target client with reasonid=6 (Banned)
+                            let mut notify = Command::new("notifyclientleftview");
+                            notify.set("clid", target_clid.to_string());
+                            notify.set("cfid", old_cid.to_string());
+                            notify.set("ctid", "0");
+                            notify.set("reasonid", "6");
+                            if !ban_reason.is_empty() {
+                                notify.set("reasonmsg", ban_reason);
+                            }
+                            notify.set("invokerid", clid.to_string());
+                            notify.set("invokername", &invoker_nickname);
+                            notify.set("invokeruid", &invoker_uid);
+
+                            // Send to banned client first
+                            let _ = self.send_encrypted_command(target_ep, &notify).await;
+
+                            let other_peers: Vec<SocketAddr> = {
+                                let mut state = self.state.lock().await;
+                                if let Some(c) = state.clients.get_mut(&target_ep) {
+                                    c.handshake_phase = HandshakePhase::Disconnected;
+                                    c.disconnect_time = Some(std::time::Instant::now());
+                                }
+                                state
+                                    .clients
+                                    .values()
+                                    .filter(|c| {
+                                        c.endpoint != target_ep
+                                            && c.handshake_phase == HandshakePhase::Connected
+                                    })
+                                    .map(|c| c.endpoint)
+                                    .collect()
+                            };
+
+                            for ep in other_peers {
+                                let _ = self.send_encrypted_command(ep, &notify).await;
+                            }
+
+                            info!(
+                                "Client {} banned {} ({}) ban_id={}",
+                                clid, target_clid, target_nick, ban_id
+                            );
+
+                            let _ = self
+                                .send_encrypted_raw(peer, &format!("banid={}", ban_id))
+                                .await;
+
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                            err_resp.set("banid", ban_id.to_string());
+                        }
+                    }
+                } else {
+                    err_resp.set("id", "512");
+                    err_resp.set("msg", "invalid clientID");
+                }
+
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "banadd" => {
+                let ip = cmd.get("ip").unwrap_or("");
+                let uid_param = cmd.get("uid").unwrap_or("");
+                let name_param = cmd.get("name").unwrap_or("");
+                let duration: i64 = cmd.get("time").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let ban_reason = cmd.get("banreason").unwrap_or("");
+
+                let (invoker_nickname, invoker_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2563");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else if ip.is_empty() && uid_param.is_empty() && name_param.is_empty() {
+                    err_resp.set("id", "1024");
+                    err_resp.set("msg", "parameter not found");
+                } else {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+
+                    let ban_record = BanRecord {
+                        ip: ip.to_string(),
+                        name: name_param.to_string(),
+                        uid: uid_param.to_string(),
+                        mytsid: String::new(),
+                        lastnickname: name_param.to_string(),
+                        created: now,
+                        duration,
+                        invokercldbid: clid as u64,
+                        invokername: invoker_nickname.clone(),
+                        invokeruid: invoker_uid.clone(),
+                        reason: ban_reason.to_string(),
+                        enforcements: 0,
+                        ..Default::default()
+                    };
+
+                    let ban_id = {
+                        let db = self.db.lock().await;
+                        db.add_ban(&ban_record).unwrap_or(0)
+                    };
+
+                    // Kick any currently connected clients that match this ban
+                    let matching_clients: Vec<(SocketAddr, u16, u64)> = {
+                        let state = self.state.lock().await;
+                        state
+                            .clients
+                            .values()
+                            .filter(|c| {
+                                c.handshake_phase == HandshakePhase::Connected
+                                    && ((!ip.is_empty() && c.endpoint.ip().to_string() == ip)
+                                        || (!uid_param.is_empty() && c.uid == uid_param)
+                                        || (!name_param.is_empty()
+                                            && c.nickname.eq_ignore_ascii_case(name_param)))
+                            })
+                            .map(|c| (c.endpoint, c.clid, c.current_channel_id))
+                            .collect()
+                    };
+
+                    for (target_ep, target_clid, old_cid) in matching_clients {
+                        let mut notify = Command::new("notifyclientleftview");
+                        notify.set("clid", target_clid.to_string());
+                        notify.set("cfid", old_cid.to_string());
+                        notify.set("ctid", "0");
+                        notify.set("reasonid", "6");
+                        if !ban_reason.is_empty() {
+                            notify.set("reasonmsg", ban_reason);
+                        }
+                        notify.set("invokerid", clid.to_string());
+                        notify.set("invokername", &invoker_nickname);
+                        notify.set("invokeruid", &invoker_uid);
+
+                        let _ = self.send_encrypted_command(target_ep, &notify).await;
+
+                        let other_peers: Vec<SocketAddr> = {
+                            let mut state = self.state.lock().await;
+                            if let Some(c) = state.clients.get_mut(&target_ep) {
+                                c.handshake_phase = HandshakePhase::Disconnected;
+                                c.disconnect_time = Some(std::time::Instant::now());
+                            }
+                            state
+                                .clients
+                                .values()
+                                .filter(|c| {
+                                    c.endpoint != target_ep
+                                        && c.handshake_phase == HandshakePhase::Connected
+                                    })
+                                .map(|c| c.endpoint)
+                                .collect()
+                        };
+
+                        for ep in other_peers {
+                            let _ = self.send_encrypted_command(ep, &notify).await;
+                        }
+                    }
+
+                    let _ = self
+                        .send_encrypted_raw(peer, &format!("banid={}", ban_id))
+                        .await;
+
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                    err_resp.set("banid", ban_id.to_string());
+                }
+
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "banlist" => {
+                let is_admin = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2563");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    let bans = {
+                        let db = self.db.lock().await;
+                        db.get_bans().unwrap_or_default()
+                    };
+
+                    for ban in bans {
+                        let mut ban_cmd = Command::new("notifybanlist");
+                        ban_cmd.set("banid", ban.ban_id.to_string());
+                        ban_cmd.set("ip", &ban.ip);
+                        ban_cmd.set("name", &ban.name);
+                        ban_cmd.set("uid", &ban.uid);
+                        ban_cmd.set("mytsid", &ban.mytsid);
+                        ban_cmd.set("lastnickname", &ban.lastnickname);
+                        ban_cmd.set("created", ban.created.to_string());
+                        ban_cmd.set("duration", ban.duration.to_string());
+                        ban_cmd.set("invokercldbid", ban.invokercldbid.to_string());
+                        ban_cmd.set("invokername", &ban.invokername);
+                        ban_cmd.set("invokeruid", &ban.invokeruid);
+                        ban_cmd.set("reason", &ban.reason);
+                        ban_cmd.set("enforcements", ban.enforcements.to_string());
+                        let _ = self.send_encrypted_command(peer, &ban_cmd).await;
+                    }
+
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "bandel" => {
+                let ban_id: Option<u64> = cmd.get("banid").and_then(|v| v.parse().ok());
+                let is_admin = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2563");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else if let Some(ban_id) = ban_id {
+                    let deleted = {
+                        let db = self.db.lock().await;
+                        db.delete_ban(ban_id).unwrap_or(false)
+                    };
+                    if deleted {
+                        err_resp.set("id", "0");
+                        err_resp.set("msg", "ok");
+                    } else {
+                        err_resp.set("id", "3328");
+                        err_resp.set("msg", "invalid ban id");
+                    }
+                } else {
+                    err_resp.set("id", "3328");
+                    err_resp.set("msg", "invalid ban id");
+                }
+
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "bandelall" => {
+                let is_admin = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2563");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    let db = self.db.lock().await;
+                    let _ = db.delete_all_bans();
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
             }
             _ => {
                 debug!("Unhandled command: {}", cmd.name);
@@ -2132,7 +2654,7 @@ impl Server {
     ) -> Result<(), String> {
         let wire = match cgid {
             5 => {
-                "notifychannelgrouppermlist cgid=5 permid=99 permvalue=1 permnegated=0 permskip=0|permid=111 permvalue=1 permnegated=0 permskip=0|permid=112 permvalue=1 permnegated=0 permskip=0|permid=113 permvalue=1 permnegated=0 permskip=0|permid=114 permvalue=1 permnegated=0 permskip=0|permid=115 permvalue=1 permnegated=0 permskip=0|permid=117 permvalue=1 permnegated=0 permskip=0|permid=118 permvalue=1 permnegated=0 permskip=0|permid=119 permvalue=1 permnegated=0 permskip=0|permid=120 permvalue=1 permnegated=0 permskip=0|permid=121 permvalue=1 permnegated=0 permskip=0|permid=123 permvalue=1 permnegated=0 permskip=0|permid=126 permvalue=1 permnegated=0 permskip=0|permid=129 permvalue=1 permnegated=0 permskip=0|permid=130 permvalue=1 permnegated=0 permskip=0|permid=131 permvalue=1 permnegated=0 permskip=0|permid=132 permvalue=50 permnegated=0 permskip=0|permid=143 permvalue=50 permnegated=0 permskip=0|permid=145 permvalue=100 permnegated=0 permskip=0|permid=148 permvalue=1 permnegated=0 permskip=0|permid=149 permvalue=40 permnegated=0 permskip=0|permid=165 permvalue=75 permnegated=0 permskip=0|permid=166 permvalue=50 permnegated=0 permskip=0|permid=167 permvalue=50 permnegated=0 permskip=0|permid=168 permvalue=50 permnegated=0 permskip=0|permid=169 permvalue=50 permnegated=0 permskip=0|permid=186 permvalue=1 permnegated=0 permskip=0|permid=200 permvalue=50 permnegated=0 permskip=0|permid=201 permvalue=50 permnegated=0 permskip=0|permid=204 permvalue=50 permnegated=0 permskip=0|permid=207 permvalue=25 permnegated=0 permskip=0|permid=221 permvalue=60 permnegated=0 permskip=0|permid=225 permvalue=1 permnegated=0 permskip=0"
+                "notifychannelgrouppermlist cgid=5 permid=99 permvalue=1 permnegated=0 permskip=0|permid=111 permvalue=1 permnegated=0 permskip=0|permid=112 permvalue=1 permnegated=0 permskip=0|permid=113 permvalue=1 permnegated=0 permskip=0|permid=114 permvalue=1 permnegated=0 permskip=0|permid=115 permvalue=1 permnegated=0 permskip=0|permid=117 permvalue=1 permnegated=0 permskip=0|permid=118 permvalue=1 permnegated=0 permskip=0|permid=119 permvalue=1 permnegated=0 permskip=0|permid=120 permvalue=1 permnegated=0 permskip=0|permid=121 permvalue=1 permnegated=0 permskip=0|permid=123 permvalue=1 permnegated=0 permskip=0|permid=124 permvalue=50 permnegated=0 permskip=0|permid=125 permvalue=50 permnegated=0 permskip=0|permid=126 permvalue=1 permnegated=0 permskip=0|permid=128 permvalue=1 permnegated=0 permskip=0|permid=129 permvalue=1 permnegated=0 permskip=0|permid=130 permvalue=1 permnegated=0 permskip=0|permid=131 permvalue=1 permnegated=0 permskip=0|permid=132 permvalue=50 permnegated=0 permskip=0|permid=133 permvalue=50 permnegated=0 permskip=0|permid=143 permvalue=50 permnegated=0 permskip=0|permid=145 permvalue=100 permnegated=0 permskip=0|permid=148 permvalue=1 permnegated=0 permskip=0|permid=149 permvalue=40 permnegated=0 permskip=0|permid=165 permvalue=75 permnegated=0 permskip=0|permid=166 permvalue=50 permnegated=0 permskip=0|permid=167 permvalue=50 permnegated=0 permskip=0|permid=168 permvalue=50 permnegated=0 permskip=0|permid=169 permvalue=50 permnegated=0 permskip=0|permid=186 permvalue=1 permnegated=0 permskip=0|permid=200 permvalue=50 permnegated=0 permskip=0|permid=201 permvalue=50 permnegated=0 permskip=0|permid=204 permvalue=50 permnegated=0 permskip=0|permid=207 permvalue=25 permnegated=0 permskip=0|permid=221 permvalue=60 permnegated=0 permskip=0|permid=225 permvalue=1 permnegated=0 permskip=0"
             }
             _ => {
                 "notifychannelgrouppermlist cgid=8 permid=149 permvalue=10 permnegated=0 permskip=0|permid=165 permvalue=75 permnegated=0 permskip=0"
@@ -2162,6 +2684,7 @@ impl Server {
         self.send_encrypted_raw(peer, &wire_str).await
     }
 
+    #[allow(dead_code)]
     async fn send_encrypted_low_command(
         &self,
         peer: SocketAddr,

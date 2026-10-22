@@ -53,6 +53,23 @@ pub struct ChannelEdit {
     pub icon_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BanRecord {
+    pub ban_id: u64,
+    pub ip: String,
+    pub name: String,
+    pub uid: String,
+    pub mytsid: String,
+    pub lastnickname: String,
+    pub created: i64,
+    pub duration: i64,
+    pub invokercldbid: u64,
+    pub invokername: String,
+    pub invokeruid: String,
+    pub reason: String,
+    pub enforcements: u64,
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -115,6 +132,22 @@ impl Database {
             CREATE TABLE IF NOT EXISTS admin_identities (
                 client_uid TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS bans (
+                ban_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                uid TEXT NOT NULL DEFAULT '',
+                mytsid TEXT NOT NULL DEFAULT '',
+                lastnickname TEXT NOT NULL DEFAULT '',
+                created INTEGER NOT NULL,
+                duration INTEGER NOT NULL DEFAULT 0,
+                invokercldbid INTEGER NOT NULL DEFAULT 0,
+                invokername TEXT NOT NULL DEFAULT '',
+                invokeruid TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                enforcements INTEGER NOT NULL DEFAULT 0
             );
             ",
         )?;
@@ -667,6 +700,105 @@ impl Database {
             .map(Ok)
             .transpose()
     }
+
+    /// Adds a ban record and returns the allocated `ban_id`.
+    pub fn add_ban(&self, ban: &BanRecord) -> Result<u64> {
+        self.conn.execute(
+            "INSERT INTO bans (ip, name, uid, mytsid, lastnickname, created, duration, invokercldbid, invokername, invokeruid, reason, enforcements) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                ban.ip,
+                ban.name,
+                ban.uid,
+                ban.mytsid,
+                ban.lastnickname,
+                ban.created,
+                ban.duration,
+                ban.invokercldbid as i64,
+                ban.invokername,
+                ban.invokeruid,
+                ban.reason,
+                ban.enforcements as i64,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid() as u64)
+    }
+
+    /// Deletes a ban rule by ID. Returns true if a row was deleted.
+    pub fn delete_ban(&self, ban_id: u64) -> Result<bool> {
+        let rows = self.conn.execute(
+            "DELETE FROM bans WHERE ban_id = ?1",
+            params![ban_id as i64],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Deletes all active ban rules.
+    pub fn delete_all_bans(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM bans", [])?;
+        Ok(())
+    }
+
+    /// Fetches all bans.
+    pub fn get_bans(&self) -> Result<Vec<BanRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ban_id, ip, name, uid, mytsid, lastnickname, created, duration, \
+             invokercldbid, invokername, invokeruid, reason, enforcements FROM bans ORDER BY ban_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(BanRecord {
+                ban_id: row.get::<_, i64>(0)? as u64,
+                ip: row.get(1)?,
+                name: row.get(2)?,
+                uid: row.get(3)?,
+                mytsid: row.get(4)?,
+                lastnickname: row.get(5)?,
+                created: row.get(6)?,
+                duration: row.get(7)?,
+                invokercldbid: row.get::<_, i64>(8)? as u64,
+                invokername: row.get(9)?,
+                invokeruid: row.get(10)?,
+                reason: row.get(11)?,
+                enforcements: row.get::<_, i64>(12)? as u64,
+            })
+        })?;
+        let mut bans = Vec::new();
+        for r in rows {
+            bans.push(r?);
+        }
+        Ok(bans)
+    }
+
+    /// Checks if a client is banned by IP, UID, or nickname.
+    /// If banned, increments enforcement count and returns the ban reason.
+    pub fn is_banned(&self, ip: &str, uid: &str, name: &str) -> Result<Option<String>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let bans = self.get_bans()?;
+        for ban in bans {
+            // Check expiry: duration == 0 means permanent
+            if ban.duration > 0 && ban.created + ban.duration <= now {
+                continue;
+            }
+
+            let ip_matches = !ban.ip.is_empty() && !ip.is_empty() && ban.ip == ip;
+            let uid_matches = !ban.uid.is_empty() && !uid.is_empty() && ban.uid == uid;
+            let name_matches =
+                !ban.name.is_empty() && !name.is_empty() && ban.name.eq_ignore_ascii_case(name);
+
+            if ip_matches || uid_matches || name_matches {
+                let _ = self.conn.execute(
+                    "UPDATE bans SET enforcements = enforcements + 1 WHERE ban_id = ?1",
+                    params![ban.ban_id as i64],
+                );
+                return Ok(Some(ban.reason));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -722,5 +854,108 @@ mod tests {
         // Duplicate add should not fail
         db.add_admin_identity("test_uid_1").unwrap();
         assert!(db.is_admin_identity("test_uid_1").unwrap());
+    }
+
+    #[test]
+    fn test_ban_lifecycle_and_matching() {
+        let db = Database::in_memory().expect("failed to open in-memory db");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Permanent ban by UID
+        let ban_uid = BanRecord {
+            ip: String::new(),
+            name: String::new(),
+            uid: "banned_uid_1".to_string(),
+            mytsid: String::new(),
+            lastnickname: "Troll".to_string(),
+            created: now,
+            duration: 0,
+            invokercldbid: 1,
+            invokername: "Admin".to_string(),
+            invokeruid: "admin_uid".to_string(),
+            reason: "Trolling in lobby".to_string(),
+            enforcements: 0,
+            ..Default::default()
+        };
+        let ban_id1 = db.add_ban(&ban_uid).expect("failed to add ban");
+        assert!(ban_id1 > 0);
+
+        // Ban by IP with 3600s duration
+        let ban_ip = BanRecord {
+            ip: "192.168.1.100".to_string(),
+            name: String::new(),
+            uid: String::new(),
+            mytsid: String::new(),
+            lastnickname: "Flooder".to_string(),
+            created: now,
+            duration: 3600,
+            invokercldbid: 1,
+            invokername: "Admin".to_string(),
+            invokeruid: "admin_uid".to_string(),
+            reason: "Flooding".to_string(),
+            enforcements: 0,
+            ..Default::default()
+        };
+        let ban_id2 = db.add_ban(&ban_ip).expect("failed to add ban");
+        assert!(ban_id2 > 0);
+
+        // Expired ban
+        let ban_expired = BanRecord {
+            ip: "10.0.0.5".to_string(),
+            name: String::new(),
+            uid: "expired_uid".to_string(),
+            mytsid: String::new(),
+            lastnickname: "OldBanned".to_string(),
+            created: now - 100,
+            duration: 50, // expired 50 seconds ago
+            invokercldbid: 1,
+            invokername: "Admin".to_string(),
+            invokeruid: "admin_uid".to_string(),
+            reason: "Temporary".to_string(),
+            enforcements: 0,
+            ..Default::default()
+        };
+        let _ = db.add_ban(&ban_expired).expect("failed to add ban");
+
+        // Verify is_banned matching
+        assert_eq!(
+            db.is_banned("1.2.3.4", "banned_uid_1", "User").unwrap(),
+            Some("Trolling in lobby".to_string())
+        );
+        assert_eq!(
+            db.is_banned("192.168.1.100", "innocent_uid", "User").unwrap(),
+            Some("Flooding".to_string())
+        );
+        // Expired ban should not match
+        assert_eq!(
+            db.is_banned("10.0.0.5", "expired_uid", "OldBanned").unwrap(),
+            None
+        );
+        // Clean user should not match
+        assert_eq!(
+            db.is_banned("1.2.3.4", "clean_uid", "GoodUser").unwrap(),
+            None
+        );
+
+        // Verify enforcement counter incremented
+        let bans = db.get_bans().expect("failed to get bans");
+        assert_eq!(bans.len(), 3);
+        let b1 = bans.iter().find(|b| b.ban_id == ban_id1).unwrap();
+        assert_eq!(b1.enforcements, 1);
+
+        // Delete ban 1
+        assert!(db.delete_ban(ban_id1).unwrap());
+        assert!(!db.delete_ban(ban_id1).unwrap());
+        assert_eq!(
+            db.is_banned("1.2.3.4", "banned_uid_1", "User").unwrap(),
+            None
+        );
+
+        // Delete all bans
+        db.delete_all_bans().expect("failed to delete all");
+        assert_eq!(db.get_bans().unwrap().len(), 0);
     }
 }
