@@ -1,0 +1,30 @@
+[package]
+name = "nano-ts3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tsproto-packets = "0.1.0"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+aes = "0.8"
+eax = "0.5"
+sha1 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+base64 = "0.22"
+byteorder = "1.5"
+p256 = { version = "0.14.0", features = ["ecdh", "ecdsa"] }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
+
+[[bin]]
+name = "dump_cmd"
+path = "src/bin/dump_cmd.rs"
+
+[[bin]]
+name = "test_cmds"
+path = "src/bin/test_cmds.rs"

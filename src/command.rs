@@ -1,0 +1,152 @@
+use std::collections::HashMap;
+
+/// Escapes a raw string into TeamSpeak 3 command-escaped format.
+pub fn escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '\\' => out.push_str(r"\\"),
+            '/' => out.push_str(r"\/"),
+            ' ' => out.push_str(r"\s"),
+            '|' => out.push_str(r"\p"),
+            '\x07' => out.push_str(r"\a"),
+            '\x08' => out.push_str(r"\b"),
+            '\t' => out.push_str(r"\t"),
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            '\x0b' => out.push_str(r"\v"),
+            '\x0c' => out.push_str(r"\f"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Unescapes a TeamSpeak 3 command-escaped string into raw text.
+pub fn unescape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                match next {
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    's' => out.push(' '),
+                    'p' => out.push('|'),
+                    'a' => out.push('\x07'),
+                    'b' => out.push('\x08'),
+                    't' => out.push('\t'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    'v' => out.push('\x0b'),
+                    'f' => out.push('\x0c'),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+            } else {
+                out.push('\\');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Represents a parsed TeamSpeak 3 command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub name: String,
+    pub params: HashMap<String, String>,
+    pub raw: String,
+}
+
+impl Command {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            params: HashMap::new(),
+            raw: String::new(),
+        }
+    }
+
+    pub fn set(&mut self, key: impl Into<String>, val: impl Into<String>) -> &mut Self {
+        self.params.insert(key.into(), val.into());
+        self
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.params.get(key).map(|s| s.as_str())
+    }
+
+    /// Formats the command into wire-ready string.
+    pub fn build(&self) -> String {
+        let mut out = self.name.clone();
+        for (k, v) in &self.params {
+            out.push(' ');
+            out.push_str(&escape(k));
+            if !v.is_empty() {
+                out.push('=');
+                out.push_str(&escape(v));
+            }
+        }
+        out
+    }
+
+    /// Parses a raw command string.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let name = parts.next()?.to_string();
+        let mut params = HashMap::new();
+
+        for part in parts {
+            if let Some((k, v)) = part.split_once('=') {
+                params.insert(unescape(k), unescape(v));
+            } else {
+                params.insert(unescape(part), String::new());
+            }
+        }
+
+        Some(Self {
+            name,
+            params,
+            raw: trimmed.to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_unescape() {
+        let original = r"Hello World! /|\ Test\nLine";
+        let escaped = escape(original);
+        assert_eq!(unescape(&escaped), original);
+    }
+
+    #[test]
+    fn test_command_build_and_parse() {
+        let mut cmd = Command::new("clientinit");
+        cmd.set("client_nickname", "Tester 1");
+        cmd.set("client_version", "3.6.2 [Build: 1695216578]");
+        let wire = cmd.build();
+
+        let parsed = Command::parse(&wire).unwrap();
+        assert_eq!(parsed.name, "clientinit");
+        assert_eq!(parsed.get("client_nickname"), Some("Tester 1"));
+        assert_eq!(
+            parsed.get("client_version"),
+            Some("3.6.2 [Build: 1695216578]")
+        );
+    }
+}
