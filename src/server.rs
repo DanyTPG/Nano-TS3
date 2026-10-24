@@ -423,6 +423,155 @@ impl Server {
         }
     }
 
+    /// Endpoints of connected clients that watch any of `cids` (through
+    /// their channel subscriptions). Notifications that reference a client
+    /// must only reach clients whose view can contain it, otherwise the
+    /// official client aborts with "invalid clientID".
+    async fn watching_recipients(
+        &self,
+        cids: &[u64],
+        exclude: Option<SocketAddr>,
+    ) -> Vec<SocketAddr> {
+        let state = self.state.lock().await;
+        state
+            .clients
+            .values()
+            .filter(|c| {
+                c.handshake_phase == HandshakePhase::Connected
+                    && exclude.map_or(true, |ep| c.endpoint != ep)
+                    && cids.iter().any(|cid| c.subscribed_channels.contains(cid))
+            })
+            .map(|c| c.endpoint)
+            .collect()
+    }
+
+    /// Recipients for a channel switch `from_cid -> to_cid` of a client:
+    /// watchers of `from_cid` already know the mover (they get the moved
+    /// notification), watchers of only `to_cid` have never seen it (they get
+    /// an enter view instead).
+    async fn move_recipients(
+        &self,
+        from_cid: u64,
+        to_cid: u64,
+        exclude: SocketAddr,
+    ) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+        let state = self.state.lock().await;
+        let mut moved = Vec::new();
+        let mut entered = Vec::new();
+        for c in state.clients.values() {
+            if c.endpoint == exclude || c.handshake_phase != HandshakePhase::Connected {
+                continue;
+            }
+            if c.subscribed_channels.contains(&from_cid) {
+                moved.push(c.endpoint);
+            } else if c.subscribed_channels.contains(&to_cid) {
+                entered.push(c.endpoint);
+            }
+        }
+        (moved, entered)
+    }
+
+    /// Sends the subscriber fresh enter views (reasonid=2, Subscription) for
+    /// every connected client in the given channels except the subscriber
+    /// itself. The official client drops users from its view when it
+    /// unsubscribes, so a (re)subscribe must re-announce them or they never
+    /// reappear and later notifications about them kill the client.
+    async fn send_subscription_enter_views(&self, peer: SocketAddr, own_clid: u16, channels: &[u64]) {
+        if channels.is_empty() {
+            return;
+        }
+        let occupants: Vec<(u16, String, String, u64, bool, ClientAudioState)> = {
+            let state = self.state.lock().await;
+            state
+                .clients
+                .values()
+                .filter(|c| {
+                    c.handshake_phase == HandshakePhase::Connected
+                        && c.clid != own_clid
+                        && channels.contains(&c.current_channel_id)
+                })
+                .map(|c| {
+                    (
+                        c.clid,
+                        c.uid.clone(),
+                        c.nickname.clone(),
+                        c.current_channel_id,
+                        c.is_admin,
+                        c.audio,
+                    )
+                })
+                .collect()
+        };
+        for (clid, uid, nickname, cid, is_admin, audio) in occupants {
+            let view = build_client_enter_view("2", clid, &uid, &nickname, cid, 0, is_admin, audio);
+            let _ = self.send_encrypted_command(peer, &view).await;
+        }
+    }
+
+    /// Tell every connected client that `gone_clid` left the server.
+    /// Matches the official format captured for timeouts:
+    /// `notifyclientleftview cfid=<cid> ctid=0 reasonid=3 reasonmsg=connection lost clid=<id>`.
+    async fn broadcast_client_left(
+        &self,
+        gone_clid: u16,
+        gone_cid: u64,
+        reasonid: &str,
+        reasonmsg: &str,
+    ) {
+        let recipients = self.watching_recipients(&[gone_cid], None).await;
+        let mut notify = Command::new("notifyclientleftview");
+        notify.set("clid", gone_clid.to_string());
+        notify.set("cfid", gone_cid.to_string());
+        notify.set("ctid", "0");
+        notify.set("reasonid", reasonid);
+        notify.set("reasonmsg", reasonmsg);
+        for ep in recipients {
+            let _ = self.send_encrypted_command(ep, &notify).await;
+        }
+        info!(
+            "Broadcast left view for vanished client {} (reason {})",
+            gone_clid, reasonid
+        );
+    }
+
+    /// Tell every connected client that the server is going away so the
+    /// official client disconnects immediately instead of waiting for its
+    /// keepalive timeout. Captured from the official 3.13.7 server on
+    /// `serverstop`: it sends each client its own left view with reasonid 11
+    /// (`ClientdisconnectServerShutdown`) and reasonmsg "Server Shutdown!".
+    /// (reasonid 7 is rejected by the 3.6.2 client with "invalid parameter".)
+    pub async fn shutdown(&self) {
+        let targets: Vec<(SocketAddr, u16, u64)> = {
+            let mut state = self.state.lock().await;
+            state
+                .clients
+                .values_mut()
+                .filter(|c| c.handshake_phase == HandshakePhase::Connected)
+                .map(|c| (c.endpoint, c.clid, c.current_channel_id))
+                .collect()
+        };
+
+        for (ep, target_clid, cid) in targets {
+            let mut notify = Command::new("notifyclientleftview");
+            notify.set("clid", target_clid.to_string());
+            notify.set("cfid", cid.to_string());
+            notify.set("ctid", "0");
+            notify.set("reasonid", "11");
+            notify.set("reasonmsg", "Server Shutdown!");
+            let _ = self.send_encrypted_command(ep, &notify).await;
+
+            let mut state = self.state.lock().await;
+            if let Some(c) = state.clients.get_mut(&ep) {
+                c.handshake_phase = HandshakePhase::Disconnected;
+                c.disconnect_time = Some(std::time::Instant::now());
+            }
+            info!("Notified client {} of server shutdown", target_clid);
+        }
+
+        // Give the final packets a moment to flush before the process exits.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
     async fn handle_packet(&self, peer: SocketAddr, data: &[u8]) -> Result<(), String> {
         let in_pkt = match InPacket::try_new(Direction::C2S, data) {
             Ok(pkt) => pkt,
@@ -432,12 +581,21 @@ impl Server {
         let p_type = in_pkt.header().packet_type();
         let p_id = in_pkt.header().packet_id();
 
-        {
+        let disappeared = {
             let mut state = self.state.lock().await;
-            state.cleanup_stale();
+            let disappeared = state.cleanup_stale();
             if let Some(c) = state.get_client_mut(&peer) {
                 c.last_activity = std::time::Instant::now();
             }
+            disappeared
+        };
+
+        // Sessions that vanished without a disconnect must be announced as
+        // gone, or every client still holding their clid in view will
+        // reject later notifications about it ("invalid clientID").
+        for (gone_clid, gone_cid) in disappeared {
+            self.broadcast_client_left(gone_clid, gone_cid, "3", "connection lost")
+                .await;
         }
 
         match p_type {
@@ -484,10 +642,19 @@ impl Server {
     async fn handle_init(&self, peer: SocketAddr, in_pkt: InPacket<'_>) -> Result<(), String> {
         let c2s_init = in_pkt.into_c2sinit().map_err(|e| format!("{:?}", e))?;
         let mut state = self.state.lock().await;
+        let mut replaced_connected: Option<(u16, u64)> = None;
 
         match c2s_init.data() {
             C2SInitData::Init0 { random0, .. } => {
                 info!("Handshake Init0 from {}", peer);
+                // If this endpoint replaces a fully connected session (the
+                // old connection died without a disconnect), remember it so
+                // we can announce its departure after the handshake reply.
+                if let Some(old) = state.get_client(&peer) {
+                    if old.handshake_phase == HandshakePhase::Connected {
+                        replaced_connected = Some((old.clid, old.current_channel_id));
+                    }
+                }
                 let client = state.reset_or_create_client(peer);
                 let r0_rev = [random0[3], random0[2], random0[1], random0[0]];
                 let mut r1 = [0u8; 16];
@@ -598,6 +765,13 @@ impl Server {
                     peer
                 );
             }
+        }
+
+        drop(state);
+
+        if let Some((old_clid, old_cid)) = replaced_connected {
+            self.broadcast_client_left(old_clid, old_cid, "3", "connection lost")
+                .await;
         }
 
         Ok(())
@@ -735,25 +909,62 @@ impl Server {
                 None => return Err("Client session not found".into()),
             };
 
-            // Detect duplicate retransmissions (older than expected_c2s_packet_id)
-            let diff = p_id.wrapping_sub(client.expected_c2s_packet_id);
+            // The Command and CommandLow packet types carry independent
+            // packet-id sequences (the official client sends e.g. clientpoke
+            // on CommandLow starting at pid 0). Track them separately;
+            // sharing one tracker drops every low packet as a stale
+            // "retransmission".
+            let is_low = p_type == PacketType::CommandLow;
+            let expected = if is_low {
+                client.expected_c2s_low_packet_id
+            } else {
+                client.expected_c2s_packet_id
+            };
+
+            // Detect duplicate retransmissions (older than the expected id)
+            let diff = p_id.wrapping_sub(expected);
             if diff > 32768 {
                 debug!(
-                    "Ignoring retransmitted packet {} for clid {} (expected {})",
-                    p_id, clid, client.expected_c2s_packet_id
+                    "Ignoring retransmitted {} packet {} for clid {} (expected {})",
+                    if is_low { "low" } else { "command" },
+                    p_id,
+                    clid,
+                    expected
                 );
                 return Ok(());
             }
 
-            client
-                .pending_packets
-                .insert(p_id, (flags, decrypted_bytes));
-
-            while let Some((cmd_text, consumed)) =
-                try_assemble_next(&mut client.pending_packets, client.expected_c2s_packet_id)
             {
-                client.expected_c2s_packet_id =
-                    client.expected_c2s_packet_id.wrapping_add(consumed);
+                let pending = if is_low {
+                    &mut client.pending_low_packets
+                } else {
+                    &mut client.pending_packets
+                };
+                pending.insert(p_id, (flags, decrypted_bytes));
+            }
+
+            loop {
+                let (cmd_text, consumed) = if is_low {
+                    let expected_low = client.expected_c2s_low_packet_id;
+                    match try_assemble_next(&mut client.pending_low_packets, expected_low) {
+                        Some((text, consumed)) => {
+                            client.expected_c2s_low_packet_id =
+                                expected_low.wrapping_add(consumed);
+                            (text, consumed)
+                        }
+                        None => break,
+                    }
+                } else {
+                    let expected_cmd = client.expected_c2s_packet_id;
+                    match try_assemble_next(&mut client.pending_packets, expected_cmd) {
+                        Some((text, consumed)) => {
+                            client.expected_c2s_packet_id =
+                                expected_cmd.wrapping_add(consumed);
+                            (text, consumed)
+                        }
+                        None => break,
+                    }
+                };
                 if consumed == 1 {
                     info!(
                         "Received complete single-packet command from clid {}: {}",
@@ -946,7 +1157,9 @@ impl Server {
                 initserver.set("virtualserver_min_client_version", "1560850141");
                 initserver.set("acn", &nickname);
                 initserver.set("aclid", clid.to_string());
-                initserver.set("pv", "4");
+                // Official 3.13.7 sends protocol version 7 here (captured via
+                // MITM); the client gates server-feature behavior on it.
+                initserver.set("pv", "7");
                 initserver.set("client_nickname", &nickname);
                 initserver.set("client_version", "3.6.2 [Build: 1695203293]");
                 initserver.set("client_platform", "Windows");
@@ -1040,23 +1253,31 @@ impl Server {
                 }
 
                 // 4. Announce the newcomer to all other connected clients.
+                // The connect flow above hands the newcomer every existing
+                // client's view, so mirror that in its own subscription
+                // state: it is effectively subscribed to every channel until
+                // it explicitly changes that.
+                {
+                    let all_cids = {
+                        let db = self.db.lock().await;
+                        db.get_channels()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|ch| ch.cid)
+                            .collect::<Vec<_>>()
+                    };
+                    let mut state = self.state.lock().await;
+                    if let Some(c) = state.get_client_mut(&peer) {
+                        c.subscribed_channels.extend(all_cids);
+                    }
+                }
+
                 let newcomer_view =
                     build_client_enter_view("0", clid, &uid, &nickname, 1, 0, is_admin, audio);
-                let other_endpoints: Vec<SocketAddr> = {
-                    let state = self.state.lock().await;
-                    state
-                        .clients
-                        .values()
-                        .filter(|c| {
-                            c.clid != clid
-                                && c.handshake_phase == HandshakePhase::Connected
-                                && c.last_activity.elapsed() < std::time::Duration::from_secs(45)
-                        })
-                        .map(|c| c.endpoint)
-                        .collect()
-                };
-                for ep in other_endpoints {
-                    let _ = self.send_encrypted_command(ep, &newcomer_view).await;
+                let other_endpoints = self.watching_recipients(&[1], Some(peer)).await;
+                for ep in &other_endpoints {
+                    let _ = self.send_encrypted_command(*ep, &newcomer_view).await;
+                    let _ = self.send_encrypted_raw(*ep, &format!("notifyclientpermhints clid={} flags=65535", clid)).await;
                 }
 
                 // 6. Publish channel-group names, followed by the baseline
@@ -1077,6 +1298,32 @@ impl Server {
                 if is_admin {
                     self.send_channel_group_perm_list(peer, 5).await?;
                 }
+
+                // Send channel and client permission hints to enable client
+                // UI buttons (menu actions are gated on these; without them
+                // even the Poke menu item does nothing).
+                let channels = {
+                    let db = self.db.lock().await;
+                    db.get_channels().unwrap_or_default()
+                };
+                if !channels.is_empty() {
+                    let mut ch_hints_wire = String::from("notifychannelpermhints ");
+                    for (i, ch) in channels.iter().enumerate() {
+                        if i > 0 {
+                            ch_hints_wire.push('|');
+                        }
+                        let flags = if ch.is_default { "1027" } else { "65535" };
+                        ch_hints_wire.push_str(&format!("cid={} flags={}", ch.cid, flags));
+                    }
+                    self.send_encrypted_raw(peer, &ch_hints_wire).await?;
+                }
+
+                let mut cl_hints_wire = String::from("notifyclientpermhints ");
+                cl_hints_wire.push_str(&format!("clid={} flags=65535", clid));
+                for (other_clid, ..) in &existing_clients {
+                    cl_hints_wire.push_str(&format!("|clid={} flags=65535", other_clid));
+                }
+                self.send_encrypted_raw(peer, &cl_hints_wire).await?;
 
                 // 8. Success for the clientinit request itself.
                 let mut err_resp = Command::new("error");
@@ -1151,14 +1398,23 @@ impl Server {
                         .collect::<Vec<_>>()
                 };
 
-                let (notification_name, notification_ids) = {
+                let (notification_name, notification_ids, own_clid) = {
                     let mut state = self.state.lock().await;
                     match state.get_client_mut(&peer) {
                         Some(client) if subscribe => {
-                            client
-                                .subscribed_channels
-                                .extend(channel_ids.iter().copied());
-                            ("notifychannelsubscribed", channel_ids)
+                            let own_clid = client.clid;
+                            // Only channels that are genuinely new to this
+                            // client's subscription get a notification and a
+                            // re-announcement of their users; re-sending
+                            // enter views for clients the receiver already
+                            // knows aborts it ("Already known Client
+                            // entering").
+                            let newly: Vec<u64> = channel_ids
+                                .iter()
+                                .copied()
+                                .filter(|cid| client.subscribed_channels.insert(*cid))
+                                .collect();
+                            ("notifychannelsubscribed", newly, Some(own_clid))
                         }
                         Some(client) => {
                             let current_channel = client.current_channel_id;
@@ -1170,9 +1426,9 @@ impl Server {
                                 .collect::<Vec<_>>();
                             client.subscribed_channels.clear();
                             client.subscribed_channels.insert(current_channel);
-                            ("notifychannelunsubscribed", unsubscribe_ids)
+                            ("notifychannelunsubscribed", unsubscribe_ids, None)
                         }
-                        None => ("notifychannelunsubscribed", Vec::new()),
+                        None => ("notifychannelunsubscribed", Vec::new(), None),
                     }
                 };
 
@@ -1182,6 +1438,13 @@ impl Server {
                         &notification_ids,
                     );
                     self.send_encrypted_raw(peer, &wire).await?;
+                }
+
+                if subscribe {
+                    if let Some(own_clid) = own_clid {
+                        self.send_subscription_enter_views(peer, own_clid, &notification_ids)
+                            .await;
+                    }
                 }
 
                 let mut err_resp = Command::new("error");
@@ -1208,17 +1471,18 @@ impl Server {
                     .filter(|cid| available.contains(cid))
                     .collect::<Vec<_>>();
 
-                let (notification_name, notification_ids) = {
+                let (notification_name, notification_ids, own_clid) = {
                     let mut state = self.state.lock().await;
                     match state.get_client_mut(&peer) {
                         Some(client) if subscribe => {
+                            let own_clid = client.clid;
                             let mut newly_subscribed = Vec::new();
                             for cid in requested {
                                 if client.subscribed_channels.insert(cid) {
                                     newly_subscribed.push(cid);
                                 }
                             }
-                            ("notifychannelsubscribed", newly_subscribed)
+                            ("notifychannelsubscribed", newly_subscribed, Some(own_clid))
                         }
                         Some(client) => {
                             let current_channel = client.current_channel_id;
@@ -1229,9 +1493,9 @@ impl Server {
                                     unsubscribe_ids.push(cid);
                                 }
                             }
-                            ("notifychannelunsubscribed", unsubscribe_ids)
+                            ("notifychannelunsubscribed", unsubscribe_ids, None)
                         }
-                        None => ("notifychannelunsubscribed", Vec::new()),
+                        None => ("notifychannelunsubscribed", Vec::new(), None),
                     }
                 };
 
@@ -1241,6 +1505,13 @@ impl Server {
                         &notification_ids,
                     );
                     self.send_encrypted_raw(peer, &wire).await?;
+                }
+
+                if subscribe {
+                    if let Some(own_clid) = own_clid {
+                        self.send_subscription_enter_views(peer, own_clid, &notification_ids)
+                            .await;
+                    }
                 }
 
                 let mut err_resp = Command::new("error");
@@ -1299,26 +1570,73 @@ impl Server {
             }
             "clientmove" => {
                 let new_cid: u64 = cmd.get("cid").and_then(|s| s.parse().ok()).unwrap_or(1);
-                {
+                // Moving to the channel the client is already in must be a
+                // silent no-op: broadcasting a redundant notifyclientmoved
+                // makes the official client disconnect with "Invalid Client
+                // moving: already member of channel" (seen with 3.6.2 when
+                // a channel row is double-clicked twice in a row).
+                let move_ctx = {
                     let mut state = self.state.lock().await;
-                    if let Some(c) = state.get_client_mut(&peer) {
-                        c.current_channel_id = new_cid;
-                        c.subscribed_channels.insert(new_cid);
+                    match state.get_client_mut(&peer) {
+                        Some(c) if c.current_channel_id != new_cid => {
+                            let old = c.current_channel_id;
+                            let was_watching = c.subscribed_channels.contains(&new_cid);
+                            c.current_channel_id = new_cid;
+                            c.subscribed_channels.insert(new_cid);
+                            Some((
+                                old,
+                                was_watching,
+                                c.uid.clone(),
+                                c.nickname.clone(),
+                                c.is_admin,
+                                c.audio,
+                            ))
+                        }
+                        _ => None,
                     }
-                }
-
-                let mut notify = Command::new("notifyclientmoved");
-                notify.set("ctid", new_cid.to_string());
-                notify.set("reasonid", "0");
-                notify.set("reasonmsg", "");
-                notify.set("clid", clid.to_string());
-
-                let all_peers: Vec<SocketAddr> = {
-                    let state = self.state.lock().await;
-                    state.clients.values().map(|c| c.endpoint).collect()
                 };
-                for ep in all_peers {
-                    let _ = self.send_encrypted_command(ep, &notify).await;
+
+                if let Some((old_cid, was_watching, mover_uid, mover_nick, mover_admin, mover_audio)) =
+                    move_ctx
+                {
+                    let mut notify = Command::new("notifyclientmoved");
+                    notify.set("clid", clid.to_string());
+                    notify.set("cfid", old_cid.to_string());
+                    notify.set("ctid", new_cid.to_string());
+                    notify.set("reasonid", "0");
+
+                    // Watchers of the old channel know the mover: they get
+                    // the moved notification. Watchers of only the new
+                    // channel have never seen it: they get an enter view
+                    // instead, or the client aborts with "invalid clientID".
+                    let (mut moved_eps, enter_eps) =
+                        self.move_recipients(old_cid, new_cid, peer).await;
+                    moved_eps.push(peer);
+                    for ep in &moved_eps {
+                        let _ = self.send_encrypted_command(*ep, &notify).await;
+                    }
+
+                    for ep in &enter_eps {
+                        let view = build_client_enter_view(
+                            "0",
+                            clid,
+                            &mover_uid,
+                            &mover_nick,
+                            new_cid,
+                            old_cid,
+                            mover_admin,
+                            mover_audio,
+                        );
+                        let _ = self.send_encrypted_command(*ep, &view).await;
+                    }
+
+                    // If the mover was not watching the new channel before,
+                    // it has never seen that channel's occupants: deliver
+                    // their enter views so they become visible.
+                    if !was_watching {
+                        self.send_subscription_enter_views(peer, clid, &[new_cid])
+                            .await;
+                    }
                 }
 
                 let mut err_resp = Command::new("error");
@@ -1327,7 +1645,7 @@ impl Server {
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
-                let _ = self.send_encrypted_command(peer, &err_resp).await;
+                let _ = self.send_encrypted_command(peer, &err_resp).await?;
             }
             "servergetvariables" => {
                 let port = self.local_addr().map(|a| a.port()).unwrap_or(9988);
@@ -1611,6 +1929,7 @@ impl Server {
                         state.clients.values().map(|c| c.endpoint).collect()
                     };
                     if let Some(notify) = notify {
+
                         for ep in all_peers {
                             let _ = self.send_encrypted_command(ep, &notify).await;
                         }
@@ -1791,7 +2110,14 @@ impl Server {
                                     {
                                         client.current_channel_id = default_cid;
                                         client.subscribed_channels.insert(default_cid);
-                                        move_clients.push(client.clid);
+                                        move_clients.push((
+                                            client.clid,
+                                            client.endpoint,
+                                            client.uid.clone(),
+                                            client.nickname.clone(),
+                                            client.is_admin,
+                                            client.audio,
+                                        ));
                                     }
                                 }
                                 let recipients = state
@@ -1805,7 +2131,9 @@ impl Server {
                                 (move_clients, recipients)
                             };
 
-                            for moved_clid in move_clients {
+                            for (moved_clid, moved_ep, moved_uid, moved_nick, moved_admin, moved_audio) in
+                                move_clients
+                            {
                                 let mut moved = Command::new("notifyclientmoved");
                                 moved.set("clid", moved_clid.to_string());
                                 moved.set("cfid", cid.to_string());
@@ -1815,8 +2143,27 @@ impl Server {
                                 moved.set("invokerid", clid.to_string());
                                 moved.set("invokername", &nickname);
                                 moved.set("invokeruid", &uid);
-                                for recipient in &recipients {
+                                // Watchers of the deleted channel know the
+                                // moved client; watchers of only the default
+                                // channel get an enter view instead.
+                                let (mut moved_eps, enter_eps) =
+                                    self.move_recipients(cid, default_cid, moved_ep).await;
+                                moved_eps.push(moved_ep);
+                                for recipient in &moved_eps {
                                     let _ = self.send_encrypted_command(*recipient, &moved).await;
+                                }
+                                for recipient in &enter_eps {
+                                    let view = build_client_enter_view(
+                                        "0",
+                                        moved_clid,
+                                        &moved_uid,
+                                        &moved_nick,
+                                        default_cid,
+                                        cid,
+                                        moved_admin,
+                                        moved_audio,
+                                    );
+                                    let _ = self.send_encrypted_command(*recipient, &view).await;
                                 }
                             }
 
@@ -1925,26 +2272,18 @@ impl Server {
                 let reason_id = cmd.get("reasonid").unwrap_or("3");
                 let reason_msg = cmd.get("reasonmsg").unwrap_or("");
 
-                let (cur_cid, other_peers) = {
+                let cur_cid = {
                     let mut state = self.state.lock().await;
-                    let cid = match state.get_client_mut(&peer) {
+                    match state.get_client_mut(&peer) {
                         Some(c) => {
                             c.handshake_phase = HandshakePhase::Disconnected;
                             c.disconnect_time = Some(std::time::Instant::now());
                             c.current_channel_id
                         }
                         None => 1,
-                    };
-                    let others: Vec<SocketAddr> = state
-                        .clients
-                        .values()
-                        .filter(|other| {
-                            other.clid != clid && other.handshake_phase == HandshakePhase::Connected
-                        })
-                        .map(|other| other.endpoint)
-                        .collect();
-                    (cid, others)
+                    }
                 };
+                let other_peers = self.watching_recipients(&[cur_cid], Some(peer)).await;
 
                 // 1. Confirm the clientdisconnect command itself.
                 let mut err_resp = Command::new("error");
@@ -2038,26 +2377,46 @@ impl Server {
                                     moved.set("cfid", old_cid.to_string());
                                     moved.set("ctid", default_cid.to_string());
                                     moved.set("reasonid", "4");
-                                    if !reason_msg.is_empty() {
-                                        moved.set("reasonmsg", reason_msg);
-                                    }
+                                    // The official server always includes
+                                    // reasonmsg (possibly empty); without the
+                                    // parameter the official client aborts
+                                    // with "parameter not found".
+                                    moved.set("reasonmsg", reason_msg);
                                     moved.set("invokerid", clid.to_string());
                                     moved.set("invokername", &invoker_nickname);
                                     moved.set("invokeruid", &invoker_uid);
 
-                                    let all_peers: Vec<SocketAddr> = {
+                                    // Watchers of the old channel know the
+                                    // target; watchers of only the default
+                                    // channel need an enter view instead.
+                                    let target_details = {
                                         let state = self.state.lock().await;
                                         state
                                             .clients
-                                            .values()
-                                            .filter(|c| {
-                                                c.handshake_phase == HandshakePhase::Connected
-                                            })
-                                            .map(|c| c.endpoint)
-                                            .collect()
+                                            .get(&target_ep)
+                                            .map(|c| (c.uid.clone(), c.is_admin, c.audio))
                                     };
-                                    for ep in all_peers {
-                                        let _ = self.send_encrypted_command(ep, &moved).await;
+                                    let (mut moved_eps, enter_eps) = self
+                                        .move_recipients(old_cid, default_cid, target_ep)
+                                        .await;
+                                    moved_eps.push(target_ep);
+                                    for ep in &moved_eps {
+                                        let _ = self.send_encrypted_command(*ep, &moved).await;
+                                    }
+                                    if let Some((t_uid, t_admin, t_audio)) = target_details {
+                                        for ep in &enter_eps {
+                                            let view = build_client_enter_view(
+                                                "0",
+                                                target_clid,
+                                                &t_uid,
+                                                &target_nick,
+                                                default_cid,
+                                                old_cid,
+                                                t_admin,
+                                                t_audio,
+                                            );
+                                            let _ = self.send_encrypted_command(*ep, &view).await;
+                                        }
                                     }
 
                                     info!(
@@ -2074,9 +2433,7 @@ impl Server {
                                 notify.set("cfid", old_cid.to_string());
                                 notify.set("ctid", "0");
                                 notify.set("reasonid", "5");
-                                if !reason_msg.is_empty() {
-                                    notify.set("reasonmsg", reason_msg);
-                                }
+                                notify.set("reasonmsg", reason_msg);
                                 notify.set("invokerid", clid.to_string());
                                 notify.set("invokername", &invoker_nickname);
                                 notify.set("invokeruid", &invoker_uid);
@@ -2084,22 +2441,16 @@ impl Server {
                                 // Send to kicked client first
                                 let _ = self.send_encrypted_command(target_ep, &notify).await;
 
-                                let other_peers: Vec<SocketAddr> = {
+                                {
                                     let mut state = self.state.lock().await;
                                     if let Some(c) = state.clients.get_mut(&target_ep) {
                                         c.handshake_phase = HandshakePhase::Disconnected;
                                         c.disconnect_time = Some(std::time::Instant::now());
                                     }
-                                    state
-                                        .clients
-                                        .values()
-                                        .filter(|c| {
-                                            c.endpoint != target_ep
-                                                && c.handshake_phase == HandshakePhase::Connected
-                                        })
-                                        .map(|c| c.endpoint)
-                                        .collect()
-                                };
+                                }
+                                let other_peers = self
+                                    .watching_recipients(&[old_cid], Some(target_ep))
+                                    .await;
 
                                 for ep in other_peers {
                                     let _ = self.send_encrypted_command(ep, &notify).await;
@@ -2127,8 +2478,64 @@ impl Server {
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
+            "clientpoke" => {
+                let target_clid: Option<u16> = cmd.get("clid").and_then(|v| v.parse().ok());
+                let poke_msg = cmd.get("msg").unwrap_or("").to_string();
+
+                let (invoker_nickname, invoker_uid) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.nickname.clone(), c.uid.clone()))
+                        .unwrap_or_else(|| ("User".to_string(), String::new()))
+                };
+
+                let mut err_resp = Command::new("error");
+                let target_ep = {
+                    let state = self.state.lock().await;
+                    target_clid.and_then(|target_clid| {
+                        state
+                            .clients
+                            .values()
+                            .find(|c| {
+                                c.clid == target_clid
+                                    && c.handshake_phase == HandshakePhase::Connected
+                            })
+                            .map(|c| c.endpoint)
+                    })
+                };
+
+                match target_ep {
+                    Some(target_ep) => {
+                        let mut poke = Command::new("notifyclientpoke");
+                        poke.set("invokerid", clid.to_string());
+                        poke.set("invokername", &invoker_nickname);
+                        poke.set("invokeruid", &invoker_uid);
+                        poke.set("msg", &poke_msg);
+                        let _ = self.send_encrypted_command(target_ep, &poke).await;
+
+                        info!(
+                            "Client {} ({}) poked client {} with message '{}'",
+                            clid, invoker_nickname, target_clid.unwrap(), poke_msg
+                        );
+                        err_resp.set("id", "0");
+                        err_resp.set("msg", "ok");
+                    }
+                    None => {
+                        err_resp.set("id", "512");
+                        err_resp.set("msg", "invalid clientID");
+                    }
+                }
+
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
             "banclient" => {
                 let target_clid: Option<u16> = cmd.get("clid").and_then(|v| v.parse().ok());
+                let target_uid_param = cmd.get("uid").unwrap_or("");
+                let target_cldbid: Option<u64> = cmd.get("cldbid").and_then(|v| v.parse().ok());
                 let duration: i64 = cmd.get("time").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let ban_reason = cmd.get("banreason").unwrap_or("");
 
@@ -2144,18 +2551,23 @@ impl Server {
                 if !is_admin {
                     err_resp.set("id", "2563");
                     err_resp.set("msg", "insufficient client permissions");
-                } else if let Some(target_clid) = target_clid {
+                } else {
                     let target_info = {
                         let state = self.state.lock().await;
                         state
                             .clients
                             .values()
                             .find(|c| {
-                                c.clid == target_clid
-                                    && c.handshake_phase == HandshakePhase::Connected
+                                c.handshake_phase == HandshakePhase::Connected
+                                    && (
+                                        target_clid.map_or(false, |clid| c.clid == clid)
+                                            || (!target_uid_param.is_empty() && c.uid == target_uid_param)
+                                            || target_cldbid.map_or(false, |cldbid| c.clid as u64 == cldbid)
+                                    )
                             })
                             .map(|c| {
                                 (
+                                    c.clid,
                                     c.endpoint,
                                     c.current_channel_id,
                                     c.nickname.clone(),
@@ -2164,48 +2576,56 @@ impl Server {
                             })
                     };
 
-                    match target_info {
-                        None => {
-                            err_resp.set("id", "512");
-                            err_resp.set("msg", "invalid clientID");
-                        }
-                        Some((target_ep, old_cid, target_nick, target_uid)) => {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64;
+                    let (found_target, target_clid_opt, target_ep_opt, old_cid_opt, target_nick, target_uid, target_ip) =
+                        if let Some((t_clid, t_ep, t_cid, t_nick, t_uid)) = target_info {
+                            let ip = t_ep.ip().to_string();
+                            (true, Some(t_clid), Some(t_ep), Some(t_cid), t_nick, t_uid, ip)
+                        } else if !target_uid_param.is_empty() {
+                            let name = cmd.get("name").unwrap_or("").to_string();
+                            (true, None, None, None, name, target_uid_param.to_string(), String::new())
+                        } else {
+                            (false, None, None, None, String::new(), String::new(), String::new())
+                        };
 
-                            let target_ip = target_ep.ip().to_string();
-                            let ban_record = BanRecord {
-                                ip: target_ip,
-                                name: target_nick.clone(),
-                                uid: target_uid,
-                                mytsid: String::new(),
-                                lastnickname: target_nick.clone(),
-                                created: now,
-                                duration,
-                                invokercldbid: clid as u64,
-                                invokername: invoker_nickname.clone(),
-                                invokeruid: invoker_uid.clone(),
-                                reason: ban_reason.to_string(),
-                                enforcements: 0,
-                                ..Default::default()
-                            };
+                    if !found_target {
+                        err_resp.set("id", "512");
+                        err_resp.set("msg", "invalid clientID");
+                    } else {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
 
-                            let ban_id = {
-                                let db = self.db.lock().await;
-                                db.add_ban(&ban_record).unwrap_or(0)
-                            };
+                        let ban_record = BanRecord {
+                            ip: target_ip,
+                            name: target_nick.clone(),
+                            uid: target_uid,
+                            mytsid: String::new(),
+                            lastnickname: target_nick.clone(),
+                            created: now,
+                            duration,
+                            invokercldbid: clid as u64,
+                            invokername: invoker_nickname.clone(),
+                            invokeruid: invoker_uid.clone(),
+                            reason: ban_reason.to_string(),
+                            enforcements: 0,
+                            ..Default::default()
+                        };
 
+                        let ban_id = {
+                            let db = self.db.lock().await;
+                            db.add_ban(&ban_record).unwrap_or(0)
+                        };
+
+                        if let (Some(target_clid), Some(target_ep), Some(old_cid)) = (target_clid_opt, target_ep_opt, old_cid_opt) {
                             // Disconnect target client with reasonid=6 (Banned)
                             let mut notify = Command::new("notifyclientleftview");
                             notify.set("clid", target_clid.to_string());
                             notify.set("cfid", old_cid.to_string());
                             notify.set("ctid", "0");
                             notify.set("reasonid", "6");
-                            if !ban_reason.is_empty() {
-                                notify.set("reasonmsg", ban_reason);
-                            }
+                            notify.set("bantime", duration.to_string());
+                            notify.set("reasonmsg", ban_reason);
                             notify.set("invokerid", clid.to_string());
                             notify.set("invokername", &invoker_nickname);
                             notify.set("invokeruid", &invoker_uid);
@@ -2213,22 +2633,16 @@ impl Server {
                             // Send to banned client first
                             let _ = self.send_encrypted_command(target_ep, &notify).await;
 
-                            let other_peers: Vec<SocketAddr> = {
+                            {
                                 let mut state = self.state.lock().await;
                                 if let Some(c) = state.clients.get_mut(&target_ep) {
                                     c.handshake_phase = HandshakePhase::Disconnected;
                                     c.disconnect_time = Some(std::time::Instant::now());
                                 }
-                                state
-                                    .clients
-                                    .values()
-                                    .filter(|c| {
-                                        c.endpoint != target_ep
-                                            && c.handshake_phase == HandshakePhase::Connected
-                                    })
-                                    .map(|c| c.endpoint)
-                                    .collect()
-                            };
+                            }
+                            let other_peers = self
+                                .watching_recipients(&[old_cid], Some(target_ep))
+                                .await;
 
                             for ep in other_peers {
                                 let _ = self.send_encrypted_command(ep, &notify).await;
@@ -2238,19 +2652,17 @@ impl Server {
                                 "Client {} banned {} ({}) ban_id={}",
                                 clid, target_clid, target_nick, ban_id
                             );
-
-                            let _ = self
-                                .send_encrypted_raw(peer, &format!("banid={}", ban_id))
-                                .await;
-
-                            err_resp.set("id", "0");
-                            err_resp.set("msg", "ok");
-                            err_resp.set("banid", ban_id.to_string());
+                        } else {
+                            info!(
+                                "Client {} added ban for uid {} ban_id={}",
+                                clid, target_uid_param, ban_id
+                            );
                         }
+
+                        err_resp.set("id", "0");
+                        err_resp.set("msg", "ok");
+                        err_resp.set("banid", ban_id.to_string());
                     }
-                } else {
-                    err_resp.set("id", "512");
-                    err_resp.set("msg", "invalid clientID");
                 }
 
                 if let Some(rc) = cmd.get("return_code") {
@@ -2330,40 +2742,29 @@ impl Server {
                         notify.set("cfid", old_cid.to_string());
                         notify.set("ctid", "0");
                         notify.set("reasonid", "6");
-                        if !ban_reason.is_empty() {
-                            notify.set("reasonmsg", ban_reason);
-                        }
+                        notify.set("bantime", duration.to_string());
+                        notify.set("reasonmsg", ban_reason);
                         notify.set("invokerid", clid.to_string());
                         notify.set("invokername", &invoker_nickname);
                         notify.set("invokeruid", &invoker_uid);
 
                         let _ = self.send_encrypted_command(target_ep, &notify).await;
 
-                        let other_peers: Vec<SocketAddr> = {
+                        {
                             let mut state = self.state.lock().await;
                             if let Some(c) = state.clients.get_mut(&target_ep) {
                                 c.handshake_phase = HandshakePhase::Disconnected;
                                 c.disconnect_time = Some(std::time::Instant::now());
                             }
-                            state
-                                .clients
-                                .values()
-                                .filter(|c| {
-                                    c.endpoint != target_ep
-                                        && c.handshake_phase == HandshakePhase::Connected
-                                    })
-                                .map(|c| c.endpoint)
-                                .collect()
-                        };
+                        }
+                        let other_peers = self
+                            .watching_recipients(&[old_cid], Some(target_ep))
+                            .await;
 
                         for ep in other_peers {
                             let _ = self.send_encrypted_command(ep, &notify).await;
                         }
                     }
-
-                    let _ = self
-                        .send_encrypted_raw(peer, &format!("banid={}", ban_id))
-                        .await;
 
                     err_resp.set("id", "0");
                     err_resp.set("msg", "ok");
@@ -2468,6 +2869,36 @@ impl Server {
                     err_resp.set("msg", "ok");
                 }
 
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "permissionlist" => {
+                // Full permid<->permname catalog, verbatim from an official
+                // 3.13.7 server. The client asks for this once and caches it;
+                // an empty answer leaves permission-name lookups permanently
+                // unresolved and holds permission-gated commands (pokes).
+                let wire = crate::permission_catalog::get_permission_catalog_wire();
+                self.send_encrypted_raw(peer, wire).await?;
+
+                let mut err_resp = Command::new("error");
+                err_resp.set("id", "0");
+                err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "ftgetfilelist" => {
+                // No file transfer support. The official 3.13.7 server answers
+                // ftgetfilelist for an empty channel with no notifications and
+                // this exact error (verified via a decrypted MITM capture):
+                // the client's Delete Channel / File Browser flows treat it as
+                // an empty listing and continue.
+                let mut err_resp = Command::new("error");
+                err_resp.set("id", "1281");
+                err_resp.set("msg", "database empty result set");
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
@@ -2619,7 +3050,12 @@ impl Server {
     /// `channellist`; by then its own client object already exists.
     async fn send_channel_list(&self, peer: SocketAddr) -> Result<(), String> {
         self.send_channel_entries(peer).await?;
-        self.send_channellist_finished(peer).await
+        self.send_channellist_finished(peer).await?;
+        let _ = {
+            let db = self.db.lock().await;
+            db.get_channels().unwrap_or_default()
+        };
+        Ok(())
     }
 
     /// Announces the server groups a client belongs to. All groups are sent

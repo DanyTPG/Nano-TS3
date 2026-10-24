@@ -228,3 +228,106 @@ Investigated without success:
   `clientID != m_clientID` in `serverview.cpp`);
 * mirroring the client fields in `initserver`.
 
+
+## Client actions (kick, poke, ban) — verified with client 3.6.2
+
+* `clientpoke clid=N msg=...`: reply `error id=0` to the invoker and send the
+  target `notifyclientpoke invokerid=<clid> invokername=<nick> invokeruid=<uid>
+  msg=<text>`. The 3.6.2 client shows the poke popup ("X poked you: msg").
+* `clientkick reasonid=4` must answer with `notifyclientmoved clid=<target>
+  cfid=<old> ctid=<default> reasonid=4` plus invoker fields; the target stays
+  connected in the default channel.
+* `banclient` stores the ban (ip+uid+name, duration seconds) and disconnects the
+  target with `notifyclientleftview ... reasonid=6 bantime=<secs>` plus invoker
+  fields. Bans are enforced at `clientinit` (`connection failed, you are
+  banned`).
+* `ftgetfilelist` on an empty channel must be answered with **no** notification
+  and exactly `error id=1281 msg=database empty result set` (captured from the
+  official 3.13.7 server). The Delete Channel flow queries the file list first;
+  any other answer stalls the dialog silently.
+
+## Same-channel moves
+
+`clientmove` to the channel the client is already in must be a silent no-op.
+Broadcasting a redundant `notifyclientmoved` makes client 3.6.2 disconnect with
+"Invalid Client moving: already member of channel" (double-clicking a channel
+row twice triggers this).
+
+## Graceful shutdown (verified against official 3.13.7)
+
+On shutdown the server sends every connected client its own
+`notifyclientleftview cfid=<cur> ctid=0 reasonid=11 reasonmsg=Server\sShutdown!
+clid=<own>` (captured from `serverstop` on the official server). The client then
+disconnects immediately and arms auto-reconnect ("want autoreconnect = 1").
+Notes:
+
+* reasonid must be **11** (`ClientdisconnectServerShutdown`); reasonid 7 is
+  rejected by client 3.6.2 with "invalid parameter".
+* reasonmsg is required; without it the client logs "parameter not found".
+
+## View consistency (critical, client 3.6.2)
+
+The official client maintains a strict per-clid view. Any notifyclientmoved /
+enterview / leftview that references a clid the receiver does not know aborts
+the connection ("invalid clientID"), and any kick-move without a `reasonmsg`
+parameter aborts it ("parameter not found"). Rules implemented:
+
+* `clientkick`/`banclient` notifications always carry `reasonmsg` (possibly
+  empty). Verified against a captured official kick:
+  `notifyclientmoved ctid=1 reasonid=4 invokerid=.. invokername=..
+  invokeruid=.. reasonmsg=cap clid=1`.
+* `channelsubscribeall`/`channelsubscribe` re-send `notifycliententerview`
+  (reasonid 2, Subscription) for the users of every NEWLY subscribed channel —
+  after unsubscribe-all the client has dropped them from its view, and without
+  the re-announcement they never reappear and later notifications kill the
+  client. Channels already subscribed are skipped: re-sending enter views for
+  known clients aborts with "Already known Client entering".
+* `clientmove` into a channel the mover was not subscribed to delivers the
+  occupants' enter views to the mover.
+* All enter/moved/leftview fan-outs go only to clients subscribed to a
+  relevant channel (watchers of the old channel get the moved view; watchers
+  of only the destination get an enter view).
+* Sessions that vanish without `clientdisconnect` (killed process, parse
+  abort, timeout) are announced with
+  `notifyclientleftview ... reasonid=3 reasonmsg=connection lost` — both when
+  the 120 s inactivity sweep drops them and when a reconnecting endpoint
+  replaces a still-connected session. Without this, the ghost clid poisons
+  every client view ("only one of two users can rejoin").
+
+## CommandLow stream (the clientpoke bug, SOLVED 2026-10-24)
+
+The official 3.6.2 client sends `clientpoke` on the **CommandLow** packet type
+(p_type 3), which carries a packet-id sequence **independent** of the Command
+stream, starting at pid 0 (captured: `clientpoke clid=4 msg=... return_code=1:e`
+as `CL pid=0` via MITM). Sharing one expected-pid tracker between Command and
+CommandLow made the server classify every poke as a stale "retransmission" and
+silently drop it; the client never received its ACK and held the built command
+in its send queue forever (verified by live process-memory scans). Fix:
+`ClientSession` tracks `expected_c2s_low_packet_id` + `pending_low_packets`
+separately; `handle_command` branches on `p_type == CommandLow`.
+
+Debugging techniques that cracked it (reusable):
+* **MITM + per-session IV recovery**: raw_proxy captures the wire; the shared
+  IV is found in the client process by scanning memory for a window whose
+  SHA1 prefix equals a captured unencrypted ping MAC (scan_iv), then
+  decrypt_log (or brute_decrypt for interleaved multi-session logs) rebuilds
+  the plaintext.
+* **Live memory scan of the client** (mem_scan.py): searching for the built
+  command string distinguishes "dialog never fired" (no string), "command
+  built but held" (string persists across scans), and "sent" (string vanishes).
+
+## Permission catalog
+
+The client sends `permissionlist` once and caches the permid<->name mapping.
+An empty answer leaves permission-name lookups unresolved. The server answers
+with the full 496-entry catalog captured from an official 3.13.7 server
+(src/permission_catalog.rs). Note: absent permhints disable context-menu
+actions entirely, but the menu can also be killed by wrong flag values —
+the flags field parses as i32 (4294967295 aborts the connection with
+"convert error"; 2147483647 is safe).
+
+## ftgetfilelist (empty channel)
+
+Answer with no notifications and exactly
+`error id=1281 msg=database empty result set` (official capture). Any other
+answer stalls the Delete Channel dialog silently.

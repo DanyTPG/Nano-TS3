@@ -22,8 +22,13 @@ redemption.
 | Text chat (`sendtextmessage` / `notifytextmessage`) | Working |
 | In-channel voice relay (Opus, unencrypted) | Payloads relay without codec encryption; live audio verification is pending |
 | `channelcreate` protocol handler (new `cid`, broadcast, duplicate rejection) | Working (covered by integration tests) |
-| `channeledit` / `channeldelete` | Implemented for root channels; channel-description reply fixed; Edit dialog verified with TS3 3.6.2 |
-| Channel creation from the official client's context menu | Enabled in official client 3.6.2; sort-order fix implemented |
+| `channeledit` / `channeldelete` (incl. the client's Delete Channel dialog) | Working with TS3 3.6.2; deletion broadcasts `notifychanneldeleted` and persists |
+| Channel creation from the official client's context menu | Working; sort-order fix implemented |
+| Kick from channel / from server (client context menu) | Working; `notifyclientmoved reasonid=4` / `notifyclientleftview reasonid=5` with invoker fields |
+| Ban client (`banclient`, bans persisted and enforced at connect) | Working; target disconnected with `reasonid=6` |
+| Poke client (`clientpoke` → `notifyclientpoke` popup) | Working (requires separate CommandLow packet-id tracking) |
+| Graceful server shutdown (Ctrl+C / console close) | Working; per-client `notifyclientleftview reasonid=11` per the official server; clients disconnect instantly with auto-reconnect |
+| Multi-user view consistency (subscribe toggle, join occupied channel, ghost sessions) | Working; enter-views re-sent on (re)subscribe; subscription-filtered fan-outs |
 | Graceful disconnect (`notifyclientleftview` to the leaving client itself) | Working (covered by tests) |
 
 ### Known limitation

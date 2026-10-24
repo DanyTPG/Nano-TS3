@@ -1,6 +1,6 @@
 # nano-ts3 Hand-Off
 
-Date: 2026-10-22
+Date: 2026-10-24
 Repository: `C:\Projects\Nano-TS3`
 Target: official TeamSpeak 3 Client 3.6.2 (`C:\Program Files\TeamSpeak 3 Client\ts3client_win64.exe`)
 Server: `nano-ts3`, UDP 9988, pure Rust.
@@ -9,76 +9,70 @@ Server: `nano-ts3`, UDP 9988, pure Rust.
 
 ## 1. Mission status
 
-The official client now connects, stays connected, sees other clients in the
-same channel, chats, redeems the privilege key, shows the Server Admin group and
-is recognised as admin on reconnect without asking for a key again.
+The official client 3.6.2 now exercises the full admin workflow against
+nano-ts3: connect, chat, redeem/hold admin, create/edit/**delete** channels
+(GUI, with confirmation dialog), **kick from channel and from server**,
+**ban**, **poke**, and it disconnects **gracefully on server shutdown**
+(auto-reconnect armed). Multi-user view consistency is fixed.
 
 | Goal | State | Evidence |
 | --- | --- | --- |
-| TS3 handshake Init0–Init4, initivexpand2, clientek, SharedIV | works | real client logs `Connect status: Connected` |
-| Encrypted commands, fragmentation, out-of-order reassembly | works | tests + real traffic |
-| Multiple clients visible with de-duplicated nicknames | works | five clients (`Dany`…`Dany3`) visible simultaneously |
-| Server Admin group/icon and channel group resolution | works | client info panel shows `Server Admin`, `Guest` |
-| Privilege key redemption from client popup | works | `tokenuse` logged, token marked used, UID persisted |
-| Admin recognised on reconnect without key prompt | works | reconnect shows `Server Admin`, no popup |
-| `channelcreate` protocol handler | works | tests; returns `cid`, broadcasts, rejects duplicates |
-| Channel creation from the client context menu | enabled; order fix implemented | user confirmed menu enabled; create had invalid order and disconnected, live retest pending |
-| Graceful disconnect | works (protocol) | tests; `notifyclientleftview` sent to leaving client too |
-| Voice relay | implemented, not exercised with two real mics | relay path only |
+| Handshake Init0-4, encrypted commands, fragmentation, reassembly | works | tests + real client |
+| Multiple clients, groups, privilege keys, chat | works | tests + live sessions |
+| Channel create / edit / **delete (GUI confirm dialog)** | works | `channeldelete` received, `notifychanneldeleted` broadcast, DB row removed, live tree update |
+| **Kick from channel / from server (GUI)** | works | `notifyclientmoved reasonid=4` / `notifyclientleftview reasonid=5` with invoker fields |
+| **Ban (GUI + wire)** | works | `notifyclientleftview reasonid=6 bantime=...`, bans row stored, enforced at `clientinit` |
+| **Poke (GUI and wire)** | works | CommandLow fix; "X poked you" popup delivered to the official client |
+| **Graceful server shutdown** | works | Ctrl+C/Break/console-close → per-client left-view `reasonid=11 reasonmsg=Server Shutdown!` (official format); client disconnects in ~10 ms, autoreconnect armed |
+| **View consistency** (subscribe toggle, join occupied channel, ghost sessions) | works | enter-views resent on (re)subscribe; subscription-filtered fan-outs; vanished sessions announced `reasonid=3` |
+| `permissionlist` catalog | works | full 496-entry official capture (src/permission_catalog.rs) |
+| Voice relay | implemented | relay path only, live mic test pending |
 
-All automated tests pass consistently:
-
-```
-cargo test --lib                 -> 13 passed
-cargo test --test multi_client_test -> 4 passed
-cargo test --test integration_test  -> 1 passed
-```
-
-Release build succeeds: `cargo build --release` (only the pre-existing
-`test_cmds` linker `.drectve` warning).
+All automated tests pass: `cargo test --release` → 21 ok. Protocol findings
+live in [PROTOCOL_NOTES.md](PROTOCOL_NOTES.md) — read it before touching the
+wire format; nearly every constant there was captured from real official
+traffic.
 
 ---
 
-## 2. Running processes / environment state (as of hand-off)
+## 2. Environment (as of hand-off)
 
-> PIDs change; check with `Get-Process nano-ts3,ts3server,ts3client_win64` and
-> `Get-NetUDPEndpoint -LocalPort 9987,9988`. The server may have been stopped
-> and restarted by the harness after this document was written — restart it
-> with `.\target\release\nano-ts3.exe 9988` if `Get-NetUDPEndpoint` is empty.
-> A quick liveness check is
-> `.\target\release\examples\oracle_probe.exe 9988 Probe probe_uid`.
-
-* `nano-ts3` listening on `0.0.0.0:9988` (hotfix restart: PID 2120).
-  Kill with `Stop-Process -Name nano-ts3`.
-* Official TS3 server 3.13.7 on voice `9987`, ServerQuery TCP `10011`,
-  running from `C:\Projects\Nano-TS3\scratch\ts3official` (a **copy**;
-  `scratch/` is gitignored). It was started in a prior shell; if it is not
-  running, launch `scratch\ts3official\ts3server.exe` from that directory.
-* TeamSpeak client process name `ts3client_win64` (at hand-off PID 17012),
-  several tabs connected to 9988 (and sometimes one to the official 9987).
-  It was launched through the **elevated** `RunTS3` scheduled task, so a
-  medium-integrity shell cannot kill it (`taskkill` → access denied) and
-  **cannot inject mouse/keyboard input** (`SetCursorPos` returns False).
-  Any UI interaction must be done by the user or after relaunching the client
-  from a medium-integrity process.
-* `nano_ts3.db` state:
-  * root channels: cid 1 (default), cids 6 and 7; the hotfix startup normalized
-    their `channel_order` chain so they follow the default channel
-  * privilege key `nano_ts3_admin_dX2sKBZpzwBU9yLzk75PPhQWPJmVnkY9`, `is_used=1`
-  * admin identity `iMD9uDe3y38CY2TNKHZ8LHCQuH4=` (the real client's UID)
-  * To get a fresh token + guest state: stop the server, delete `nano_ts3.db`,
-    restart. The first run prints a new token.
-
-### Useful credentials / handles
-
-* Official server copy admin token (unused): `mXIVNQg7mfFEghKZvsvUuuYedBn6SdKYU3zbhD9j`
-* Official ServerQuery login: `serveradmin` / `5J6TGS8q` (port 10011).
-  The client identity `iMD9uDe3y38CY2TNKHZ8LHCQuH4=` (official cldbid 3, "Dany")
-  was added to Server Admin group `sgid=6` there for comparison tests.
-* Client logs: `%APPDATA%\TS3Client\logs\ts3client_*.log`
-* Official server logs: `scratch\ts3official\logs\ts3server_*.log`
-* Analysis logs/screenshots/scripts: `scratch/` (gitignored)
-* DSH GUI: `http://127.0.0.1:13151`, working dir `C:\Projects\Nano-TS3`.
+* `nano-ts3` on UDP 9988. Start: `python scratch/run_nano.py 9988 start`;
+  graceful stop: `python scratch/send_ctrl_c.py` (sends CTRL_BREAK to the
+  server console so clients disconnect cleanly). Plain `taskkill` also works
+  but clients hang until timeout.
+* Official 3.13.7 server copies: `scratch/ts3official` (use query port 10022;
+  10011 is blocked by a Windows reserved-port range) and the user's own at
+  `C:\Softwares	eamspeak3-server_win64` (default ports). ServerQuery login:
+  `serveradmin` / `5J6TGS8q`.
+* **TS3 client automation**: the Program Files client manifest has
+  `uiAccess="true"` — Windows silently launches it elevated and UI
+  automation (UIA/cua-driver) is blocked. Always launch the copy at
+  `scratch/ts3medium/ts3client_win64.exe` (medium integrity, fully drivable;
+  a Program Files instance must be closed manually first — single-instance
+  forwarding). Qt context menus respond reliably to keyboard navigation
+  (right-click + N×Down + Enter); synthetic mouse clicks into menus are
+  flaky; UIA can enumerate the main window but not menu popups.
+* Wire-level test client: `cargo run --release --example admin_console --
+  9988 Nick [admin_uid]` — interactive command console over the TS3
+  protocol; self-registers its derived UID into `admin_identities` when no
+  uid argument is passed (pass `iMD9uDe3y38CY2TNKHZ8LHCQuH4=` to act as the
+  user's admin identity).
+* Debugging arsenal in `scratch/` (gitignored):
+  * `run_nano.py` / `run_official.py` / `send_ctrl_c.py` — process control.
+  * `poke_watch3.py` — armed live watcher: triggers on a server-log event and
+    repeatedly scans the client process for a string; `mem_scan.py` — one-shot
+    process string scan (UTF-16 + ASCII). These distinguish "dialog never
+    fired" vs "command built but held in queue" vs "sent".
+  * `poke_xref.py` / `poke_disasm.py` — capstone RE helpers for
+    ts3client_win64.exe (image base 0x140000000).
+  * MITM pipeline: `examples/raw_proxy` (capture), `examples/scan_iv`
+    (recover session IV from client memory via ping MAC), `examples/decrypt_log`
+    (per-session transcript), `examples/brute_decrypt` (per-packet IV brute
+    force — required when several sessions interleave in one capture).
+* Client identity UID `iMD9uDe3y38CY2TNKHZ8LHCQuH4=`; DB
+  `nano_ts3.db` (channels, `admin_identities`, `privilege_keys`, `bans`).
+* Client logs: `%APPDATA%\TS3Client\logs	s3client_*.log`.
 
 ---
 
@@ -127,6 +121,43 @@ important ones:
 ---
 
 ## 4. What changed in the code
+
+### Session 2026-10-23/24 (channel mgmt GUI, kick/ban/poke, shutdown, view consistency, CommandLow)
+
+* `src/server.rs`
+  * `clientpoke` handler; `ftgetfilelist` answers official-style
+    `error id=1281 database empty result set` (unblocks the Delete Channel
+    dialog); `permissionlist` answers with the full official catalog
+    (`src/permission_catalog.rs`).
+  * Kick/ban notifications always carry `reasonmsg` (possibly empty) — its
+    absence aborted every receiving client ("parameter not found") and was
+    the cause of "kick kicks BOTH clients".
+  * Graceful shutdown: `Server::shutdown()` sends each client its own
+    `notifyclientleftview reasonid=11 reasonmsg=Server Shutdown!` (captured
+    official format; reasonid 7 is rejected by the client).
+    `src/main.rs` listens on ctrl_c/ctrl_break/ctrl_close (unix: SIGTERM/SIGINT).
+  * View consistency: subscribe-all resends enter-views (reasonid 2) for newly
+    subscribed channels only; `clientmove` delivers occupant enter-views to
+    the mover; all enter/moved/left-view fan-outs are subscription-filtered
+    (`watching_recipients`, `move_recipients`); vanished sessions (idle sweep,
+    endpoint replacement) broadcast `reasonid=3 connection lost`
+    (`cleanup_stale` now returns the disappeared).
+  * Same-channel `clientmove` is a silent no-op (redundant moved-broadcast
+    disconnects the official client).
+  * `pv=7` in initserver (official value).
+  * **CommandLow stream separation** — Command (p_type 2) and CommandLow
+    (p_type 3) have independent packet-id sequences; the client sends
+    `clientpoke` on CommandLow starting at pid 0. The old single shared
+    expected-pid tracker dropped every poke as a "retransmission" while the
+    client held it forever. `ClientSession` now has
+    `expected_c2s_low_packet_id` + `pending_low_packets`.
+* `src/state.rs`: low-stream fields; `cleanup_stale` returns disappeared
+  connected sessions.
+* New examples: `admin_console` (interactive wire client), `brute_decrypt`,
+  `ftlist_probe`; `src/permission_catalog.rs` (generated via
+  `scratch/gen_catalog.py` from the official capture).
+* Tests: 21 pass (`cargo test --release`).
+
 
 * `src/server.rs`
   * `try_assemble_next` + corrected outbound fragment flags.
