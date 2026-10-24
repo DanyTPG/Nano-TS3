@@ -64,6 +64,14 @@ pub struct ClientSession {
 
     // Inbound command reordering and defragmentation
     pub pending_packets: BTreeMap<u16, (Flags, Vec<u8>)>,
+
+    // The CommandLow stream (p_type 3) has its own packet-id sequence,
+    // independent of the Command stream. The official client sends e.g.
+    // clientpoke on it, starting at pid 0 (captured from a real 3.6.2
+    // client). Sharing one tracker drops every low packet as a stale
+    // "retransmission".
+    pub expected_c2s_low_packet_id: u16,
+    pub pending_low_packets: BTreeMap<u16, (Flags, Vec<u8>)>,
     pub last_activity: std::time::Instant,
 }
 
@@ -94,6 +102,8 @@ impl ClientSession {
             next_s2c_voice_packet_id: 0,
             last_c2s_packet_id: 0,
             expected_c2s_packet_id: 1, // First command is clientek (pid 1)
+            expected_c2s_low_packet_id: 0, // First CommandLow command is pid 0
+            pending_low_packets: BTreeMap::new(),
             pending_packets: BTreeMap::new(),
             last_activity: std::time::Instant::now(),
         }
@@ -146,15 +156,26 @@ impl ServerState {
         self.clients.remove(endpoint)
     }
 
-    pub fn cleanup_stale(&mut self) {
+    /// Drops stale sessions. Returns the (clid, channel) of sessions that
+    /// were fully connected when they vanished: those were never announced
+    /// as leaving, so the caller must broadcast a left view for them or
+    /// clients still holding that clid in view will treat later
+    /// notifications about it as a protocol error ("invalid clientID").
+    pub fn cleanup_stale(&mut self) -> Vec<(u16, u64)> {
         let now = std::time::Instant::now();
+        let mut disappeared = Vec::new();
         self.clients.retain(|_, c| {
-            if let Some(disc_time) = c.disconnect_time {
+            let keep = if let Some(disc_time) = c.disconnect_time {
                 now.duration_since(disc_time).as_secs() < 5
             } else {
                 now.duration_since(c.last_activity).as_secs() < 120
+            };
+            if !keep && c.handshake_phase == HandshakePhase::Connected {
+                disappeared.push((c.clid, c.current_channel_id));
             }
+            keep
         });
+        disappeared
     }
 
     pub fn clients_in_channel(&self, cid: u64) -> Vec<&ClientSession> {
