@@ -4,8 +4,12 @@
 //!
 //! Usage: cargo run --release --example scan_iv -- <pid> <oracle_mac_hex>
 
+// This tool reads Windows process memory through kernel32 and cannot build
+// on other hosts; gating it keeps `cargo test` green on Linux CI.
+#[cfg(windows)]
 use sha1::{Digest as _, Sha1};
 
+#[cfg(windows)]
 #[repr(C)]
 #[derive(Default)]
 struct MemoryBasicInformation {
@@ -19,6 +23,7 @@ struct MemoryBasicInformation {
     region_type: u32,
 }
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
@@ -38,9 +43,11 @@ unsafe extern "system" {
     ) -> usize;
 }
 
+#[cfg(windows)]
 const PROCESS_VM_READ: u32 = 0x0010;
 const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 
+#[cfg(windows)]
 fn readable(protect: u32) -> bool {
     const GUARD: u32 = 0x100;
     if protect & GUARD != 0 {
@@ -52,6 +59,7 @@ fn readable(protect: u32) -> bool {
     )
 }
 
+#[cfg(windows)]
 fn main() {
     let mut args = std::env::args().skip(1);
     let pid: u32 = args.next().expect("pid").parse().expect("numeric pid");
@@ -139,8 +147,14 @@ fn main() {
     }
 }
 
+#[cfg(windows)]
 fn hex_to_bytes(s: &str) -> Vec<u8> {
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex"))
         .collect()
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("scan_iv reads Windows process memory and only runs on Windows.");
 }

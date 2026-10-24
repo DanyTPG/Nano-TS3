@@ -628,6 +628,10 @@ async fn test_channelcreate_returns_cid_and_rejects_duplicates() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
     let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
     let server_addr = server.local_addr().expect("local addr failed");
     let server_handle = tokio::spawn(async move {
@@ -635,6 +639,14 @@ async fn test_channelcreate_returns_cid_and_rejects_duplicates() {
     });
 
     let mut admin = ClientSession::connect(server_addr, "Creator").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgrade notification");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await; // tokenuse ack
 
     let mut create = Command::new("channelcreate");
     create.set("channel_name", "Lounge");
@@ -690,6 +702,54 @@ async fn test_channelcreate_returns_cid_and_rejects_duplicates() {
             "duplicate name must be rejected"
         );
     }
+
+    server_handle.abort();
+}
+
+/// Guests must not be able to create channels; the server answers with the
+/// official 2568 "insufficient client permissions" and a failed_permid.
+#[tokio::test]
+async fn test_channelcreate_requires_admin() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut guest = ClientSession::connect(server_addr, "Guest").await;
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "Sneaky");
+    create.set("channel_flag_permanent", "1");
+    guest.send_command(&create).await;
+
+    let error = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("guest channelcreate must answer with an error");
+    assert_eq!(error.get("id"), Some("2568"));
+    assert_eq!(error.get("failed_permid"), Some("89"));
+
+    // No channel was created either.
+    let list = Command::new("channellist");
+    guest.send_command(&list).await;
+    let mut saw_sneaky = false;
+    for _ in 0..10 {
+        match guest.recv_command(Duration::from_secs(2)).await {
+            Some(cmd) => {
+                if cmd.name == "channellist" && cmd.get("channel_name") == Some("Sneaky") {
+                    saw_sneaky = true;
+                }
+                if cmd.name == "channellistfinished" {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    assert!(!saw_sneaky, "guest-created channel must not exist");
 
     server_handle.abort();
 }
@@ -1027,6 +1087,453 @@ async fn test_client_kick_and_ban() {
         bob_reconnected.clid, 0,
         "unbanned client can now connect"
     );
+
+    server_handle.abort();
+}
+
+/// Every notifytextmessage must carry invokeruid (its absence aborts the
+/// official client with "parameter not found"), and targetmode=1 must be
+/// routed to the `target` client plus an echo to the sender only.
+#[tokio::test]
+async fn test_text_message_targeting_and_invokeruid() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut alice = ClientSession::connect(server_addr, "Alice").await;
+    let mut bob = ClientSession::connect(server_addr, "Bob").await;
+
+    // Channel message (targetmode 2): both receive it with invokeruid.
+    let mut ch_msg = Command::new("sendtextmessage");
+    ch_msg.set("targetmode", "2");
+    ch_msg.set("msg", "hello\\schannel");
+    alice.send_command(&ch_msg).await;
+
+    let alice_seen = alice
+        .recv_until("notifytextmessage", Duration::from_secs(2))
+        .await
+        .expect("sender receives the channel message echo");
+    assert_eq!(alice_seen.get("msg"), Some("hello\\schannel"));
+    assert_eq!(alice_seen.get("invokerid"), Some(alice.clid.to_string().as_str()));
+    assert_eq!(
+        alice_seen.get("targetmode"),
+        Some("2"),
+        "channel messages use targetmode 2"
+    );
+    let uid = alice_seen
+        .get("invokeruid")
+        .expect("notifytextmessage must carry invokeruid")
+        .to_string();
+    assert!(!uid.is_empty(), "invokeruid must not be empty");
+
+    let bob_seen = bob
+        .recv_until("notifytextmessage", Duration::from_secs(2))
+        .await
+        .expect("channel member receives the channel message");
+    assert_eq!(bob_seen.get("invokeruid"), Some(uid.as_str()));
+
+    // Private message (targetmode 1): only the target and the sender get it.
+    let mut dm = Command::new("sendtextmessage");
+    dm.set("targetmode", "1");
+    dm.set("target", bob.clid.to_string());
+    dm.set("msg", "secret");
+    alice.send_command(&dm).await;
+
+    let dm_echo = alice
+        .recv_until("notifytextmessage", Duration::from_secs(2))
+        .await
+        .expect("sender receives the private message echo");
+    assert_eq!(dm_echo.get("msg"), Some("secret"));
+    assert_eq!(dm_echo.get("targetmode"), Some("1"));
+
+    let dm_target = bob
+        .recv_until("notifytextmessage", Duration::from_secs(2))
+        .await
+        .expect("target receives the private message");
+    assert_eq!(dm_target.get("msg"), Some("secret"));
+    assert_eq!(dm_target.get("invokerid"), Some(alice.clid.to_string().as_str()));
+
+    let _ = alice.recv_until("error", Duration::from_secs(2)).await; // DM ack
+
+    // Messaging a non-existent client must answer 512, not disconnect.
+    let mut dm_bad = Command::new("sendtextmessage");
+    dm_bad.set("targetmode", "1");
+    dm_bad.set("target", "999");
+    dm_bad.set("msg", "nobody");
+    alice.send_command(&dm_bad).await;
+    let err = alice
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("error response for unknown target");
+    assert_eq!(err.get("id"), Some("512"));
+
+    server_handle.abort();
+}
+
+/// An admin moving another user must relocate the target, not the admin.
+/// ("Move client to channel" / "Move client to own channel" context actions.)
+#[tokio::test]
+async fn test_admin_moves_other_client() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "Admin").await;
+    let mut guest = ClientSession::connect(server_addr, "Guest").await;
+
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgrade notification");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await; // tokenuse ack
+
+    // Admin creates a channel and moves the GUEST into it while the admin
+    // stays in the default channel.
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "Target");
+    admin.send_command(&create).await;
+    let created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let new_cid = created.get("cid").expect("cid").to_string();
+
+    let mut move_cmd = Command::new("clientmove");
+    move_cmd.set("clid", guest.clid.to_string());
+    move_cmd.set("cid", &new_cid);
+    admin.send_command(&move_cmd).await;
+
+    // The moved guest receives notifyclientmoved with invoker fields.
+    let guest_moved = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("moved client is notified");
+    assert_eq!(guest_moved.get("clid"), Some(guest.clid.to_string().as_str()));
+    assert_eq!(guest_moved.get("ctid"), Some(new_cid.as_str()));
+    assert_eq!(
+        guest_moved.get("invokerid"),
+        Some(admin.clid.to_string().as_str()),
+        "admin move carries invoker fields"
+    );
+
+    // The admin is NOT the one who moved: it stays in the default channel
+    // (no notifyclientmoved about itself).
+    let admin_self_moved = admin
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .filter(|cmd| cmd.get("clid") == Some(admin.clid.to_string().as_str()));
+    assert!(
+        admin_self_moved.is_none(),
+        "admin must not be moved by its own clientmove of another user"
+    );
+
+    // A guest cannot move other clients.
+    let mut guest_move = Command::new("clientmove");
+    guest_move.set("clid", admin.clid.to_string());
+    guest_move.set("cid", &new_cid);
+    guest.send_command(&guest_move).await;
+    let denied = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("guest moving another client must be denied");
+    assert_eq!(denied.get("id"), Some("2568"));
+
+    server_handle.abort();
+}
+
+/// Connection info: any client can read another client's stats, but
+/// connection_client_ip is only included for admins.
+#[tokio::test]
+async fn test_connection_info_admin_only_ip() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "Admin").await;
+    let mut guest = ClientSession::connect(server_addr, "Guest").await;
+
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgrade notification");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await; // tokenuse ack
+
+    // The target publishes stats as the official client does after a
+    // notifyconnectioninforequest.
+    let mut stats = Command::new("setconnectioninfo");
+    stats.set("connection_ping", "12");
+    stats.set("connection_packetloss_total", "0.5");
+    stats.set("connection_connected_time", "123456");
+    guest.send_command(&stats).await;
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+
+    // Admin query includes the IP.
+    let mut ask = Command::new("getconnectioninfo");
+    ask.set("clid", guest.clid.to_string());
+    admin.send_command(&ask).await;
+    let admin_info = admin
+        .recv_until("notifyconnectioninfo", Duration::from_secs(2))
+        .await
+        .expect("admin receives connection info");
+    assert_eq!(admin_info.get("clid"), Some(guest.clid.to_string().as_str()));
+    assert_eq!(admin_info.get("connection_ping"), Some("12"));
+    assert!(
+        admin_info.get("connection_client_ip").is_some(),
+        "admins see the target IP"
+    );
+
+    // Guest query has no IP but still shows stats.
+    let mut ask2 = Command::new("getconnectioninfo");
+    ask2.set("clid", guest.clid.to_string());
+    guest.send_command(&ask2).await;
+    let guest_info = guest
+        .recv_until("notifyconnectioninfo", Duration::from_secs(2))
+        .await
+        .expect("guest receives connection info");
+    assert_eq!(guest_info.get("connection_ping"), Some("12"));
+    assert!(
+        guest_info.get("connection_client_ip").is_none(),
+        "guests must not see other clients' IPs"
+    );
+
+    server_handle.abort();
+}
+
+/// Joining a password-protected channel requires the matching `cpw`;
+/// admins may move other clients into it without one.
+#[tokio::test]
+async fn test_channel_password_gate() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "Admin").await;
+    let mut guest = ClientSession::connect(server_addr, "Guest").await;
+
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgrade notification");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await; // tokenuse ack
+
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "Locked");
+    create.set("channel_flag_password", "1");
+    create.set("channel_password", "open sesame");
+    admin.send_command(&create).await;
+    let created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let cid = created.get("cid").expect("cid").to_string();
+    assert_eq!(
+        created.get("channel_flag_password"),
+        Some("1"),
+        "created channel is flagged as password-protected"
+    );
+
+    // Wrong password is rejected with the official error.
+    let mut wrong = Command::new("clientmove");
+    wrong.set("cid", &cid);
+    wrong.set("cpw", "guess");
+    guest.send_command(&wrong).await;
+    let err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("wrong password rejected");
+    assert_eq!(err.get("id"), Some("781"));
+
+    // Missing password is rejected too.
+    let mut missing = Command::new("clientmove");
+    missing.set("cid", &cid);
+    guest.send_command(&missing).await;
+    let err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("missing password rejected");
+    assert_eq!(err.get("id"), Some("781"));
+
+    // The right password works.
+    let mut right = Command::new("clientmove");
+    right.set("cid", &cid);
+    right.set("cpw", "open sesame");
+    guest.send_command(&right).await;
+    let moved = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("correct password joins the channel");
+    assert_eq!(moved.get("ctid"), Some(cid.as_str()));
+
+    server_handle.abort();
+}
+
+/// A channel with a max-user limit stops admitting clients once full
+/// (ERROR_channel_maxclients_reached = 777).
+#[tokio::test]
+async fn test_channel_max_clients_enforced() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "Admin").await;
+    let mut guest = ClientSession::connect(server_addr, "Guest").await;
+
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgrade notification");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await; // tokenuse ack
+
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "Tiny");
+    create.set("channel_flag_maxclients_unlimited", "0");
+    create.set("channel_maxclients", "1");
+    admin.send_command(&create).await;
+    let created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let cid = created.get("cid").expect("cid").to_string();
+
+    // Admin fills the channel.
+    let mut admin_move = Command::new("clientmove");
+    admin_move.set("cid", &cid);
+    admin.send_command(&admin_move).await;
+    admin
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("admin joins");
+
+    // Guest is rejected: the channel is full.
+    let mut guest_move = Command::new("clientmove");
+    guest_move.set("cid", &cid);
+    guest.send_command(&guest_move).await;
+    let err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("full channel rejects the join");
+    assert_eq!(err.get("id"), Some("777"));
+
+    server_handle.abort();
+}
+
+/// A channel edit changing codec, quality and max users at once must be
+/// accepted and echoed back (the Audio/Advanced tabs of the Edit Channel
+/// dialog).
+#[tokio::test]
+async fn test_channel_edit_audio_and_limits() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "Admin").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgrade notification");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await; // tokenuse ack
+
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "AudioTest");
+    admin.send_command(&create).await;
+    let created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let cid = created.get("cid").expect("cid").to_string();
+
+    let mut edit = Command::new("channeledit");
+    edit.set("cid", &cid);
+    edit.set("channel_codec", "5");
+    edit.set("channel_codec_quality", "10");
+    edit.set("channel_flag_maxclients_unlimited", "0");
+    edit.set("channel_maxclients", "4");
+    edit.set("channel_codec_is_unencrypted", "1");
+    admin.send_command(&edit).await;
+
+    let edited = admin
+        .recv_until("notifychanneledited", Duration::from_secs(2))
+        .await
+        .expect("edit is broadcast");
+    assert_eq!(edited.get("channel_codec"), Some("5"));
+    assert_eq!(edited.get("channel_codec_quality"), Some("10"));
+    assert_eq!(edited.get("channel_maxclients"), Some("4"));
+    assert_eq!(
+        edited.get("channel_codec_is_unencrypted"),
+        Some("1"),
+        "unencrypted flag is preserved"
+    );
+
+    let ok = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("channeledit response");
+    assert_eq!(ok.get("id"), Some("0"));
 
     server_handle.abort();
 }

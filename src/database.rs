@@ -27,6 +27,11 @@ pub struct ChannelRecord {
     pub max_family_clients_inherited: bool,
     pub name_phonetic: String,
     pub icon_id: i64,
+    /// SHA-256 hex digest of the channel password; empty means no password.
+    pub password_hash: String,
+    /// TeamSpeak `channel_codec_is_unencrypted`. False means clients send
+    /// EAX-encrypted voice payloads in this channel.
+    pub codec_is_unencrypted: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -51,6 +56,12 @@ pub struct ChannelEdit {
     pub max_family_clients_inherited: Option<bool>,
     pub name_phonetic: Option<String>,
     pub icon_id: Option<i64>,
+    /// New channel password as a SHA-256 hex digest. `Some("")` clears the
+    /// password; `None` leaves it untouched (the official client omits
+    /// `channel_password` when editing a passworded channel without retyping
+    /// it).
+    pub password: Option<String>,
+    pub codec_is_unencrypted: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -120,7 +131,9 @@ impl Database {
                 max_family_clients_unlimited INTEGER NOT NULL DEFAULT 1,
                 max_family_clients_inherited INTEGER NOT NULL DEFAULT 0,
                 name_phonetic TEXT NOT NULL DEFAULT '',
-                icon_id INTEGER NOT NULL DEFAULT 0
+                icon_id INTEGER NOT NULL DEFAULT 0,
+                password_hash TEXT NOT NULL DEFAULT '',
+                codec_is_unencrypted INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS privilege_keys (
@@ -177,6 +190,8 @@ impl Database {
             ("max_family_clients_inherited", "INTEGER NOT NULL DEFAULT 0"),
             ("name_phonetic", "TEXT NOT NULL DEFAULT ''"),
             ("icon_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("password_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("codec_is_unencrypted", "INTEGER NOT NULL DEFAULT 1"),
         ] {
             if !existing_columns.contains(name) {
                 self.conn.execute_batch(&format!(
@@ -322,7 +337,7 @@ impl Database {
                  max_family_clients, needed_talk_power, needed_subscribe_power, \
                  codec_latency_factor, delete_delay, max_clients_unlimited, \
                  max_family_clients_unlimited, max_family_clients_inherited, \
-                 name_phonetic, icon_id FROM channels",
+                 name_phonetic, icon_id, password_hash, codec_is_unencrypted FROM channels",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ChannelRecord {
@@ -347,6 +362,8 @@ impl Database {
                 max_family_clients_inherited: row.get::<_, i64>(18)? == 1,
                 name_phonetic: row.get(19)?,
                 icon_id: row.get(20)?,
+                password_hash: row.get(21)?,
+                codec_is_unencrypted: row.get::<_, i64>(22)? == 1,
             })
         })?;
 
@@ -568,6 +585,14 @@ impl Database {
             if let Some(value) = edit.icon_id {
                 channel.icon_id = value;
             }
+            if let Some(value) = &edit.password {
+                // Empty digest clears the password, matching
+                // channel_flag_password=0 edits.
+                channel.password_hash = value.clone();
+            }
+            if let Some(value) = edit.codec_is_unencrypted {
+                channel.codec_is_unencrypted = value;
+            }
         }
 
         let current_default_cid = channels
@@ -599,7 +624,8 @@ impl Database {
              needed_talk_power=?12, needed_subscribe_power=?13, codec_latency_factor=?14, \
              delete_delay=?15, max_clients_unlimited=?16, \
              max_family_clients_unlimited=?17, max_family_clients_inherited=?18, \
-             name_phonetic=?19, icon_id=?20 WHERE cid=?21",
+             name_phonetic=?19, icon_id=?20, password_hash=?21, codec_is_unencrypted=?22 \
+             WHERE cid=?23",
             params![
                 channel.name,
                 channel.topic,
@@ -621,6 +647,8 @@ impl Database {
                 channel.max_family_clients_inherited as i64,
                 channel.name_phonetic,
                 channel.icon_id,
+                channel.password_hash,
+                channel.codec_is_unencrypted as i64,
                 cid as i64,
             ],
         )?;

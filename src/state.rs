@@ -59,8 +59,22 @@ pub struct ClientSession {
     pub next_s2c_packet_id: u16,
     pub next_s2c_low_packet_id: u16,
     pub next_s2c_voice_packet_id: u16,
+    pub next_s2c_ping_packet_id: u16,
     pub last_c2s_packet_id: u16,
     pub expected_c2s_packet_id: u16,
+
+    // Voice encryption bookkeeping. The EAX key/nonce for a voice packet
+    // changes whenever the 16-bit packet id wraps around (generation++), so
+    // both directions have to track the current generation. c2s follows the
+    // sender's wrap; s2c is fully under our control.
+    pub c2s_voice_generation: u32,
+    pub last_c2s_voice_pid: Option<u16>,
+    pub s2c_voice_generation: u32,
+
+    // Connection statistics the client published with `setconnectioninfo`,
+    // keyed by the raw `connection_*` parameter name. Served to other clients
+    // through `getconnectioninfo` / `notifyconnectioninfo`.
+    pub connection_stats: std::collections::BTreeMap<String, String>,
 
     // Inbound command reordering and defragmentation
     pub pending_packets: BTreeMap<u16, (Flags, Vec<u8>)>,
@@ -100,11 +114,16 @@ impl ClientSession {
             next_s2c_packet_id: 0,
             next_s2c_low_packet_id: 0,
             next_s2c_voice_packet_id: 0,
+            next_s2c_ping_packet_id: 0,
             last_c2s_packet_id: 0,
             expected_c2s_packet_id: 1, // First command is clientek (pid 1)
             expected_c2s_low_packet_id: 0, // First CommandLow command is pid 0
             pending_low_packets: BTreeMap::new(),
             pending_packets: BTreeMap::new(),
+            c2s_voice_generation: 0,
+            last_c2s_voice_pid: None,
+            s2c_voice_generation: 0,
+            connection_stats: std::collections::BTreeMap::new(),
             last_activity: std::time::Instant::now(),
         }
     }
@@ -112,13 +131,24 @@ impl ClientSession {
 
 pub struct ServerState {
     pub clients: HashMap<SocketAddr, ClientSession>,
+    /// Which endpoints are watching another client's connection info
+    /// (target clid -> watchers). Populated by `getconnectioninfo` and
+    /// pruned whenever sessions disappear.
+    pub connection_watchers: HashMap<u16, BTreeSet<SocketAddr>>,
     next_clid: u16,
 }
+
+/// A connected client that has not sent a single packet (command, ping, pong,
+/// voice — anything) for this long is considered dead and is dropped. The
+/// official client keeps the connection alive with a ping every ~2 seconds,
+/// so 30 s means ~15 consecutive keepalives were missed.
+pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl ServerState {
     pub fn new() -> Self {
         Self {
             clients: HashMap::new(),
+            connection_watchers: HashMap::new(),
             next_clid: 2,
         }
     }
@@ -156,10 +186,11 @@ impl ServerState {
         self.clients.remove(endpoint)
     }
 
-    /// Drops stale sessions. Returns the (clid, channel) of sessions that
-    /// were fully connected when they vanished: those were never announced
-    /// as leaving, so the caller must broadcast a left view for them or
-    /// clients still holding that clid in view will treat later
+    /// Drops stale sessions (timed-out idle clients and disconnected ones
+    /// kept briefly for endpoint replacement). Returns the (clid, channel) of
+    /// sessions that were fully connected when they vanished: those were never
+    /// announced as leaving, so the caller must broadcast a left view for them
+    /// or clients still holding that clid in view will treat later
     /// notifications about it as a protocol error ("invalid clientID").
     pub fn cleanup_stale(&mut self) -> Vec<(u16, u64)> {
         let now = std::time::Instant::now();
@@ -168,13 +199,24 @@ impl ServerState {
             let keep = if let Some(disc_time) = c.disconnect_time {
                 now.duration_since(disc_time).as_secs() < 5
             } else {
-                now.duration_since(c.last_activity).as_secs() < 120
+                now.duration_since(c.last_activity) < IDLE_TIMEOUT
             };
             if !keep && c.handshake_phase == HandshakePhase::Connected {
                 disappeared.push((c.clid, c.current_channel_id));
             }
             keep
         });
+        if !disappeared.is_empty() {
+            // Watchers of vanished clients can never receive further updates.
+            let gone: BTreeSet<u16> = disappeared.iter().map(|(clid, _)| *clid).collect();
+            self.connection_watchers.retain(|clid, watchers| {
+                if gone.contains(clid) {
+                    return false;
+                }
+                watchers.retain(|ep| self.clients.contains_key(ep));
+                !watchers.is_empty()
+            });
+        }
         disappeared
     }
 
@@ -194,5 +236,61 @@ impl ServerState {
         if *next == 0 {
             *next = 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn cleanup_stale_times_out_idle_connected_clients() {
+        let mut state = ServerState::new();
+        let ep: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let mut client = ClientSession::new(2, ep);
+        client.handshake_phase = HandshakePhase::Connected;
+        client.last_activity = std::time::Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+        state.clients.insert(ep, client);
+
+        // A watcher entry for the vanished client must be pruned too.
+        let watcher: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        state
+            .connection_watchers
+            .entry(2)
+            .or_default()
+            .insert(watcher);
+
+        let gone = state.cleanup_stale();
+        assert_eq!(gone, vec![(2, 1)]);
+        assert!(state.clients.is_empty());
+        assert!(state.connection_watchers.is_empty());
+    }
+
+    #[test]
+    fn cleanup_stale_keeps_active_clients() {
+        let mut state = ServerState::new();
+        let ep: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let mut client = ClientSession::new(2, ep);
+        client.handshake_phase = HandshakePhase::Connected;
+        client.last_activity = std::time::Instant::now() - Duration::from_secs(2);
+        state.clients.insert(ep, client);
+
+        assert!(state.cleanup_stale().is_empty());
+        assert_eq!(state.clients.len(), 1);
+    }
+
+    #[test]
+    fn cleanup_stale_times_out_stuck_handshakes() {
+        let mut state = ServerState::new();
+        let ep: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let mut client = ClientSession::new(2, ep);
+        // Still in the handshake phase: dropped without a left-view broadcast.
+        client.last_activity = std::time::Instant::now() - IDLE_TIMEOUT - Duration::from_secs(5);
+        state.clients.insert(ep, client);
+
+        let gone = state.cleanup_stale();
+        assert!(gone.is_empty());
+        assert!(state.clients.is_empty());
     }
 }

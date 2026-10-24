@@ -97,6 +97,13 @@ fn bool_wire(value: bool) -> &'static str {
     if value { "1" } else { "0" }
 }
 
+/// Channel passwords are stored as SHA-256 hex digests; the wire value the
+/// client supplies in `cpw` is hashed the same way before comparison.
+fn hash_channel_password(password: &str) -> String {
+    let digest = sha2::Sha256::digest(password.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn parse_channel_ids(cmd: &Command) -> Vec<u64> {
     let mut ids = Vec::new();
     for part in cmd.raw.split('|') {
@@ -161,26 +168,33 @@ fn parse_channel_edit(cmd: &Command) -> Result<ChannelEdit, String> {
         max_family_clients_inherited: parse_wire_bool(
             cmd.get("channel_flag_maxfamilyclients_inherited"),
         ),
+        codec_is_unencrypted: parse_wire_bool(cmd.get("channel_codec_is_unencrypted")),
         ..ChannelEdit::default()
     };
 
-    // The relay supports plaintext Opus payloads only. Keep the channel
-    // unencrypted even when the client includes this unchanged property.
-    if cmd.get("channel_codec_is_unencrypted") == Some("0") {
-        return Err("voice encryption is not supported".to_string());
+    // Channel passwords: `channel_flag_password=0` clears, a non-empty
+    // `channel_password` sets a new one, and the flag alone on a passworded
+    // channel keeps the stored password (the official client does not resend
+    // it when the dialog is left unchanged).
+    let password_flag = parse_wire_bool(cmd.get("channel_flag_password"));
+    let supplied_password = cmd.get("channel_password");
+    match (password_flag, supplied_password) {
+        (Some(false), _) => edit.password = Some(String::new()),
+        (_, Some(password)) if !password.is_empty() => {
+            edit.password = Some(hash_channel_password(password));
+        }
+        (Some(true), None) => {
+            // Keep whatever is stored; the official client does not resend
+            // the password when the dialog field is left unchanged.
+        }
+        _ => {}
     }
-    if cmd
-        .get("channel_password")
-        .is_some_and(|password| !password.is_empty())
-    {
-        return Err("channel passwords are not supported".to_string());
-    }
+
     if cmd.get("cpid").is_some_and(|parent| parent != "0") {
         return Err("subchannels are not supported".to_string());
     }
-    if edit.codec.is_some_and(|codec| ![4, 5].contains(&codec)) {
-        return Err("unsupported channel codec".to_string());
-    }
+    // The voice relay passes codec frames through unchanged, so any codec the
+    // client offers (Speex, CELT, Opus) works; the quality range is 0-10.
     if edit
         .codec_quality
         .is_some_and(|quality| !(0..=10).contains(&quality))
@@ -229,7 +243,10 @@ fn build_channel_notification(
         bool_wire(channel.is_semi_permanent),
     );
     notify.set("channel_flag_default", bool_wire(channel.is_default));
-    notify.set("channel_flag_password", "0");
+    notify.set(
+        "channel_flag_password",
+        bool_wire(!channel.password_hash.is_empty()),
+    );
     notify.set("channel_maxclients", channel.max_clients.to_string());
     notify.set(
         "channel_maxfamilyclients",
@@ -248,7 +265,10 @@ fn build_channel_notification(
         "channel_codec_latency_factor",
         channel.codec_latency_factor.to_string(),
     );
-    notify.set("channel_codec_is_unencrypted", "1");
+    notify.set(
+        "channel_codec_is_unencrypted",
+        bool_wire(channel.codec_is_unencrypted),
+    );
     notify.set("channel_delete_delay", channel.delete_delay.to_string());
     notify.set(
         "channel_flag_maxclients_unlimited",
@@ -313,7 +333,81 @@ fn try_assemble_next(
     }
 }
 
-/// Builds a fully populated `notifyserverupdated` command. The official client
+/// Builds a `notifyconnectioninfo` command for the "Client connection info"
+/// dialog. Missing stats are filled with neutral defaults so the client's
+/// mandatory-field parser never rejects the command; `connection_client_ip`
+/// is only included when the requesting user is an admin.
+fn build_connection_info(
+    target_clid: u16,
+    stats: &std::collections::BTreeMap<String, String>,
+    target_ip: &str,
+    include_ip: bool,
+) -> Command {
+    let mut cmd = Command::new("notifyconnectioninfo");
+    cmd.set("clid", target_clid.to_string());
+    for name in [
+        "connection_ping",
+        "connection_ping_deviation",
+        "connection_packets_sent_speech",
+        "connection_packets_sent_keepalive",
+        "connection_packets_sent_control",
+        "connection_packets_sent_total",
+        "connection_bytes_sent_speech",
+        "connection_bytes_sent_keepalive",
+        "connection_bytes_sent_control",
+        "connection_bytes_sent_total",
+        "connection_packets_received_speech",
+        "connection_packets_received_keepalive",
+        "connection_packets_received_control",
+        "connection_packets_received_total",
+        "connection_bytes_received_speech",
+        "connection_bytes_received_keepalive",
+        "connection_bytes_received_control",
+        "connection_bytes_received_total",
+        "connection_packetloss_speech",
+        "connection_packetloss_keepalive",
+        "connection_packetloss_control",
+        "connection_packetloss_total",
+        "connection_bandwidth_sent_last_second_speech",
+        "connection_bandwidth_sent_last_second_keepalive",
+        "connection_bandwidth_sent_last_second_control",
+        "connection_bandwidth_sent_last_second_total",
+        "connection_bandwidth_sent_last_minute_speech",
+        "connection_bandwidth_sent_last_minute_keepalive",
+        "connection_bandwidth_sent_last_minute_control",
+        "connection_bandwidth_sent_last_minute_total",
+        "connection_bandwidth_received_last_second_speech",
+        "connection_bandwidth_received_last_second_keepalive",
+        "connection_bandwidth_received_last_second_control",
+        "connection_bandwidth_received_last_second_total",
+        "connection_bandwidth_received_last_minute_speech",
+        "connection_bandwidth_received_last_minute_keepalive",
+        "connection_bandwidth_received_last_minute_control",
+        "connection_bandwidth_received_last_minute_total",
+        "connection_filetransfer_bandwidth_sent",
+        "connection_filetransfer_bandwidth_received",
+        "connection_filetransfer_bytes_sent_total",
+        "connection_filetransfer_bytes_received_total",
+        "connection_connected_time",
+        "connection_server_ip",
+        "connection_server_port",
+    ] {
+        match stats.get(name) {
+            Some(value) => {
+                cmd.set(name, value);
+            }
+            None => {
+                cmd.set(name, "0");
+            }
+        }
+    }
+    if include_ip {
+        cmd.set("connection_client_ip", target_ip);
+    }
+    cmd
+}
+
+/// Builds a `notifyserverupdated` command. The official client
 /// rejects the message when any of these parameters is missing.
 fn build_server_updated(ask_for_privilegekey: bool, port: u16) -> Command {
     let mut cmd = Command::new("notifyserverupdated");
@@ -322,9 +416,10 @@ fn build_server_updated(ask_for_privilegekey: bool, port: u16) -> Command {
         "Welcome to Nano-TS3 Server!",
     );
     cmd.set("virtualserver_maxclients", "32");
-    // Nano-TS3 relays voice payloads without codec-level encryption. Advertise
-    // the server-wide forced-off mode so clients send plaintext Opus frames.
-    cmd.set("virtualserver_codec_encryption_mode", "1");
+    // Nano-TS3 relays both plaintext and EAX-encrypted codec payloads.
+    // Mode 0 (individual) lets the client choose per channel via the
+    // "Voice Data encrypted" toggle; mode 1 (forced off) greys it out.
+    cmd.set("virtualserver_codec_encryption_mode", "0");
     cmd.set("virtualserver_clientsonline", "1");
     cmd.set("virtualserver_channelsonline", "1");
     cmd.set("virtualserver_uptime", "1000");
@@ -404,22 +499,89 @@ impl Server {
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut buf = [0u8; 4096];
+        // Periodic keepalive sweep: probe every connected client with a
+        // server-side ping and drop sessions that have gone silent. Without
+        // this, a hung or crashed client lingers in every other user's view
+        // until it happens to be swept by unrelated incoming traffic.
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(5));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
-            let (len, peer) = match self.socket.recv_from(&mut buf).await {
-                Ok(r) => r,
-                Err(e) => {
-                    if e.raw_os_error() != Some(10054) {
-                        error!("UDP receive error: {:?}", e);
+            tokio::select! {
+                received = self.socket.recv_from(&mut buf) => {
+                    let (len, peer) = match received {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if e.raw_os_error() != Some(10054) {
+                                error!("UDP receive error: {:?}", e);
+                            }
+                            continue;
+                        }
+                    };
+
+                    let data = &buf[..len];
+                    if let Err(e) = self.handle_packet(peer, data).await {
+                        debug!("Handled packet from {} with info: {:?}", peer, e);
                     }
-                    continue;
+                }
+                _ = keepalive.tick() => {
+                    self.keepalive_sweep().await;
+                }
+            }
+        }
+    }
+
+    /// Pings every connected client and times out sessions that have not sent
+    /// anything for `IDLE_TIMEOUT`. Vanished connected clients are announced
+    /// to the rest with the official `reasonid=3 connection lost` left view.
+    async fn keepalive_sweep(&self) {
+        // Probe: an unencrypted ping carrying the session's shared MAC, the
+        // same shape the server already uses to answer client pings. Alive
+        // clients respond (ack/pong), which refreshes their last_activity.
+        let targets: Vec<(SocketAddr, u16, [u8; 8])> = {
+            let state = self.state.lock().await;
+            state
+                .clients
+                .values()
+                .filter(|c| c.handshake_phase == HandshakePhase::Connected)
+                .filter_map(|c| {
+                    c.shared_iv.map(|siv| {
+                        let mac: [u8; 8] = Sha1::digest(&siv)[..8].try_into().unwrap();
+                        (c.endpoint, c.clid, mac)
+                    })
+                })
+                .collect()
+        };
+
+        for (ep, _clid, mac) in targets {
+            let p_id = {
+                let mut state = self.state.lock().await;
+                match state.get_client_mut(&ep) {
+                    Some(c) => {
+                        let id = c.next_s2c_ping_packet_id;
+                        c.next_s2c_ping_packet_id = id.wrapping_add(1);
+                        id
+                    }
+                    None => continue,
                 }
             };
+            let mut ping = OutAck::new(Direction::S2C, PacketType::Ping, p_id);
+            ping.flags(Flags::UNENCRYPTED);
+            ping.mac().copy_from_slice(&mac);
+            let _ = self.socket.send_to(&ping.into_vec(), ep).await;
+        }
 
-            let data = &buf[..len];
-            if let Err(e) = self.handle_packet(peer, data).await {
-                debug!("Handled packet from {} with info: {:?}", peer, e);
-            }
+        let disappeared = {
+            let mut state = self.state.lock().await;
+            state.cleanup_stale()
+        };
+        for (gone_clid, gone_cid) in disappeared {
+            info!(
+                "Client {} timed out (no packets received within idle timeout)",
+                gone_clid
+            );
+            self.broadcast_client_left(gone_clid, gone_cid, "3", "connection lost")
+                .await;
         }
     }
 
@@ -1101,9 +1263,10 @@ impl Server {
                 initserver.set("virtualserver_version", "3.13.7 [Build: 1600000000]");
                 initserver.set("virtualserver_maxclients", "32");
                 initserver.set("virtualserver_created", "1600000000");
-                // Voice relay currently forwards codec frames verbatim, so the
-                // server must disable codec-level voice encryption.
-                initserver.set("virtualserver_codec_encryption_mode", "1");
+                // Voice relay forwards codec frames verbatim and supports
+                // both encrypted and plaintext channels, so the client may
+                // pick encryption per channel (mode 0 = individual).
+                initserver.set("virtualserver_codec_encryption_mode", "0");
                 initserver.set("virtualserver_hostmessage", "");
                 initserver.set("virtualserver_hostmessage_mode", "0");
                 initserver.set("virtualserver_default_server_group", "8");
@@ -1525,12 +1688,16 @@ impl Server {
             "sendtextmessage" => {
                 let target_mode = cmd.get("targetmode").unwrap_or("2");
                 let msg = cmd.get("msg").unwrap_or("");
-                let nickname = {
+                // `invokeruid` is mandatory: the official client aborts the
+                // connection with "parameter not found" when it is missing
+                // (observed with 3.6.2 against every channel/private/server
+                // message before the fix).
+                let (nickname, invoker_uid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| c.nickname.clone())
-                        .unwrap_or_else(|| "User".into())
+                        .map(|c| (c.nickname.clone(), c.uid.clone()))
+                        .unwrap_or_else(|| ("User".into(), String::new()))
                 };
 
                 let mut notify = Command::new("notifytextmessage");
@@ -1538,31 +1705,79 @@ impl Server {
                 notify.set("msg", msg);
                 notify.set("invokerid", clid.to_string());
                 notify.set("invokername", &nickname);
+                notify.set("invokeruid", &invoker_uid);
 
-                let endpoints: Vec<SocketAddr> = {
-                    let state = self.state.lock().await;
-                    if target_mode == "2" {
-                        let cur_cid = state
-                            .get_client(&peer)
-                            .map(|c| c.current_channel_id)
-                            .unwrap_or(1);
-                        state
-                            .clients_in_channel(cur_cid)
-                            .iter()
-                            .map(|c| c.endpoint)
-                            .collect()
-                    } else {
-                        state.clients.values().map(|c| c.endpoint).collect()
-                    }
-                };
-
-                for ep in endpoints {
-                    let _ = self.send_encrypted_command(ep, &notify).await;
-                }
-
+                // targetmode 1 (private) goes to the `target` client(s) plus an
+                // echo to the sender; 2 to the whole current channel; 3 to the
+                // whole server.
                 let mut err_resp = Command::new("error");
-                err_resp.set("id", "0");
-                err_resp.set("msg", "ok");
+                if target_mode == "1" {
+                    let targets: Vec<u16> = cmd
+                        .get("target")
+                        .map(|value| {
+                            value
+                                .split('|')
+                                .filter_map(|part| part.parse::<u16>().ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let endpoints: Vec<SocketAddr> = {
+                        let state = self.state.lock().await;
+                        targets
+                            .iter()
+                            .filter_map(|target| {
+                                state
+                                    .clients
+                                    .values()
+                                    .find(|c| {
+                                        c.clid == *target
+                                            && c.handshake_phase == HandshakePhase::Connected
+                                    })
+                                    .map(|c| c.endpoint)
+                            })
+                            .chain(std::iter::once(peer))
+                            .collect()
+                    };
+                    if endpoints.len() <= 1 {
+                        err_resp.set("id", "512");
+                        err_resp.set("msg", "invalid clientID");
+                    } else {
+                        for ep in endpoints {
+                            let _ = self.send_encrypted_command(ep, &notify).await;
+                        }
+                        err_resp.set("id", "0");
+                        err_resp.set("msg", "ok");
+                    }
+                } else {
+                    let endpoints: Vec<SocketAddr> = {
+                        let state = self.state.lock().await;
+                        if target_mode == "2" {
+                            let cur_cid = state
+                                .get_client(&peer)
+                                .map(|c| c.current_channel_id)
+                                .unwrap_or(1);
+                            state
+                                .clients_in_channel(cur_cid)
+                                .iter()
+                                .map(|c| c.endpoint)
+                                .collect()
+                        } else {
+                            state
+                                .clients
+                                .values()
+                                .filter(|c| c.handshake_phase == HandshakePhase::Connected)
+                                .map(|c| c.endpoint)
+                                .collect()
+                        }
+                    };
+
+                    for ep in endpoints {
+                        let _ = self.send_encrypted_command(ep, &notify).await;
+                    }
+
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
@@ -1570,78 +1785,109 @@ impl Server {
             }
             "clientmove" => {
                 let new_cid: u64 = cmd.get("cid").and_then(|s| s.parse().ok()).unwrap_or(1);
-                // Moving to the channel the client is already in must be a
-                // silent no-op: broadcasting a redundant notifyclientmoved
-                // makes the official client disconnect with "Invalid Client
-                // moving: already member of channel" (seen with 3.6.2 when
-                // a channel row is double-clicked twice in a row).
-                let move_ctx = {
-                    let mut state = self.state.lock().await;
-                    match state.get_client_mut(&peer) {
-                        Some(c) if c.current_channel_id != new_cid => {
-                            let old = c.current_channel_id;
-                            let was_watching = c.subscribed_channels.contains(&new_cid);
-                            c.current_channel_id = new_cid;
-                            c.subscribed_channels.insert(new_cid);
-                            Some((
-                                old,
-                                was_watching,
-                                c.uid.clone(),
-                                c.nickname.clone(),
-                                c.is_admin,
-                                c.audio,
-                            ))
-                        }
-                        _ => None,
-                    }
-                };
-
-                if let Some((old_cid, was_watching, mover_uid, mover_nick, mover_admin, mover_audio)) =
-                    move_ctx
-                {
-                    let mut notify = Command::new("notifyclientmoved");
-                    notify.set("clid", clid.to_string());
-                    notify.set("cfid", old_cid.to_string());
-                    notify.set("ctid", new_cid.to_string());
-                    notify.set("reasonid", "0");
-
-                    // Watchers of the old channel know the mover: they get
-                    // the moved notification. Watchers of only the new
-                    // channel have never seen it: they get an enter view
-                    // instead, or the client aborts with "invalid clientID".
-                    let (mut moved_eps, enter_eps) =
-                        self.move_recipients(old_cid, new_cid, peer).await;
-                    moved_eps.push(peer);
-                    for ep in &moved_eps {
-                        let _ = self.send_encrypted_command(*ep, &notify).await;
-                    }
-
-                    for ep in &enter_eps {
-                        let view = build_client_enter_view(
-                            "0",
-                            clid,
-                            &mover_uid,
-                            &mover_nick,
-                            new_cid,
-                            old_cid,
-                            mover_admin,
-                            mover_audio,
-                        );
-                        let _ = self.send_encrypted_command(*ep, &view).await;
-                    }
-
-                    // If the mover was not watching the new channel before,
-                    // it has never seen that channel's occupants: deliver
-                    // their enter views so they become visible.
-                    if !was_watching {
-                        self.send_subscription_enter_views(peer, clid, &[new_cid])
-                            .await;
-                    }
+                // The official client addresses the moved client with `clid`
+                // (`clientmove clid=5|clid=6 cid=3`); when an admin moves
+                // another user ("Move client to channel" / "Move client to own
+                // channel"), the target must be honored instead of the sender.
+                // A command without `clid` moves the sender itself (channel
+                // double-click keeps this form).
+                let mut target_clids: Vec<u16> = cmd
+                    .get("clid")
+                    .map(|value| {
+                        value
+                            .split('|')
+                            .filter_map(|part| part.parse::<u16>().ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if target_clids.is_empty() {
+                    target_clids.push(clid);
                 }
 
+                let (sender_nick, sender_uid, sender_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                };
+
+                // Moving another client requires admin rights.
+                let moves_others = target_clids.iter().any(|t| *t != clid);
                 let mut err_resp = Command::new("error");
-                err_resp.set("id", "0");
-                err_resp.set("msg", "ok");
+                if moves_others && !sender_admin {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "43"); // i_client_move_power
+                } else {
+                    // Channel properties for the join checks: password and
+                    // max clients.
+                    let (channel_password, max_clients, max_unlimited) = {
+                        let db = self.db.lock().await;
+                        match db
+                            .get_channels()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|ch| ch.cid == new_cid)
+                        {
+                            Some(ch) => (ch.password_hash, ch.max_clients, ch.max_clients_unlimited),
+                            None => (String::new(), -1, true),
+                        }
+                    };
+
+                    // Joining a password-protected channel requires the right
+                    // `cpw` for self-moves. Admin-driven moves bypass it, like
+                    // the official server's i_client_move_power.
+                    if channel_password.is_empty()
+                        || sender_admin
+                        || cmd
+                            .get("cpw")
+                            .map(|pw| hash_channel_password(pw) == channel_password)
+                            .unwrap_or(false)
+                    {
+                        let (occupants, already_there) = {
+                            let state = self.state.lock().await;
+                            let occupants = state.clients_in_channel(new_cid).len() as i64;
+                            let already_there = target_clids
+                                .iter()
+                                .filter(|t| {
+                                    state.clients.values().any(|c| {
+                                        c.clid == **t
+                                            && c.handshake_phase == HandshakePhase::Connected
+                                            && c.current_channel_id == new_cid
+                                    })
+                                })
+                                .count() as i64;
+                            (occupants, already_there)
+                        };
+                        let arrivals = target_clids.len() as i64 - already_there;
+                        if !max_unlimited
+                            && max_clients >= 0
+                            && occupants + arrivals > max_clients
+                        {
+                            // 777 = ERROR_channel_maxclients_reached
+                            err_resp.set("id", "777");
+                            err_resp.set("msg", "channel maxclient reached");
+                        } else {
+                            for target in target_clids {
+                                self.perform_move(
+                                    clid,
+                                    target,
+                                    new_cid,
+                                    &sender_nick,
+                                    &sender_uid,
+                                )
+                                .await;
+                            }
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                        }
+                    } else {
+                        // 781 = ERROR_channel_invalid_password
+                        err_resp.set("id", "781");
+                        err_resp.set("msg", "invalid channel password");
+                    }
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
@@ -1699,6 +1945,149 @@ impl Server {
                 upd.set("client_total_bytes_downloaded", "0");
                 upd.set("client_servergroups", if admin { "6" } else { "8" });
                 self.send_encrypted_command(peer, &upd).await?;
+
+                let mut err_resp = Command::new("error");
+                err_resp.set("id", "0");
+                err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "getconnectioninfo" => {
+                // The official "Client connection info" dialog: the requester
+                // asks for another client's stats, the server asks the target
+                // (notifyconnectioninforequest) to publish fresh ones with
+                // setconnectioninfo, and forwards them back as
+                // notifyconnectioninfo. The IP is only included for admins.
+                let target_clid: Option<u16> = cmd.get("clid").and_then(|v| v.parse().ok());
+                let requester_admin = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                };
+
+                match target_clid {
+                    Some(target_clid) => {
+                        let target_data = {
+                            let mut state = self.state.lock().await;
+                            let target = state
+                                .clients
+                                .values()
+                                .find(|c| {
+                                    c.clid == target_clid
+                                        && c.handshake_phase == HandshakePhase::Connected
+                                })
+                                .map(|c| {
+                                    (
+                                        c.endpoint,
+                                        c.connection_stats.clone(),
+                                        c.endpoint.ip().to_string(),
+                                    )
+                                });
+                            if target.is_some() {
+                                state
+                                    .connection_watchers
+                                    .entry(target_clid)
+                                    .or_default()
+                                    .insert(peer);
+                            }
+                            target
+                        };
+
+                        match target_data {
+                            Some((target_ep, stats, target_ip)) => {
+                                // Ask the target for a fresh report. The
+                                // official client answers with
+                                // `setconnectioninfo` while the dialog is open.
+                                let _ = self
+                                    .send_encrypted_raw(target_ep, "notifyconnectioninforequest")
+                                    .await;
+
+                                let notify = build_connection_info(
+                                    target_clid,
+                                    &stats,
+                                    &target_ip,
+                                    requester_admin,
+                                );
+                                self.send_encrypted_command(peer, &notify).await?;
+                            }
+                            None => {
+                                let mut err_resp = Command::new("error");
+                                err_resp.set("id", "512");
+                                err_resp.set("msg", "invalid clientID");
+                                if let Some(rc) = cmd.get("return_code") {
+                                    err_resp.set("return_code", rc);
+                                }
+                                self.send_encrypted_command(peer, &err_resp).await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    None => {
+                        let mut err_resp = Command::new("error");
+                        err_resp.set("id", "1538");
+                        err_resp.set("msg", "invalid parameter");
+                        if let Some(rc) = cmd.get("return_code") {
+                            err_resp.set("return_code", rc);
+                        }
+                        self.send_encrypted_command(peer, &err_resp).await?;
+                        return Ok(());
+                    }
+                }
+
+                let mut err_resp = Command::new("error");
+                err_resp.set("id", "0");
+                err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "setconnectioninfo" => {
+                // A client publishing its own connection statistics (in
+                // response to notifyconnectioninforequest). Store them and
+                // forward to everyone currently watching this client's
+                // connection info.
+                let stats: std::collections::BTreeMap<String, String> = cmd
+                    .params
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("connection_"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let has_stats = !stats.is_empty();
+
+                let recipients: Vec<(SocketAddr, bool)> = {
+                    let mut state = self.state.lock().await;
+                    if has_stats {
+                        if let Some(c) = state.get_client_mut(&peer) {
+                            c.connection_stats = stats.clone();
+                        }
+                    }
+                    let watchers = state
+                        .connection_watchers
+                        .get(&clid)
+                        .cloned()
+                        .unwrap_or_default();
+                    watchers
+                        .into_iter()
+                        .filter_map(|ep| {
+                            state
+                                .clients
+                                .get(&ep)
+                                .filter(|c| c.handshake_phase == HandshakePhase::Connected)
+                                .map(|c| (ep, c.is_admin))
+                        })
+                        .collect()
+                };
+
+                if has_stats {
+                    let target_ip = peer.ip().to_string();
+                    for (ep, admin) in recipients {
+                        let notify =
+                            build_connection_info(clid, &stats, &target_ip, admin);
+                        let _ = self.send_encrypted_command(ep, &notify).await;
+                    }
+                }
 
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
@@ -1856,96 +2245,120 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "channelcreate" => {
-                let ch_name = cmd.get("channel_name").unwrap_or("New Channel");
-                let ch_topic = cmd.get("channel_topic").unwrap_or("");
-
-                let (nickname, invoker_uid) = {
+                let (nickname, invoker_uid, is_admin) = {
                     let state = self.state.lock().await;
-                    match state.get_client(&peer) {
-                        Some(c) => (c.nickname.clone(), c.uid.clone()),
-                        None => ("User".to_string(), String::new()),
-                    }
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
                 };
-
-                // Channel names must be unique on the virtual server. The
-                // incoming channel_order is the sibling this channel follows;
-                // when omitted (or stale), append after the last channel.
-                let cid = {
-                    let db = self.db.lock().await;
-                    let channels = db.get_channels().unwrap_or_default();
-                    if channels
-                        .iter()
-                        .any(|c| c.name.eq_ignore_ascii_case(ch_name))
-                    {
-                        0
-                    } else {
-                        let requested_order =
-                            cmd.get("channel_order").and_then(|s| s.parse::<u64>().ok());
-                        let order_after = match requested_order {
-                            Some(0) => 0,
-                            Some(order) if channels.iter().any(|c| c.cid == order) => order,
-                            _ => channels.last().map(|c| c.cid).unwrap_or(0),
-                        };
-                        db.create_channel_after(ch_name, ch_topic, order_after)
-                            .unwrap_or(0)
-                    }
-                };
-
-                if cid > 0 {
-                    let db = self.db.lock().await;
-                    if let Ok(mut edit) = parse_channel_edit(&cmd) {
-                        // The order link was applied when the new row was
-                        // inserted. Apply the remaining supplied properties.
-                        edit.order_after = None;
-                        if let Err(e) = db.edit_channel(cid, &edit) {
-                            warn!(
-                                "Failed to persist properties for new channel {}: {:?}",
-                                cid, e
-                            );
-                        }
-                    }
-                }
-
-                if cid > 0 {
-                    let channel = {
-                        let db = self.db.lock().await;
-                        db.get_channels()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .find(|channel| channel.cid == cid)
-                    };
-                    let notify = channel.as_ref().map(|channel| {
-                        build_channel_notification(
-                            "notifychannelcreated",
-                            channel,
-                            clid,
-                            &nickname,
-                            &invoker_uid,
-                        )
-                    });
-
-                    let all_peers: Vec<SocketAddr> = {
-                        let state = self.state.lock().await;
-                        state.clients.values().map(|c| c.endpoint).collect()
-                    };
-                    if let Some(notify) = notify {
-
-                        for ep in all_peers {
-                            let _ = self.send_encrypted_command(ep, &notify).await;
-                        }
-                    }
-                }
 
                 let mut err_resp = Command::new("error");
-                if cid > 0 {
-                    err_resp.set("id", "0");
-                    err_resp.set("msg", "ok");
-                    // The official client needs the new channel id in this
-                    // response to select the freshly created channel.
-                    err_resp.set("cid", cid.to_string());
+                // Creating channels is admin-only. 2568 with `failed_permid`
+                // mirrors the official server; the client resolves the
+                // permission name and shows the proper "insufficient
+                // permissions" dialog instead of disconnecting.
+                let failed_permid = if cmd.get("channel_flag_permanent") == Some("1") {
+                    "89" // b_channel_create_permanent
+                } else if cmd.get("channel_flag_semi_permanent") == Some("1") {
+                    "90" // b_channel_create_semi_permanent
+                } else if cmd.get("channel_flag_temporary") == Some("1") {
+                    "91" // b_channel_create_temporary
                 } else {
-                    err_resp.set("id", "1024");
-                    err_resp.set("msg", "channel\\sname\\salready\\sin\\suse");
+                    "89"
+                };
+                if !is_admin {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", failed_permid);
+                } else {
+                    let ch_name = cmd.get("channel_name").unwrap_or("New Channel");
+                    let ch_topic = cmd.get("channel_topic").unwrap_or("");
+
+                    // Channel names must be unique on the virtual server. The
+                    // incoming channel_order is the sibling this channel
+                    // follows; when omitted (or stale), append after the last
+                    // channel.
+                    let cid = {
+                        let db = self.db.lock().await;
+                        let channels = db.get_channels().unwrap_or_default();
+                        if channels
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(ch_name))
+                        {
+                            0
+                        } else {
+                            let requested_order =
+                                cmd.get("channel_order").and_then(|s| s.parse::<u64>().ok());
+                            let order_after = match requested_order {
+                                Some(0) => 0,
+                                Some(order) if channels.iter().any(|c| c.cid == order) => order,
+                                _ => channels.last().map(|c| c.cid).unwrap_or(0),
+                            };
+                            db.create_channel_after(ch_name, ch_topic, order_after)
+                                .unwrap_or(0)
+                        }
+                    };
+
+                    if cid > 0 {
+                        let db = self.db.lock().await;
+                        if let Ok(mut edit) = parse_channel_edit(&cmd) {
+                            // The order link was applied when the new row was
+                            // inserted. Apply the remaining supplied properties.
+                            edit.order_after = None;
+                            if let Err(e) = db.edit_channel(cid, &edit) {
+                                warn!(
+                                    "Failed to persist properties for new channel {}: {:?}",
+                                    cid, e
+                                );
+                            }
+                        }
+                    }
+
+                    if cid > 0 {
+                        let channel = {
+                            let db = self.db.lock().await;
+                            db.get_channels()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|channel| channel.cid == cid)
+                        };
+                        let notify = channel.as_ref().map(|channel| {
+                            build_channel_notification(
+                                "notifychannelcreated",
+                                channel,
+                                clid,
+                                &nickname,
+                                &invoker_uid,
+                            )
+                        });
+
+                        let all_peers: Vec<SocketAddr> = {
+                            let state = self.state.lock().await;
+                            state
+                                .clients
+                                .values()
+                                .filter(|c| c.handshake_phase == HandshakePhase::Connected)
+                                .map(|c| c.endpoint)
+                                .collect()
+                        };
+                        if let Some(notify) = notify {
+                            for ep in all_peers {
+                                let _ = self.send_encrypted_command(ep, &notify).await;
+                            }
+                        }
+                    }
+
+                    if cid > 0 {
+                        err_resp.set("id", "0");
+                        err_resp.set("msg", "ok");
+                        // The official client needs the new channel id in this
+                        // response to select the freshly created channel.
+                        err_resp.set("cid", cid.to_string());
+                    } else {
+                        err_resp.set("id", "1024");
+                        err_resp.set("msg", "channel\\sname\\salready\\sin\\suse");
+                    }
                 }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
@@ -2874,22 +3287,6 @@ impl Server {
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
-            "permissionlist" => {
-                // Full permid<->permname catalog, verbatim from an official
-                // 3.13.7 server. The client asks for this once and caches it;
-                // an empty answer leaves permission-name lookups permanently
-                // unresolved and holds permission-gated commands (pokes).
-                let wire = crate::permission_catalog::get_permission_catalog_wire();
-                self.send_encrypted_raw(peer, wire).await?;
-
-                let mut err_resp = Command::new("error");
-                err_resp.set("id", "0");
-                err_resp.set("msg", "ok");
-                if let Some(rc) = cmd.get("return_code") {
-                    err_resp.set("return_code", rc);
-                }
-                self.send_encrypted_command(peer, &err_resp).await?;
-            }
             "ftgetfilelist" => {
                 // No file transfer support. The official 3.13.7 server answers
                 // ftgetfilelist for an empty channel with no notifications and
@@ -2919,6 +3316,103 @@ impl Server {
         Ok(())
     }
 
+    /// Moves one client (`target`) into `new_cid` and fans out the view
+    /// updates. A same-channel move is a silent no-op: broadcasting a
+    /// redundant notifyclientmoved makes the official client disconnect with
+    /// "Invalid Client moving: already member of channel".
+    ///
+    /// `sender` is the client that issued the command; when it differs from
+    /// the moved client (an admin moving another user), the moved
+    /// notification carries invoker fields, mirroring the captured official
+    /// kick/move format.
+    async fn perform_move(
+        &self,
+        sender_clid: u16,
+        target: u16,
+        new_cid: u64,
+        sender_nick: &str,
+        sender_uid: &str,
+    ) {
+        let move_ctx = {
+            let mut state = self.state.lock().await;
+            match state
+                .clients
+                .values_mut()
+                .find(|c| c.clid == target && c.handshake_phase == HandshakePhase::Connected)
+            {
+                Some(c) if c.current_channel_id != new_cid => {
+                    let old = c.current_channel_id;
+                    let was_watching = c.subscribed_channels.contains(&new_cid);
+                    c.current_channel_id = new_cid;
+                    c.subscribed_channels.insert(new_cid);
+                    Some((
+                        old,
+                        was_watching,
+                        c.endpoint,
+                        c.uid.clone(),
+                        c.nickname.clone(),
+                        c.is_admin,
+                        c.audio,
+                    ))
+                }
+                _ => None,
+            }
+        };
+
+        if let Some((old_cid, was_watching, target_ep, target_uid, target_nick, target_admin, target_audio)) =
+            move_ctx
+        {
+            let mut notify = Command::new("notifyclientmoved");
+            notify.set("clid", target.to_string());
+            notify.set("cfid", old_cid.to_string());
+            notify.set("ctid", new_cid.to_string());
+            notify.set("reasonid", "0");
+            if sender_clid != target {
+                notify.set("invokerid", sender_clid.to_string());
+                notify.set("invokername", sender_nick);
+                notify.set("invokeruid", sender_uid);
+            }
+
+            // Watchers of the old channel know the target: they get the moved
+            // notification. Watchers of only the new channel have never seen
+            // it: they get an enter view instead, or the client aborts with
+            // "invalid clientID".
+            let (mut moved_eps, enter_eps) =
+                self.move_recipients(old_cid, new_cid, target_ep).await;
+            moved_eps.push(target_ep);
+            for ep in &moved_eps {
+                let _ = self.send_encrypted_command(*ep, &notify).await;
+            }
+
+            for ep in &enter_eps {
+                let view = build_client_enter_view(
+                    "0",
+                    target,
+                    &target_uid,
+                    &target_nick,
+                    new_cid,
+                    old_cid,
+                    target_admin,
+                    target_audio,
+                );
+                let _ = self.send_encrypted_command(*ep, &view).await;
+            }
+
+            // If the target was not watching the new channel before, it has
+            // never seen that channel's occupants: deliver their enter views
+            // so they become visible.
+            if !was_watching {
+                self.send_subscription_enter_views(target_ep, target, &[new_cid])
+                    .await;
+            }
+
+            info!(
+                "Client {} moved client {} ({}) from channel {} to {}",
+                sender_clid, target, target_nick, old_cid, new_cid
+            );
+        }
+    }
+
     async fn handle_voice(&self, peer: SocketAddr, packet: &[u8]) -> Result<(), String> {
         let (cid, clid) = {
             let state = self.state.lock().await;
@@ -2928,13 +3422,60 @@ impl Server {
             }
         };
 
-        if packet.len() < 16 {
+        // C2S voice header: MAC(8) + packet id(2) + client id(2) + flags(1).
+        if packet.len() < 17 {
             return Ok(());
         }
+        let sender_pid = u16::from_be_bytes([packet[8], packet[9]]);
+        let sender_flags = packet[12];
+        let sender_encrypted = sender_flags & Flags::UNENCRYPTED.bits() == 0;
 
-        let seq_id = &packet[13..15];
-        let codec = packet[15];
-        let audio_data = &packet[16..];
+        let payload: Vec<u8> = if sender_encrypted {
+            // Encrypted channel: the speaker's payload is EAX-encrypted with
+            // the sender's c2s voice key for (generation, packet id). The
+            // generation advances whenever the sender's 16-bit voice packet
+            // id wraps.
+            let generation = {
+                let mut state = self.state.lock().await;
+                let voice_generation = match state.get_client_mut(&peer) {
+                    Some(c) => {
+                        let wrapped = c
+                            .last_c2s_voice_pid
+                            .map(|last| last.wrapping_sub(sender_pid) > 32768)
+                            .unwrap_or(false);
+                        if wrapped {
+                            c.c2s_voice_generation += 1;
+                        }
+                        c.last_c2s_voice_pid = Some(sender_pid);
+                        c.c2s_voice_generation
+                    }
+                    None => return Ok(()),
+                };
+                voice_generation
+            };
+            let sender_shared_iv = {
+                let state = self.state.lock().await;
+                match state.get_client(&peer).and_then(|c| c.shared_iv) {
+                    Some(iv) => iv,
+                    None => return Ok(()),
+                }
+            };
+            let (key, nonce) =
+                derive_key_nonce(Direction::C2S, PacketType::Voice as u8, generation, sender_pid, &sender_shared_iv);
+            let mac: [u8; 8] = packet[0..8].try_into().map_err(|_| "Invalid MAC")?;
+            let mut ciphertext = packet[13..].to_vec();
+            decrypt_eax(&key, &nonce, &packet[8..13], &mac, &mut ciphertext)?;
+            ciphertext
+        } else {
+            packet[13..].to_vec()
+        };
+
+        if payload.len() < 5 {
+            return Ok(());
+        }
+        let seq_id = &payload[0..2];
+        let codec = payload[4];
+        let audio_data = &payload[5..];
 
         let recipients: Vec<SocketAddr> = {
             let state = self.state.lock().await;
@@ -2946,31 +3487,79 @@ impl Server {
                 .collect()
         };
 
+        // Channels with channel_codec_is_unencrypted=0 carry EAX-encrypted
+        // voice; the relay decrypts the speaker payload and re-encrypts it
+        // per receiver with that receiver's s2c voice key.
+        let channel_encrypted = {
+            let db = self.db.lock().await;
+            db.get_channels()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|ch| ch.cid == cid)
+                .map(|ch| !ch.codec_is_unencrypted)
+                .unwrap_or(false)
+        };
+
         for recipient in recipients {
-            let (p_id, shared_mac) = {
+            let (p_id, shared_mac, shared_iv, s2c_generation) = {
                 let mut state = self.state.lock().await;
                 let c = match state.get_client_mut(&recipient) {
                     Some(c) => c,
                     None => continue,
                 };
                 let id = c.next_s2c_voice_packet_id;
-                c.next_s2c_voice_packet_id = c.next_s2c_voice_packet_id.wrapping_add(1);
+                let generation = c.s2c_voice_generation;
+                c.next_s2c_voice_packet_id = id.wrapping_add(1);
+                if id == u16::MAX {
+                    c.s2c_voice_generation += 1;
+                }
                 let sm: [u8; 8] = c
                     .shared_iv
                     .map(|siv| Sha1::digest(&siv)[..8].try_into().unwrap())
                     .unwrap_or([0u8; 8]);
-                (id, sm)
+                (id, sm, c.shared_iv, generation)
             };
 
-            let mut out = Vec::with_capacity(11 + 5 + audio_data.len());
-            out.extend_from_slice(&shared_mac);
-            out.extend_from_slice(&p_id.to_be_bytes());
-            out.push(0x80); // Flags::UNENCRYPTED | PacketType::Voice (0)
-            out.extend_from_slice(seq_id);
-            out.extend_from_slice(&clid.to_be_bytes());
-            out.push(codec);
-            out.extend_from_slice(audio_data);
-            let _ = self.socket.send_to(&out, recipient).await;
+            if channel_encrypted {
+                let Some(receiver_iv) = shared_iv else {
+                    continue;
+                };
+                let (key, nonce) = derive_key_nonce(
+                    Direction::S2C,
+                    PacketType::Voice as u8,
+                    s2c_generation,
+                    p_id,
+                    &receiver_iv,
+                );
+                let mut body = Vec::with_capacity(payload.len());
+                body.extend_from_slice(seq_id);
+                body.extend_from_slice(&clid.to_be_bytes());
+                body.push(codec);
+                body.extend_from_slice(audio_data);
+                let mac = encrypt_eax(&key, &nonce, &{
+                    let mut aad = Vec::with_capacity(3);
+                    aad.extend_from_slice(&p_id.to_be_bytes());
+                    aad.push(PacketType::Voice as u8);
+                    aad
+                }, &mut body)?;
+
+                let mut out = Vec::with_capacity(11 + body.len());
+                out.extend_from_slice(&mac);
+                out.extend_from_slice(&p_id.to_be_bytes());
+                out.push(PacketType::Voice as u8);
+                out.extend_from_slice(&body);
+                let _ = self.socket.send_to(&out, recipient).await;
+            } else {
+                let mut out = Vec::with_capacity(11 + 5 + audio_data.len());
+                out.extend_from_slice(&shared_mac);
+                out.extend_from_slice(&p_id.to_be_bytes());
+                out.push(0x80); // Flags::UNENCRYPTED | PacketType::Voice (0)
+                out.extend_from_slice(seq_id);
+                out.extend_from_slice(&clid.to_be_bytes());
+                out.push(codec);
+                out.extend_from_slice(audio_data);
+                let _ = self.socket.send_to(&out, recipient).await;
+            }
         }
 
         Ok(())
@@ -3003,12 +3592,18 @@ impl Server {
                 bool_wire(ch.is_semi_permanent),
             );
             ch_cmd.set("channel_flag_default", bool_wire(ch.is_default));
-            ch_cmd.set("channel_flag_password", "0");
+            ch_cmd.set(
+                "channel_flag_password",
+                bool_wire(!ch.password_hash.is_empty()),
+            );
             ch_cmd.set(
                 "channel_codec_latency_factor",
                 ch.codec_latency_factor.to_string(),
             );
-            ch_cmd.set("channel_codec_is_unencrypted", "1");
+            ch_cmd.set(
+                "channel_codec_is_unencrypted",
+                bool_wire(ch.codec_is_unencrypted),
+            );
             ch_cmd.set("channel_delete_delay", ch.delete_delay.to_string());
             ch_cmd.set(
                 "channel_flag_maxclients_unlimited",
