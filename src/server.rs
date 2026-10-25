@@ -286,6 +286,98 @@ fn build_channel_notification(
     notify
 }
 
+fn build_channel_edited_notification(
+    channel: &ChannelRecord,
+    edit: &ChannelEdit,
+    invoker_id: u16,
+    invoker_name: &str,
+    invoker_uid: &str,
+) -> Command {
+    let mut notify = Command::new("notifychanneledited");
+    notify.set("cid", channel.cid.to_string());
+    // `reasonid=10` is the protocol's Channeledit reason. The 3.6.2
+    // client requires it before applying an edit notification.
+    notify.set("reasonid", "10");
+    notify.set("invokerid", invoker_id.to_string());
+    notify.set("invokername", invoker_name);
+    notify.set("invokeruid", invoker_uid);
+
+    // Only broadcast fields that actually changed. Crucially, sending
+    // `channel_name` when the name was not renamed makes the official client
+    // validate uniqueness against its own channel map, fail with
+    // "Error from ChanClients: channel name is already in use", and abort.
+    if let Some(ref name) = edit.name {
+        notify.set("channel_name", name);
+    }
+    if let Some(ref topic) = edit.topic {
+        notify.set("channel_topic", topic);
+    }
+    if let Some(ref desc) = edit.description {
+        notify.set("channel_description", desc);
+    }
+    if let Some(codec) = edit.codec {
+        notify.set("channel_codec", codec.to_string());
+    }
+    if let Some(quality) = edit.codec_quality {
+        notify.set("channel_codec_quality", quality.to_string());
+    }
+    if edit.order_after.is_some() {
+        notify.set("channel_order", channel.order_id.to_string());
+    }
+    if let Some(perm) = edit.is_permanent {
+        notify.set("channel_flag_permanent", bool_wire(perm));
+    }
+    if let Some(semi) = edit.is_semi_permanent {
+        notify.set("channel_flag_semi_permanent", bool_wire(semi));
+    }
+    if let Some(def) = edit.is_default {
+        notify.set("channel_flag_default", bool_wire(def));
+    }
+    if edit.password.is_some() {
+        notify.set(
+            "channel_flag_password",
+            bool_wire(!channel.password_hash.is_empty()),
+        );
+    }
+    if let Some(max_c) = edit.max_clients {
+        notify.set("channel_maxclients", max_c.to_string());
+    }
+    if let Some(max_f) = edit.max_family_clients {
+        notify.set("channel_maxfamilyclients", max_f.to_string());
+    }
+    if let Some(ntp) = edit.needed_talk_power {
+        notify.set("channel_needed_talk_power", ntp.to_string());
+    }
+    if let Some(nsp) = edit.needed_subscribe_power {
+        notify.set("channel_needed_subscribe_power", nsp.to_string());
+    }
+    if let Some(clf) = edit.codec_latency_factor {
+        notify.set("channel_codec_latency_factor", clf.to_string());
+    }
+    if let Some(unenc) = edit.codec_is_unencrypted {
+        notify.set("channel_codec_is_unencrypted", bool_wire(unenc));
+    }
+    if let Some(delay) = edit.delete_delay {
+        notify.set("channel_delete_delay", delay.to_string());
+    }
+    if let Some(max_u) = edit.max_clients_unlimited {
+        notify.set("channel_flag_maxclients_unlimited", bool_wire(max_u));
+    }
+    if let Some(max_fu) = edit.max_family_clients_unlimited {
+        notify.set("channel_flag_maxfamilyclients_unlimited", bool_wire(max_fu));
+    }
+    if let Some(max_fi) = edit.max_family_clients_inherited {
+        notify.set("channel_flag_maxfamilyclients_inherited", bool_wire(max_fi));
+    }
+    if let Some(ref phon) = edit.name_phonetic {
+        notify.set("channel_name_phonetic", phon);
+    }
+    if let Some(icon) = edit.icon_id {
+        notify.set("channel_icon_id", icon.to_string());
+    }
+    notify
+}
+
 /// Reassembles the next complete command from the out-of-order packet buffer.
 ///
 /// TS3 marks the first and the last packet of a fragmented command with
@@ -304,7 +396,19 @@ fn try_assemble_next(
 
     if !first_flags.contains(Flags::FRAGMENTED) {
         pending.remove(&expected);
-        return Some((String::from_utf8_lossy(&first_bytes).to_string(), 1));
+        let payload = if first_flags.contains(Flags::COMPRESSED) {
+            let mut cur = std::io::Cursor::new(&first_bytes);
+            match quicklz::decompress(&mut cur, 65536) {
+                Ok(decompressed) => decompressed,
+                Err(e) => {
+                    warn!("Failed to decompress single-packet command with QuickLZ: {:?}", e);
+                    first_bytes
+                }
+            }
+        } else {
+            first_bytes
+        };
+        return Some((String::from_utf8_lossy(&payload).to_string(), 1));
     }
 
     let mut ids = vec![expected];
@@ -321,8 +425,20 @@ fn try_assemble_next(
                     for id in &ids {
                         pending.remove(id);
                     }
+                    let decompressed = if first_flags.contains(Flags::COMPRESSED) {
+                        let mut cur = std::io::Cursor::new(&payload);
+                        match quicklz::decompress(&mut cur, 65536) {
+                            Ok(dec) => dec,
+                            Err(e) => {
+                                warn!("Failed to decompress fragmented command with QuickLZ: {:?}", e);
+                                payload
+                            }
+                        }
+                    } else {
+                        payload
+                    };
                     return Some((
-                        String::from_utf8_lossy(&payload).to_string(),
+                        String::from_utf8_lossy(&decompressed).to_string(),
                         ids.len() as u16,
                     ));
                 }
@@ -635,34 +751,42 @@ impl Server {
 
     /// Sends the subscriber fresh enter views (reasonid=2, Subscription) for
     /// every connected client in the given channels except the subscriber
-    /// itself. The official client drops users from its view when it
-    /// unsubscribes, so a (re)subscribe must re-announce them or they never
-    /// reappear and later notifications about them kill the client.
+    /// itself and clients the subscriber already has in view. The official
+    /// client aborts with "Already known Client entering" if it receives a
+    /// duplicate enter view for a client it already knows.
     async fn send_subscription_enter_views(&self, peer: SocketAddr, own_clid: u16, channels: &[u64]) {
         if channels.is_empty() {
             return;
         }
         let occupants: Vec<(u16, String, String, u64, bool, ClientAudioState)> = {
-            let state = self.state.lock().await;
-            state
-                .clients
-                .values()
-                .filter(|c| {
-                    c.handshake_phase == HandshakePhase::Connected
-                        && c.clid != own_clid
-                        && channels.contains(&c.current_channel_id)
-                })
-                .map(|c| {
-                    (
+            let mut state = self.state.lock().await;
+            let known = match state.get_client(&peer) {
+                Some(c) => c.known_clients.clone(),
+                None => return,
+            };
+            let mut to_send = Vec::new();
+            for c in state.clients.values() {
+                if c.handshake_phase == HandshakePhase::Connected
+                    && c.clid != own_clid
+                    && channels.contains(&c.current_channel_id)
+                    && !known.contains(&c.clid)
+                {
+                    to_send.push((
                         c.clid,
                         c.uid.clone(),
                         c.nickname.clone(),
                         c.current_channel_id,
                         c.is_admin,
                         c.audio,
-                    )
-                })
-                .collect()
+                    ));
+                }
+            }
+            if let Some(c) = state.get_client_mut(&peer) {
+                for (clid, ..) in &to_send {
+                    c.known_clients.insert(*clid);
+                }
+            }
+            to_send
         };
         for (clid, uid, nickname, cid, is_admin, audio) in occupants {
             let view = build_client_enter_view("2", clid, &uid, &nickname, cid, 0, is_admin, audio);
@@ -687,8 +811,16 @@ impl Server {
         notify.set("ctid", "0");
         notify.set("reasonid", reasonid);
         notify.set("reasonmsg", reasonmsg);
-        for ep in recipients {
-            let _ = self.send_encrypted_command(ep, &notify).await;
+        for ep in &recipients {
+            let _ = self.send_encrypted_command(*ep, &notify).await;
+        }
+        {
+            let mut state = self.state.lock().await;
+            for ep in &recipients {
+                if let Some(c) = state.get_client_mut(ep) {
+                    c.known_clients.remove(&gone_clid);
+                }
+            }
         }
         info!(
             "Broadcast left view for vanished client {} (reason {})",
@@ -1443,6 +1575,21 @@ impl Server {
                     let _ = self.send_encrypted_raw(*ep, &format!("notifyclientpermhints clid={} flags=65535", clid)).await;
                 }
 
+                {
+                    let mut state = self.state.lock().await;
+                    if let Some(c) = state.get_client_mut(&peer) {
+                        c.known_clients.insert(clid);
+                        for (other_clid, ..) in &existing_clients {
+                            c.known_clients.insert(*other_clid);
+                        }
+                    }
+                    for ep in &other_endpoints {
+                        if let Some(c) = state.get_client_mut(ep) {
+                            c.known_clients.insert(clid);
+                        }
+                    }
+                }
+
                 // 6. Publish channel-group names, followed by the baseline
                 // permission requirements that the client uses for actions.
                 self.send_channel_group_list(peer).await?;
@@ -1608,6 +1755,19 @@ impl Server {
                         self.send_subscription_enter_views(peer, own_clid, &notification_ids)
                             .await;
                     }
+                } else if !notification_ids.is_empty() {
+                    let mut state = self.state.lock().await;
+                    let to_remove: Vec<u16> = state
+                        .clients
+                        .values()
+                        .filter(|c| c.endpoint != peer && notification_ids.contains(&c.current_channel_id))
+                        .map(|c| c.clid)
+                        .collect();
+                    if let Some(client) = state.get_client_mut(&peer) {
+                        for clid in to_remove {
+                            client.known_clients.remove(&clid);
+                        }
+                    }
                 }
 
                 let mut err_resp = Command::new("error");
@@ -1674,6 +1834,19 @@ impl Server {
                     if let Some(own_clid) = own_clid {
                         self.send_subscription_enter_views(peer, own_clid, &notification_ids)
                             .await;
+                    }
+                } else if !notification_ids.is_empty() {
+                    let mut state = self.state.lock().await;
+                    let to_remove: Vec<u16> = state
+                        .clients
+                        .values()
+                        .filter(|c| c.endpoint != peer && notification_ids.contains(&c.current_channel_id))
+                        .map(|c| c.clid)
+                        .collect();
+                    if let Some(client) = state.get_client_mut(&peer) {
+                        for clid in to_remove {
+                            client.known_clients.remove(&clid);
+                        }
                     }
                 }
 
@@ -2402,9 +2575,9 @@ impl Server {
                             };
                             match result {
                                 Ok(Some(channel)) => {
-                                    let notify = build_channel_notification(
-                                        "notifychanneledited",
+                                    let notify = build_channel_edited_notification(
                                         &channel,
+                                        &edit,
                                         clid,
                                         &nickname,
                                         &uid,
@@ -2586,6 +2759,14 @@ impl Server {
                                     );
                                     let _ = self.send_encrypted_command(*recipient, &view).await;
                                 }
+                                {
+                                    let mut state = self.state.lock().await;
+                                    for recipient in &enter_eps {
+                                        if let Some(c) = state.get_client_mut(recipient) {
+                                            c.known_clients.insert(moved_clid);
+                                        }
+                                    }
+                                }
                             }
 
                             let mut deleted = Command::new("notifychanneldeleted");
@@ -2727,8 +2908,16 @@ impl Server {
                 notify.set("reasonmsg", reason_msg);
                 let _ = self.send_encrypted_command(peer, &notify).await;
 
-                for ep in other_peers {
-                    let _ = self.send_encrypted_command(ep, &notify).await;
+                for ep in &other_peers {
+                    let _ = self.send_encrypted_command(*ep, &notify).await;
+                }
+                {
+                    let mut state = self.state.lock().await;
+                    for ep in &other_peers {
+                        if let Some(c) = state.get_client_mut(ep) {
+                            c.known_clients.remove(&clid);
+                        }
+                    }
                 }
 
                 info!("Client {} disconnecting (reason {})", clid, reason_id);
@@ -2838,6 +3027,14 @@ impl Server {
                                             );
                                             let _ = self.send_encrypted_command(*ep, &view).await;
                                         }
+                                        {
+                                            let mut state = self.state.lock().await;
+                                            for ep in &enter_eps {
+                                                if let Some(c) = state.get_client_mut(ep) {
+                                                    c.known_clients.insert(target_clid);
+                                                }
+                                            }
+                                        }
                                     }
 
                                     info!(
@@ -2873,8 +3070,16 @@ impl Server {
                                     .watching_recipients(&[old_cid], Some(target_ep))
                                     .await;
 
-                                for ep in other_peers {
-                                    let _ = self.send_encrypted_command(ep, &notify).await;
+                                for ep in &other_peers {
+                                    let _ = self.send_encrypted_command(*ep, &notify).await;
+                                }
+                                {
+                                    let mut state = self.state.lock().await;
+                                    for ep in &other_peers {
+                                        if let Some(c) = state.get_client_mut(ep) {
+                                            c.known_clients.remove(&target_clid);
+                                        }
+                                    }
                                 }
 
                                 info!(
@@ -3065,8 +3270,16 @@ impl Server {
                                 .watching_recipients(&[old_cid], Some(target_ep))
                                 .await;
 
-                            for ep in other_peers {
-                                let _ = self.send_encrypted_command(ep, &notify).await;
+                            for ep in &other_peers {
+                                let _ = self.send_encrypted_command(*ep, &notify).await;
+                            }
+                            {
+                                let mut state = self.state.lock().await;
+                                for ep in &other_peers {
+                                    if let Some(c) = state.get_client_mut(ep) {
+                                        c.known_clients.remove(&target_clid);
+                                    }
+                                }
                             }
 
                             info!(
@@ -3404,6 +3617,14 @@ impl Server {
                     target_audio,
                 );
                 let _ = self.send_encrypted_command(*ep, &view).await;
+            }
+            {
+                let mut state = self.state.lock().await;
+                for ep in &enter_eps {
+                    if let Some(c) = state.get_client_mut(ep) {
+                        c.known_clients.insert(target);
+                    }
+                }
             }
 
             // If the target was not watching the new channel before, it has
@@ -3952,5 +4173,19 @@ mod tests {
         assert_eq!(text, "ping");
         assert_eq!(consumed, 1);
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_quicklz_compressed_reassembly() {
+        use std::collections::BTreeMap;
+        let data = b"setconnectioninfo connection_ping=12.3456";
+        let compressed = quicklz::compress(data, quicklz::CompressionLevel::Lvl1);
+
+        let mut pending: BTreeMap<u16, (Flags, Vec<u8>)> = BTreeMap::new();
+        pending.insert(1, (Flags::COMPRESSED, compressed));
+
+        let (text, consumed) = try_assemble_next(&mut pending, 1).expect("complete command");
+        assert_eq!(consumed, 1);
+        assert_eq!(text, "setconnectioninfo connection_ping=12.3456");
     }
 }

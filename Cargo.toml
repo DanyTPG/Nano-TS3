@@ -20,6 +20,7 @@ base64 = "0.22"
 byteorder = "1.5"
 p256 = { version = "0.14.0", features = ["ecdh", "ecdsa"] }
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
+quicklz = "0.3.1"
 
 [[bin]]
 name = "dump_cmd"

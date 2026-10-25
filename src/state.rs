@@ -41,6 +41,7 @@ pub struct ClientSession {
     pub current_channel_id: u64,
     pub audio: ClientAudioState,
     pub subscribed_channels: BTreeSet<u64>,
+    pub known_clients: BTreeSet<u16>,
     pub is_admin: bool,
     pub uid: String,
     pub disconnect_time: Option<std::time::Instant>,
@@ -102,6 +103,7 @@ impl ClientSession {
             current_channel_id: 1, // Default channel
             audio: ClientAudioState::default(),
             subscribed_channels: BTreeSet::from([1]),
+            known_clients: BTreeSet::new(),
             is_admin: false,
             handshake_phase: HandshakePhase::Init0Received,
             server_secret,

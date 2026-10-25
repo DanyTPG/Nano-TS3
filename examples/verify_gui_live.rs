@@ -503,6 +503,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     let mut left_seen = false;
     while tokio::time::Instant::now() < deadline {
+        let _ = alice.send_command(&Command::new("clientupdate")).await;
         if let Some(left) = alice.recv_until("notifyclientleftview", Duration::from_secs(2)).await {
             if left.get("clid") == Some(eve_clid.to_string().as_str()) {
                 println!("Server broadcast notifyclientleftview for Eve: clid={:?}, reasonid={:?}, msg={:?}",
