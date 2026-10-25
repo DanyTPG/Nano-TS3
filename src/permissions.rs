@@ -6,7 +6,7 @@ static PERMISSION_LIST_WIRE: OnceLock<String> = OnceLock::new();
 pub fn get_client_needed_permissions_wire() -> &'static str {
     concat!(
         "notifyclientneededpermissions ",
-        "permid=137 permvalue=1|permid=233 permvalue=1|permid=178 permvalue=200000|permid=179 permvalue=-1|permid=170 permvalue=75|permid=164 permvalue=75|permid=154 permvalue=1|permid=159 permvalue=1|",
+        "permid=178 permvalue=200000|permid=179 permvalue=-1|permid=170 permvalue=75|permid=164 permvalue=75|permid=154 permvalue=1|permid=159 permvalue=1|",
         "permid=157 permvalue=1|permid=161 permvalue=1|permid=158 permvalue=1|permid=192 permvalue=1|permid=211 permvalue=1|permid=208 permvalue=1|permid=44 permvalue=1|permid=232 permvalue=1|",
         "permid=26 permvalue=1|permid=228 permvalue=1|permid=218 permvalue=1|permid=219 permvalue=1|permid=166 permvalue=75|permid=168 permvalue=75|permid=243 permvalue=75|permid=65 permvalue=1|",
         "permid=63 permvalue=1|permid=57 permvalue=1|permid=58 permvalue=1|permid=59 permvalue=1|permid=66 permvalue=1|permid=60 permvalue=1|permid=70 permvalue=1|permid=52 permvalue=1|",
@@ -20,7 +20,7 @@ pub fn get_client_needed_permissions_wire() -> &'static str {
         "permid=43 permvalue=1|permid=212 permvalue=1|permid=153 permvalue=1|permid=155 permvalue=1|permid=156 permvalue=1|permid=215 permvalue=-1|permid=147 permvalue=1|permid=146 permvalue=8192|",
         "permid=74 permvalue=1|permid=229 permvalue=1|permid=220 permvalue=1|permid=31 permvalue=1|permid=55 permvalue=1|permid=99 permvalue=1|permid=119 permvalue=1|permid=126 permvalue=1|",
         "permid=76 permvalue=1|permid=186 permvalue=1|permid=162 permvalue=1|permid=163 permvalue=1|permid=193 permvalue=1|permid=248 permvalue=-1|permid=247 permvalue=-1|permid=75 permvalue=1|",
-        "permid=173 permvalue=1|permid=172 permvalue=1|permid=214 permvalue=1|permid=213 permvalue=1|permid=77 permvalue=1|permid=187 permvalue=1|permid=188 permvalue=1|permid=138 permvalue=1|",
+        "permid=173 permvalue=1|permid=172 permvalue=1|permid=214 permvalue=1|permid=213 permvalue=1|permid=77 permvalue=1|permid=187 permvalue=1|permid=188 permvalue=1|",
         "permid=79 permvalue=1|permid=106 permvalue=86400|permid=127 permvalue=1|permid=125 permvalue=1|permid=133 permvalue=1|permid=199 permvalue=1|permid=201 permvalue=1|permid=203 permvalue=1",
     )
 }

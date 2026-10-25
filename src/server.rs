@@ -180,7 +180,8 @@ fn parse_channel_edit(cmd: &Command) -> Result<ChannelEdit, String> {
     let supplied_password = cmd.get("channel_password");
     match (password_flag, supplied_password) {
         (Some(false), _) => edit.password = Some(String::new()),
-        (_, Some(password)) if !password.is_empty() => {
+        (_, Some(pw)) if pw.is_empty() => edit.password = Some(String::new()),
+        (_, Some(password)) => {
             edit.password = Some(hash_channel_password(password));
         }
         (Some(true), None) => {
@@ -566,6 +567,9 @@ fn build_connection_info(
     if include_ip {
         cmd.set("connection_client_ip", target_ip);
         cmd.set("connection_client_port", target_port.to_string());
+    } else {
+        cmd.set("connection_client_ip", "");
+        cmd.set("connection_client_port", "0");
     }
 
     cmd
@@ -2211,10 +2215,10 @@ impl Server {
                 // setconnectioninfo, and forwards them back as
                 // notifyconnectioninfo. The IP and port are included for admins
                 // and when checking one's own connection info.
-                let target_clid: Option<u16> = cmd
-                    .get("clid")
-                    .and_then(|v| v.parse().ok())
-                    .map(|id| if id == 0 { clid } else { id });
+                let target_clid: Option<u16> = match cmd.get("clid") {
+                    Some(v) => v.parse().ok().map(|id| if id == 0 { clid } else { id }),
+                    None => Some(clid),
+                };
                 let requester_admin = {
                     let state = self.state.lock().await;
                     state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
@@ -2630,8 +2634,15 @@ impl Server {
                                 .collect()
                         };
                         if let Some(notify) = notify {
-                            for ep in all_peers {
-                                let _ = self.send_encrypted_command(ep, &notify).await;
+                            for ep in &all_peers {
+                                let _ = self.send_encrypted_command(*ep, &notify).await;
+                            }
+                            if channel.as_ref().is_some_and(|ch| !ch.password_hash.is_empty()) {
+                                let mut pw_notify = Command::new("notifychannelpasswordchanged");
+                                pw_notify.set("cid", cid.to_string());
+                                for ep in &all_peers {
+                                    let _ = self.send_encrypted_command(*ep, &pw_notify).await;
+                                }
                             }
                         }
                     }
@@ -2699,9 +2710,18 @@ impl Server {
                                             .map(|client| client.endpoint)
                                             .collect()
                                     };
-                                    for recipient in recipients {
+                                    for recipient in &recipients {
                                         let _ =
-                                            self.send_encrypted_command(recipient, &notify).await;
+                                            self.send_encrypted_command(*recipient, &notify).await;
+                                    }
+                                    if edit.password.is_some() {
+                                        let mut pw_notify = Command::new("notifychannelpasswordchanged");
+                                        pw_notify.set("cid", cid.to_string());
+                                        for recipient in &recipients {
+                                            let _ = self
+                                                .send_encrypted_command(*recipient, &pw_notify)
+                                                .await;
+                                        }
                                     }
                                     err_resp.set("id", "0");
                                     err_resp.set("msg", "ok");

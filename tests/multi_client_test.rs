@@ -1313,7 +1313,8 @@ async fn test_connection_info_admin_only_ip() {
         "admins see the target IP"
     );
 
-    // Guest query for another client (Admin) has no IP but still shows stats.
+    // Guest query for another client (Admin) has blank IP/port (required to prevent
+    // official client disconnect with parameter not found) but still shows stats.
     let mut ask2 = Command::new("getconnectioninfo");
     ask2.set("clid", admin.clid.to_string());
     guest.send_command(&ask2).await;
@@ -1321,9 +1322,15 @@ async fn test_connection_info_admin_only_ip() {
         .recv_until("notifyconnectioninfo", Duration::from_secs(2))
         .await
         .expect("guest receives connection info");
-    assert!(
-        guest_info.get("connection_client_ip").is_none(),
+    assert_eq!(
+        guest_info.get("connection_client_ip"),
+        Some(""),
         "guests must not see other clients' IPs"
+    );
+    assert_eq!(
+        guest_info.get("connection_client_port"),
+        Some("0"),
+        "guests must not see other clients' ports"
     );
 
     // Guest querying itself sees its own IP and port (required by TS3 client).
@@ -1587,6 +1594,174 @@ async fn test_channel_edit_audio_and_limits() {
         .await
         .expect("channeledit response");
     assert_eq!(ok.get("id"), Some("0"));
+
+    server_handle.abort();
+}
+
+/// Tests channel password changes (setting, removing, and broadcast of notifychannelpasswordchanged)
+/// and connection info requests with default clid or non-admin view.
+#[tokio::test]
+async fn test_channel_password_edit_and_connection_info_default_clid() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    // Verify baseline needed permissions do NOT grant password bypass to clients:
+    let needed_wire = nano_ts3::permissions::get_client_needed_permissions_wire();
+    assert!(
+        !needed_wire.contains("permid=137"),
+        "b_channel_join_ignore_password (137) must not be broadcast in needed permissions"
+    );
+    assert!(
+        !needed_wire.contains("permid=138"),
+        "b_channel_join_ignore_maxclients (138) must not be broadcast in needed permissions"
+    );
+    assert!(
+        !needed_wire.contains("permid=233"),
+        "b_ft_ignore_password (233) must not be broadcast in needed permissions"
+    );
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "Admin").await;
+    let mut guest = ClientSession::connect(server_addr, "Guest").await;
+
+    // Redeem admin token
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    let _ = admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await;
+
+    // 1. Admin creates an initially passwordless channel
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "PwTestChannel");
+    admin.send_command(&create).await;
+    let created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let cid = created.get("cid").expect("cid").to_string();
+    assert_eq!(created.get("channel_flag_password"), Some("0"));
+
+    // 2. Admin edits channel to set a password
+    let mut edit_pw = Command::new("channeledit");
+    edit_pw.set("cid", &cid);
+    edit_pw.set("channel_password", "mysecret");
+    admin.send_command(&edit_pw).await;
+
+    // Admin receives notifychanneledited and notifychannelpasswordchanged
+    let admin_edited = admin
+        .recv_until("notifychanneledited", Duration::from_secs(2))
+        .await
+        .expect("admin receives notifychanneledited");
+    assert_eq!(admin_edited.get("channel_flag_password"), Some("1"));
+    let admin_pw_changed = admin
+        .recv_until("notifychannelpasswordchanged", Duration::from_secs(2))
+        .await
+        .expect("admin receives notifychannelpasswordchanged");
+    assert_eq!(admin_pw_changed.get("cid"), Some(cid.as_str()));
+
+    // Guest also receives notifychanneledited and notifychannelpasswordchanged
+    let guest_edited = guest
+        .recv_until("notifychanneledited", Duration::from_secs(2))
+        .await
+        .expect("guest receives notifychanneledited");
+    assert_eq!(guest_edited.get("channel_flag_password"), Some("1"));
+    let guest_pw_changed = guest
+        .recv_until("notifychannelpasswordchanged", Duration::from_secs(2))
+        .await
+        .expect("guest receives notifychannelpasswordchanged");
+    assert_eq!(guest_pw_changed.get("cid"), Some(cid.as_str()));
+
+    // 3. Guest tries to join without password -> error 781
+    let mut guest_join_no_pw = Command::new("clientmove");
+    guest_join_no_pw.set("cid", &cid);
+    guest_join_no_pw.set("cpw", "");
+    guest_join_no_pw.set("clid", "0");
+    guest.send_command(&guest_join_no_pw).await;
+    let err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("guest join rejected");
+    assert_eq!(err.get("id"), Some("781"));
+
+    // 4. Guest joins with correct password -> succeeds
+    let mut guest_join_pw = Command::new("clientmove");
+    guest_join_pw.set("cid", &cid);
+    guest_join_pw.set("cpw", "mysecret");
+    guest_join_pw.set("clid", "0");
+    guest.send_command(&guest_join_pw).await;
+    let moved = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("guest moved");
+    assert_eq!(moved.get("ctid"), Some(cid.as_str()));
+
+    // 5. Admin edits channel to clear the password (empty channel_password, no flag)
+    let mut clear_pw = Command::new("channeledit");
+    clear_pw.set("cid", &cid);
+    clear_pw.set("channel_password", "");
+    admin.send_command(&clear_pw).await;
+
+    // Both clients receive notifychanneledited with flag=0 and notifychannelpasswordchanged
+    let admin_cleared = admin
+        .recv_until("notifychanneledited", Duration::from_secs(2))
+        .await
+        .expect("admin receives clear notifychanneledited");
+    assert_eq!(admin_cleared.get("channel_flag_password"), Some("0"));
+    let admin_pw_cleared = admin
+        .recv_until("notifychannelpasswordchanged", Duration::from_secs(2))
+        .await
+        .expect("admin receives notifychannelpasswordchanged on clear");
+    assert_eq!(admin_pw_cleared.get("cid"), Some(cid.as_str()));
+
+    let guest_cleared = guest
+        .recv_until("notifychanneledited", Duration::from_secs(2))
+        .await
+        .expect("guest receives clear notifychanneledited");
+    assert_eq!(guest_cleared.get("channel_flag_password"), Some("0"));
+    let guest_pw_cleared = guest
+        .recv_until("notifychannelpasswordchanged", Duration::from_secs(2))
+        .await
+        .expect("guest receives notifychannelpasswordchanged on clear");
+    assert_eq!(guest_pw_cleared.get("cid"), Some(cid.as_str()));
+
+    // 6. Guest moves back to default channel, then joins PwTestChannel without password
+    let mut move_back = Command::new("clientmove");
+    move_back.set("cid", "1");
+    guest.send_command(&move_back).await;
+    let _ = guest.recv_until("notifyclientmoved", Duration::from_secs(2)).await;
+
+    let mut move_again = Command::new("clientmove");
+    move_again.set("cid", &cid);
+    move_again.set("clid", "0");
+    guest.send_command(&move_again).await;
+    let moved_again = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("guest moved into cleared channel without password");
+    assert_eq!(moved_again.get("ctid"), Some(cid.as_str()));
+
+    // 7. Test getconnectioninfo without clid parameter (defaults to self)
+    let info_no_clid = Command::new("getconnectioninfo");
+    guest.send_command(&info_no_clid).await;
+    let self_info = guest
+        .recv_until("notifyconnectioninfo", Duration::from_secs(2))
+        .await
+        .expect("guest receives connection info for self when clid is omitted");
+    assert_eq!(self_info.get("clid"), Some(guest.clid.to_string().as_str()));
+    assert!(self_info.get("connection_client_ip").is_some());
+    assert!(self_info.get("connection_client_port").is_some());
 
     server_handle.abort();
 }
