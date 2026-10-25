@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     decrypt_eax(BOOTSTRAP_KEY, BOOTSTRAP_NONCE, &raw[8..11], &mac, &mut ct)?;
     let expand_cmd = Command::parse(std::str::from_utf8(&ct)?).unwrap();
 
-    let server_omega_b64 = expand_cmd.get("omega").unwrap();
+    let _server_omega_b64 = expand_cmd.get("omega").unwrap();
     let server_beta_b64 = expand_cmd.get("beta").unwrap();
     let server_beta = BASE64_STANDARD.decode(server_beta_b64)?;
 

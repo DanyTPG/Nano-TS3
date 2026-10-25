@@ -45,6 +45,7 @@ unsafe extern "system" {
 
 #[cfg(windows)]
 const PROCESS_VM_READ: u32 = 0x0010;
+#[cfg(windows)]
 const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 
 #[cfg(windows)]

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use tsproto_packets::packets::{Direction, Flags, PacketType};
+use tsproto_packets::packets::{Direction, PacketType};
 
 use nano_ts3::crypto::*;
 
