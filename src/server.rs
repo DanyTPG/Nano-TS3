@@ -2043,11 +2043,12 @@ impl Server {
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
-            "setconnectioninfo" => {
-                // A client publishing its own connection statistics (in
-                // response to notifyconnectioninforequest). Store them and
-                // forward to everyone currently watching this client's
-                // connection info.
+            "setconnectioninfo" | "connectioninfoautoupdate" => {
+                // A client publishing its own connection statistics. The
+                // official 3.6.2 client sends `connectioninfoautoupdate`
+                // periodically (and after a connection-info request); both
+                // names are accepted. Store them and forward to everyone
+                // currently watching this client's connection info.
                 let stats: std::collections::BTreeMap<String, String> = cmd
                     .params
                     .iter()
