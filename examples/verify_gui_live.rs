@@ -418,20 +418,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(notify_move.get("ctid"), Some(created_cid.to_string().as_str()));
     let _ = alice.recv_until("error", Duration::from_secs(2)).await;
 
-    // Step 5: Connection Info (Admin gets IP, Guest does not)
-    println!("\n--- Step 5: Connection Info (IP visibility) ---");
+    // Step 5: Connection Info (IP visibility & Self-Query completeness)
+    println!("\n--- Step 5: Connection Info (IP visibility & completeness) ---");
     let mut get_info = Command::new("getconnectioninfo");
     get_info.set("clid", gui_clid.to_string());
     alice.send_command(&get_info).await;
     if let Some(info) = alice.recv_until("notifyconnectioninfo", Duration::from_secs(2)).await {
-        println!("Alice (Admin) connection info response: has_ip={}, ip={:?}", info.get("connection_client_ip").is_some(), info.get("connection_client_ip"));
+        println!("Alice (Admin) querying GUI Admin info: has_ip={}, ip={:?}", info.get("connection_client_ip").is_some(), info.get("connection_client_ip"));
         assert!(info.get("connection_client_ip").is_some(), "Admin must see client IP");
+        assert!(info.get("connection_client_port").is_some(), "Admin must see client port");
     }
 
     bob.send_command(&get_info).await;
     if let Some(info) = bob.recv_until("notifyconnectioninfo", Duration::from_secs(2)).await {
-        println!("Bob (Guest) connection info response: has_ip={}", info.get("connection_client_ip").is_some());
-        assert!(info.get("connection_client_ip").is_none(), "Guest must NOT see client IP");
+        println!("Bob (Guest) querying GUI Admin info: has_ip={}", info.get("connection_client_ip").is_some());
+        assert!(info.get("connection_client_ip").is_none(), "Guest must NOT see other client IP");
+    }
+
+    // 5c. Bob querying his OWN connection info (the official TS3 client trigger)
+    let mut get_self_info = Command::new("getconnectioninfo");
+    get_self_info.set("clid", "0");
+    bob.send_command(&get_self_info).await;
+    let mut self_info = None;
+    while let Some(info) = bob.recv_until("notifyconnectioninfo", Duration::from_secs(2)).await {
+        println!("Received notifyconnectioninfo: clid={:?}, raw={}", info.get("clid"), info.raw);
+        if info.get("clid") == Some(bob.clid.to_string().as_str()) {
+            self_info = Some(info);
+            break;
+        }
+    }
+    if let Some(info) = self_info {
+        println!("Bob (Guest) querying own info with clid=0: has_ip={}, has_port={}, has_idle={}",
+            info.get("connection_client_ip").is_some(),
+            info.get("connection_client_port").is_some(),
+            info.get("connection_idle_time").is_some(),
+        );
+        assert!(info.get("connection_client_ip").is_some(), "Clients must receive own IP for Connection Info dialog");
+        assert!(info.get("connection_client_port").is_some(), "Clients must receive own port for Connection Info dialog");
+        assert!(info.get("connection_client2server_packetloss_speech").is_some(), "Mandatory packetloss speech field must be present");
+        assert!(info.get("connection_client2server_packetloss_total").is_some(), "Mandatory packetloss total field must be present");
+        assert!(info.get("connection_idle_time").is_some(), "Mandatory idle time must be present");
     }
 
     // Step 6: Channel Settings, Password Gate & Max Clients
@@ -450,10 +476,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Charlie connects as Guest
     let mut charlie = ClientSession::connect(server_addr, "CharlieGuest", false).await;
-    // Charlie tries to join TestingRoom with wrong password
+    // Charlie double clicks password channel in GUI (sends cpw empty, clid=0)
+    let mut join_empty_pw = Command::new("clientmove");
+    join_empty_pw.set("cid", created_cid.to_string());
+    join_empty_pw.set("cpw", "");
+    join_empty_pw.set("clid", "0");
+    charlie.send_command(&join_empty_pw).await;
+    let err_empty_pw = charlie.recv_until("error", Duration::from_secs(2)).await.expect("empty pw error");
+    println!("Double-click on password channel without password rejected: id={:?}", err_empty_pw.get("id"));
+    assert_eq!(err_empty_pw.get("id"), Some("781"));
+
+    // Charlie tries to join TestingRoom with wrong password and clid=0
     let mut join_bad = Command::new("clientmove");
     join_bad.set("cid", created_cid.to_string());
     join_bad.set("cpw", "wrongpass");
+    join_bad.set("clid", "0");
     charlie.send_command(&join_bad).await;
     let err_pw = charlie.recv_until("error", Duration::from_secs(2)).await.expect("pw error");
     println!("Join with wrong password rejected: id={:?}", err_pw.get("id"));
@@ -466,10 +503,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     alice.send_command(&move_bob_back).await;
     let _ = alice.recv_until("notifyclientmoved", Duration::from_secs(2)).await;
 
-    // Charlie joins with correct password
+    // Charlie submits valid password from dialog with clid=0
     let mut join_ok = Command::new("clientmove");
     join_ok.set("cid", created_cid.to_string());
     join_ok.set("cpw", "secretpass");
+    join_ok.set("clid", "0");
     charlie.send_command(&join_ok).await;
     let mut charlie_moved = None;
     while let Some(mv) = charlie.recv_until("notifyclientmoved", Duration::from_secs(2)).await {
@@ -479,8 +517,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let charlie_moved = charlie_moved.expect("charlie moved");
-    println!("Charlie joined with correct password: cid={:?}", charlie_moved.get("ctid"));
+    println!("Charlie joined with correct password (clid=0): cid={:?}", charlie_moved.get("ctid"));
     assert_eq!(charlie_moved.get("ctid"), Some(created_cid.to_string().as_str()));
+
+    // Charlie moves back to passwordless default channel using clid=0
+    let mut join_default = Command::new("clientmove");
+    join_default.set("cid", "1");
+    join_default.set("cpw", "");
+    join_default.set("clid", "0");
+    charlie.send_command(&join_default).await;
+    let mut charlie_back = None;
+    while let Some(mv) = charlie.recv_until("notifyclientmoved", Duration::from_secs(2)).await {
+        if mv.get("clid") == Some(charlie.clid.to_string().as_str()) {
+            charlie_back = Some(mv);
+            break;
+        }
+    }
+    let charlie_back = charlie_back.expect("charlie back to default");
+    println!("Charlie moved back to passwordless default channel (clid=0): cid={:?}", charlie_back.get("ctid"));
+    assert_eq!(charlie_back.get("ctid"), Some("1"));
+
+    // Move Charlie back into TestingRoom so it is full (occupants=1, maxclients=1)
+    charlie.send_command(&join_ok).await;
+    let _ = charlie.recv_until("notifyclientmoved", Duration::from_secs(2)).await;
 
     // Dave tries to join TestingRoom (occupants=1, maxclients=1)
     let mut dave = ClientSession::connect(server_addr, "DaveGuest", false).await;

@@ -45,6 +45,7 @@ pub struct ClientSession {
     pub is_admin: bool,
     pub uid: String,
     pub disconnect_time: Option<std::time::Instant>,
+    pub connected_time: std::time::Instant,
 
     // Handshake & Cryptography state
     pub handshake_phase: HandshakePhase,
@@ -126,6 +127,7 @@ impl ClientSession {
             last_c2s_voice_pid: None,
             s2c_voice_generation: 0,
             connection_stats: std::collections::BTreeMap::new(),
+            connected_time: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),
         }
     }

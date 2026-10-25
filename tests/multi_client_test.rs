@@ -1313,18 +1313,30 @@ async fn test_connection_info_admin_only_ip() {
         "admins see the target IP"
     );
 
-    // Guest query has no IP but still shows stats.
+    // Guest query for another client (Admin) has no IP but still shows stats.
     let mut ask2 = Command::new("getconnectioninfo");
-    ask2.set("clid", guest.clid.to_string());
+    ask2.set("clid", admin.clid.to_string());
     guest.send_command(&ask2).await;
     let guest_info = guest
         .recv_until("notifyconnectioninfo", Duration::from_secs(2))
         .await
         .expect("guest receives connection info");
-    assert_eq!(guest_info.get("connection_ping"), Some("12"));
     assert!(
         guest_info.get("connection_client_ip").is_none(),
         "guests must not see other clients' IPs"
+    );
+
+    // Guest querying itself sees its own IP and port (required by TS3 client).
+    let mut ask_self = Command::new("getconnectioninfo");
+    ask_self.set("clid", guest.clid.to_string());
+    guest.send_command(&ask_self).await;
+    let self_info = guest
+        .recv_until("notifyconnectioninfo", Duration::from_secs(2))
+        .await
+        .expect("guest receives own connection info");
+    assert!(
+        self_info.get("connection_client_ip").is_some(),
+        "clients can see their own IP"
     );
 
     server_handle.abort();
@@ -1406,6 +1418,45 @@ async fn test_channel_password_gate() {
         .await
         .expect("correct password joins the channel");
     assert_eq!(moved.get("ctid"), Some(cid.as_str()));
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+
+    // The official TS3 GUI client sends `clid=0` when double-clicking a channel.
+    // Moving back to passwordless channel with `clid=0`:
+    let mut move_default = Command::new("clientmove");
+    move_default.set("cid", "1");
+    move_default.set("cpw", "");
+    move_default.set("clid", "0");
+    guest.send_command(&move_default).await;
+    let moved_back = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("move back to default channel with clid=0 succeeds");
+    assert_eq!(moved_back.get("ctid"), Some("1"));
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+
+    // Official TS3 GUI double-click on password channel sends `cpw` empty with `clid=0`:
+    let mut gui_double_click = Command::new("clientmove");
+    gui_double_click.set("cid", &cid);
+    gui_double_click.set("cpw", "");
+    gui_double_click.set("clid", "0");
+    guest.send_command(&gui_double_click).await;
+    let err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("empty password on locked channel with clid=0 returns 781");
+    assert_eq!(err.get("id"), Some("781"));
+
+    // Official TS3 GUI dialog submit sends `cpw=password` with `clid=0`:
+    let mut gui_submit_pw = Command::new("clientmove");
+    gui_submit_pw.set("cid", &cid);
+    gui_submit_pw.set("cpw", "open sesame");
+    gui_submit_pw.set("clid", "0");
+    guest.send_command(&gui_submit_pw).await;
+    let moved_again = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("valid password with clid=0 succeeds");
+    assert_eq!(moved_again.get("ctid"), Some(cid.as_str()));
 
     server_handle.abort();
 }

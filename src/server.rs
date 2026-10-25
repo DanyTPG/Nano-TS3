@@ -453,17 +453,27 @@ fn try_assemble_next(
 /// dialog. Missing stats are filled with neutral defaults so the client's
 /// mandatory-field parser never rejects the command; `connection_client_ip`
 /// is only included when the requesting user is an admin.
+/// Builds a `notifyconnectioninfo` snapshot. Reverse engineered from the
+/// official TS3 client handler at 0x102af00 (ff9b30, ff9dc0, fab810): the
+/// client strictly asserts the presence of all packet loss fields, idle
+/// time, server/client address and port. Missing parameters make the client
+/// abort with "parameter not found" and disconnect immediately.
+/// Remote IP and port are provided when `include_ip` is true (e.g. Server
+/// Admin or checking one's own connection info).
 fn build_connection_info(
     target_clid: u16,
     stats: &std::collections::BTreeMap<String, String>,
     target_ip: &str,
+    target_port: u16,
+    connected_time_secs: u64,
+    idle_time_ms: u64,
     include_ip: bool,
 ) -> Command {
     let mut cmd = Command::new("notifyconnectioninfo");
     cmd.set("clid", target_clid.to_string());
+
+    // Integer metrics
     for name in [
-        "connection_ping",
-        "connection_ping_deviation",
         "connection_packets_sent_speech",
         "connection_packets_sent_keepalive",
         "connection_packets_sent_control",
@@ -480,10 +490,6 @@ fn build_connection_info(
         "connection_bytes_received_keepalive",
         "connection_bytes_received_control",
         "connection_bytes_received_total",
-        "connection_packetloss_speech",
-        "connection_packetloss_keepalive",
-        "connection_packetloss_control",
-        "connection_packetloss_total",
         "connection_bandwidth_sent_last_second_speech",
         "connection_bandwidth_sent_last_second_keepalive",
         "connection_bandwidth_sent_last_second_control",
@@ -504,22 +510,64 @@ fn build_connection_info(
         "connection_filetransfer_bandwidth_received",
         "connection_filetransfer_bytes_sent_total",
         "connection_filetransfer_bytes_received_total",
-        "connection_connected_time",
-        "connection_server_ip",
-        "connection_server_port",
     ] {
-        match stats.get(name) {
-            Some(value) => {
-                cmd.set(name, value);
-            }
-            None => {
-                cmd.set(name, "0");
-            }
-        }
+        cmd.set(name, stats.get(name).map(|s| s.as_str()).unwrap_or("0"));
     }
+
+    // Floating-point metrics and packet loss
+    for name in [
+        "connection_ping",
+        "connection_ping_deviation",
+        "connection_packetloss_speech",
+        "connection_packetloss_keepalive",
+        "connection_packetloss_control",
+        "connection_packetloss_total",
+        "connection_server2client_packetloss_speech",
+        "connection_server2client_packetloss_keepalive",
+        "connection_server2client_packetloss_control",
+        "connection_server2client_packetloss_total",
+        "connection_client2server_packetloss_speech",
+        "connection_client2server_packetloss_keepalive",
+        "connection_client2server_packetloss_control",
+        "connection_client2server_packetloss_total",
+    ] {
+        cmd.set(name, stats.get(name).map(|s| s.as_str()).unwrap_or("0.0000"));
+    }
+
+    cmd.set(
+        "connection_server_ip",
+        stats
+            .get("connection_server_ip")
+            .map(|s| s.as_str())
+            .unwrap_or("127.0.0.1"),
+    );
+    cmd.set(
+        "connection_server_port",
+        stats
+            .get("connection_server_port")
+            .map(|s| s.as_str())
+            .unwrap_or("9988"),
+    );
+    cmd.set(
+        "connection_connected_time",
+        stats
+            .get("connection_connected_time")
+            .cloned()
+            .unwrap_or_else(|| connected_time_secs.to_string()),
+    );
+    cmd.set(
+        "connection_idle_time",
+        stats
+            .get("connection_idle_time")
+            .cloned()
+            .unwrap_or_else(|| idle_time_ms.to_string()),
+    );
+
     if include_ip {
         cmd.set("connection_client_ip", target_ip);
+        cmd.set("connection_client_port", target_port.to_string());
     }
+
     cmd
 }
 
@@ -1977,6 +2025,7 @@ impl Server {
                         value
                             .split('|')
                             .filter_map(|part| part.parse::<u16>().ok())
+                            .map(|id| if id == 0 { clid } else { id })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -2017,13 +2066,20 @@ impl Server {
 
                     // Joining a password-protected channel requires the right
                     // `cpw` for self-moves. Admin-driven moves bypass it, like
-                    // the official server's i_client_move_power.
-                    if channel_password.is_empty()
-                        || sender_admin
-                        || cmd
-                            .get("cpw")
+                    // the official server's i_client_move_power and
+                    // b_channel_join_ignore_password.
+                    let is_password_ok = if channel_password.is_empty() {
+                        true
+                    } else if sender_admin {
+                        true
+                    } else {
+                        cmd.get("cpw")
+                            .filter(|pw| !pw.is_empty())
                             .map(|pw| hash_channel_password(pw) == channel_password)
                             .unwrap_or(false)
+                    };
+
+                    if is_password_ok
                     {
                         let (occupants, already_there) = {
                             let state = self.state.lock().await;
@@ -2098,11 +2154,22 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "clientgetvariables" => {
-                let (nickname, _uid, admin) = {
+                let target_clid: u16 = cmd
+                    .get("clid")
+                    .and_then(|v| v.parse().ok())
+                    .map(|id| if id == 0 { clid } else { id })
+                    .unwrap_or(clid);
+                let (nickname, is_admin, connected_secs) = {
                     let state = self.state.lock().await;
-                    match state.get_client(&peer) {
-                        Some(c) => (c.nickname.clone(), c.uid.clone(), c.is_admin),
-                        None => ("User".to_string(), String::new(), false),
+                    match state.clients.values().find(|c| {
+                        c.clid == target_clid && c.handshake_phase == HandshakePhase::Connected
+                    }) {
+                        Some(c) => (
+                            c.nickname.clone(),
+                            c.is_admin,
+                            c.connected_time.elapsed().as_secs(),
+                        ),
+                        None => ("User".to_string(), false, 0),
                     }
                 };
                 let now = std::time::SystemTime::now()
@@ -2111,19 +2178,22 @@ impl Server {
                     .as_secs();
 
                 let mut upd = Command::new("notifyclientupdated");
-                upd.set("clid", clid.to_string());
+                upd.set("clid", target_clid.to_string());
                 let _ = &nickname; // clientgetvariables must not rename
                 upd.set("client_version", "3.6.2 [Build: 1695203293]");
-                upd.set("client_platform", "Windows");
+                upd.set("client_platform", "Linux");
                 upd.set("client_login_name", "");
                 upd.set("client_created", "1600000000");
-                upd.set("client_lastconnected", now.to_string());
+                upd.set(
+                    "client_lastconnected",
+                    (now.saturating_sub(connected_secs)).to_string(),
+                );
                 upd.set("client_totalconnections", "1");
                 upd.set("client_month_bytes_uploaded", "0");
                 upd.set("client_month_bytes_downloaded", "0");
                 upd.set("client_total_bytes_uploaded", "0");
                 upd.set("client_total_bytes_downloaded", "0");
-                upd.set("client_servergroups", if admin { "6" } else { "8" });
+                upd.set("client_servergroups", if is_admin { "6" } else { "8" });
                 self.send_encrypted_command(peer, &upd).await?;
 
                 let mut err_resp = Command::new("error");
@@ -2139,8 +2209,12 @@ impl Server {
                 // asks for another client's stats, the server asks the target
                 // (notifyconnectioninforequest) to publish fresh ones with
                 // setconnectioninfo, and forwards them back as
-                // notifyconnectioninfo. The IP is only included for admins.
-                let target_clid: Option<u16> = cmd.get("clid").and_then(|v| v.parse().ok());
+                // notifyconnectioninfo. The IP and port are included for admins
+                // and when checking one's own connection info.
+                let target_clid: Option<u16> = cmd
+                    .get("clid")
+                    .and_then(|v| v.parse().ok())
+                    .map(|id| if id == 0 { clid } else { id });
                 let requester_admin = {
                     let state = self.state.lock().await;
                     state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
@@ -2162,6 +2236,9 @@ impl Server {
                                         c.endpoint,
                                         c.connection_stats.clone(),
                                         c.endpoint.ip().to_string(),
+                                        c.endpoint.port(),
+                                        c.connected_time.elapsed().as_secs(),
+                                        c.last_activity.elapsed().as_millis() as u64,
                                     )
                                 });
                             if target.is_some() {
@@ -2175,7 +2252,14 @@ impl Server {
                         };
 
                         match target_data {
-                            Some((target_ep, stats, target_ip)) => {
+                            Some((
+                                target_ep,
+                                stats,
+                                target_ip,
+                                target_port,
+                                connected_time,
+                                idle_time,
+                            )) => {
                                 // Ask the target for a fresh report. The
                                 // official client answers with
                                 // `setconnectioninfo` while the dialog is open.
@@ -2183,11 +2267,15 @@ impl Server {
                                     .send_encrypted_raw(target_ep, "notifyconnectioninforequest")
                                     .await;
 
+                                let is_self = target_clid == clid;
                                 let notify = build_connection_info(
                                     target_clid,
                                     &stats,
                                     &target_ip,
-                                    requester_admin,
+                                    target_port,
+                                    connected_time,
+                                    idle_time,
+                                    requester_admin || is_self,
                                 );
                                 self.send_encrypted_command(peer, &notify).await?;
                             }
@@ -2237,19 +2325,29 @@ impl Server {
                     .collect();
                 let has_stats = !stats.is_empty();
 
-                let recipients: Vec<(SocketAddr, bool)> = {
+                let (target_ip, target_port, connected_time, idle_time, recipients) = {
                     let mut state = self.state.lock().await;
                     if has_stats {
                         if let Some(c) = state.get_client_mut(&peer) {
                             c.connection_stats = stats.clone();
                         }
                     }
+                    let (target_ip, target_port, connected_time, idle_time) = state
+                        .get_client(&peer)
+                        .map(|c| (
+                            c.endpoint.ip().to_string(),
+                            c.endpoint.port(),
+                            c.connected_time.elapsed().as_secs(),
+                            c.last_activity.elapsed().as_millis() as u64,
+                        ))
+                        .unwrap_or_else(|| ("127.0.0.1".to_string(), 0, 0, 0));
+
                     let watchers = state
                         .connection_watchers
                         .get(&clid)
                         .cloned()
                         .unwrap_or_default();
-                    watchers
+                    let recps: Vec<(SocketAddr, bool)> = watchers
                         .into_iter()
                         .filter_map(|ep| {
                             state
@@ -2258,14 +2356,22 @@ impl Server {
                                 .filter(|c| c.handshake_phase == HandshakePhase::Connected)
                                 .map(|c| (ep, c.is_admin))
                         })
-                        .collect()
+                        .collect();
+                    (target_ip, target_port, connected_time, idle_time, recps)
                 };
 
                 if has_stats {
-                    let target_ip = peer.ip().to_string();
-                    for (ep, admin) in recipients {
-                        let notify =
-                            build_connection_info(clid, &stats, &target_ip, admin);
+                    for (ep, is_admin) in recipients {
+                        let is_self = ep == peer;
+                        let notify = build_connection_info(
+                            clid,
+                            &stats,
+                            &target_ip,
+                            target_port,
+                            connected_time,
+                            idle_time,
+                            is_admin || is_self,
+                        );
                         let _ = self.send_encrypted_command(ep, &notify).await;
                     }
                 }
