@@ -1721,7 +1721,7 @@ impl Server {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let endpoints: Vec<SocketAddr> = {
+                    let target_clients: Vec<(u16, SocketAddr)> = {
                         let state = self.state.lock().await;
                         targets
                             .iter()
@@ -1733,18 +1733,25 @@ impl Server {
                                         c.clid == *target
                                             && c.handshake_phase == HandshakePhase::Connected
                                     })
-                                    .map(|c| c.endpoint)
+                                    .map(|c| (*target, c.endpoint))
                             })
-                            .chain(std::iter::once(peer))
                             .collect()
                     };
-                    if endpoints.len() <= 1 {
+                    if target_clients.is_empty() {
                         err_resp.set("id", "512");
                         err_resp.set("msg", "invalid clientID");
                     } else {
-                        for ep in endpoints {
-                            let _ = self.send_encrypted_command(ep, &notify).await;
+                        for (target_clid, ep) in &target_clients {
+                            let mut target_notify = notify.clone();
+                            target_notify.set("target", target_clid.to_string());
+                            let _ = self.send_encrypted_command(*ep, &target_notify).await;
                         }
+                        // Sender echo
+                        let mut echo_notify = notify.clone();
+                        let target_str = cmd.get("target").unwrap_or("");
+                        echo_notify.set("target", target_str);
+                        let _ = self.send_encrypted_command(peer, &echo_notify).await;
+
                         err_resp.set("id", "0");
                         err_resp.set("msg", "ok");
                     }

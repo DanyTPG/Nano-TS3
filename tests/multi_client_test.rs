@@ -1150,6 +1150,7 @@ async fn test_text_message_targeting_and_invokeruid() {
         .expect("sender receives the private message echo");
     assert_eq!(dm_echo.get("msg"), Some("secret"));
     assert_eq!(dm_echo.get("targetmode"), Some("1"));
+    assert_eq!(dm_echo.get("target"), Some(bob.clid.to_string().as_str()));
 
     let dm_target = bob
         .recv_until("notifytextmessage", Duration::from_secs(2))
@@ -1157,6 +1158,7 @@ async fn test_text_message_targeting_and_invokeruid() {
         .expect("target receives the private message");
     assert_eq!(dm_target.get("msg"), Some("secret"));
     assert_eq!(dm_target.get("invokerid"), Some(alice.clid.to_string().as_str()));
+    assert_eq!(dm_target.get("target"), Some(bob.clid.to_string().as_str()));
 
     let _ = alice.recv_until("error", Duration::from_secs(2)).await; // DM ack
 

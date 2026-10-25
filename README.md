@@ -19,8 +19,16 @@ redemption.
 | Multiple official clients in one channel, nickname de-duplication | Working (three simultaneous clients were visible to each other) |
 | Server group / channel group names and admin icon | Working (`Server Admin`, `Channel Admin`) |
 | Privilege key redemption from the official client popup | Working; the identity is persisted and recognized as Server Admin on reconnect |
-| Text chat (`sendtextmessage` / `notifytextmessage`) | Working |
-| In-channel voice relay (Opus, unencrypted) | Payloads relay without codec encryption; live audio verification is pending |
+| Text chat (`sendtextmessage` / `notifytextmessage`) | Working; channel, server, and private routing with mandatory `invokeruid` and `target` |
+| Admin client move (`clientmove clid=... cid=...`) | Working; moves target client, preserves admin; guest moving other clients rejected with error 2568 (`failed_permid=43`) |
+| Channel creation permissions | Working; guest creation rejected with error 2568 (`failed_permid` 89/90/91); admin allowed |
+| Server-side keepalive and idle timeout | Working; 5s keepalive sweep pings clients, drops silent sessions after 30s with `notifyclientleftview reasonid=3 connection lost` |
+| Connection info & stats publication | Working; `getconnectioninfo` / `notifyconnectioninforequest` / `setconnectioninfo` / `connectioninfoautoupdate` flow; `connection_client_ip` restricted to admins |
+| Channel passwords & authentication gate | Working; SHA-256 hashed, `cpw` enforced on self-join (wrong/missing -> 781), admin bypass, key icon displayed in UI |
+| Channel client limits | Working; `channel_maxclients` and `channel_flag_maxclients_unlimited` enforced on join and move (channel full -> 777) |
+| Voice encryption per-channel toggle | Working; `virtualserver_codec_encryption_mode=0`, per-channel toggle persisted, EAX decrypt c2s and re-encrypt per receiver s2c tracking PID wraps |
+| Opus codec quality & restrictions | Working; relay is codec-agnostic, quality range 0–10 validated |
+| In-channel voice relay (Opus, unencrypted & encrypted) | Payloads relay with per-client EAX re-encryption or plaintext relay |
 | `channelcreate` protocol handler (new `cid`, broadcast, duplicate rejection) | Working (covered by integration tests) |
 | `channeledit` / `channeldelete` (incl. the client's Delete Channel dialog) | Working with TS3 3.6.2; deletion broadcasts `notifychanneldeleted` and persists |
 | Channel creation from the official client's context menu | Working; sort-order fix implemented |
@@ -33,18 +41,18 @@ redemption.
 
 ### Known limitation
 
-Channel order is stored as a predecessor link. Create and edit operations now
-apply the requested predecessor and repair the following links; delete repairs
-the remaining chain. Channel edits persist the name, topic, description, codec,
-quality, ordering, and supported limits and flags. Forced deletion moves clients
-to the default channel. The current channel model is flat, so subchannels and
-channel passwords are not supported. Details are in
+Channel order is stored as a predecessor link. Create and edit operations apply
+the requested predecessor and repair the following links; delete repairs the
+remaining chain. Channel edits persist the name, topic, description, codec,
+quality, password hash, max clients, and encryption flags. Forced deletion moves
+clients to the default channel. The current channel model is flat, so subchannels
+are not yet supported. Details are in
 [docs/PROTOCOL_NOTES.md](docs/PROTOCOL_NOTES.md#channel-edits-and-deletes).
 
-Voice whisper routing is not implemented. In-channel voice is relayed as raw
-Opus frames, so nano-ts3 advertises codec encryption as forced off; encrypted
-voice channels are unsupported. The relay has a separate S2C voice packet
-sequence. Live audio verification is pending.
+Voice whisper routing is not implemented. In-channel voice is relayed with EAX
+decryption and per-receiver re-encryption (or plaintext passthrough depending on
+channel codec configuration). The relay tracks 16-bit packet id wraps across EAX
+generations.
 
 ---
 
