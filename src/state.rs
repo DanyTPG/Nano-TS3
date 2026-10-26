@@ -44,6 +44,8 @@ pub struct ClientSession {
     pub known_clients: BTreeSet<u16>,
     pub is_admin: bool,
     pub uid: String,
+    pub away: bool,
+    pub away_message: String,
     pub disconnect_time: Option<std::time::Instant>,
     pub connected_time: std::time::Instant,
 
@@ -106,6 +108,8 @@ impl ClientSession {
             subscribed_channels: BTreeSet::from([1]),
             known_clients: BTreeSet::new(),
             is_admin: false,
+            away: false,
+            away_message: String::new(),
             handshake_phase: HandshakePhase::Init0Received,
             server_secret,
             r0_reversed: [0u8; 4],

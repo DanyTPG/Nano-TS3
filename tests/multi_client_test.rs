@@ -25,6 +25,7 @@ struct ClientSession {
     pub uid: String,
     pub ask_for_privilege_key: bool,
     pub server_groups: String,
+    pub current_channel_id: u64,
     pub initserver_clientsonline: usize,
     pub initserver_channelsonline: usize,
     pub initserver_maxclients: usize,
@@ -46,6 +47,17 @@ impl ClientSession {
         server_addr: SocketAddr,
         nickname: &str,
         secret: Option<&SecretKey>,
+    ) -> Self {
+        Self::connect_with_options(server_addr, nickname, secret, None, None, None).await
+    }
+
+    async fn connect_with_options(
+        server_addr: SocketAddr,
+        nickname: &str,
+        secret: Option<&SecretKey>,
+        password: Option<&str>,
+        default_channel: Option<&str>,
+        default_channel_password: Option<&str>,
     ) -> Self {
         let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind failed");
         sock.connect(server_addr).await.expect("connect failed");
@@ -198,6 +210,15 @@ impl ClientSession {
         // clientinit (PID 2)
         let mut clientinit_cmd = Command::new("clientinit");
         clientinit_cmd.set("client_nickname", nickname);
+        if let Some(pw) = password {
+            clientinit_cmd.set("client_server_password", pw);
+        }
+        if let Some(dc) = default_channel {
+            clientinit_cmd.set("client_default_channel", dc);
+        }
+        if let Some(dcpw) = default_channel_password {
+            clientinit_cmd.set("client_default_channel_password", dcpw);
+        }
         let mut payload = clientinit_cmd.build().into_bytes();
 
         let p_id = 2u16;
@@ -229,6 +250,7 @@ impl ClientSession {
             uid: String::new(),
             ask_for_privilege_key: false,
             server_groups: String::new(),
+            current_channel_id: 1,
             initserver_clientsonline: 0,
             initserver_channelsonline: 0,
             initserver_maxclients: 0,
@@ -269,6 +291,9 @@ impl ClientSession {
                 }
                 if let Some(groups) = cmd.get("client_servergroups") {
                     session.server_groups = groups.to_string();
+                }
+                if let Some(cid) = cmd.get("ctid").and_then(|s| s.parse().ok()) {
+                    session.current_channel_id = cid;
                 }
             }
             if cmd.name == "error" {
@@ -2643,6 +2668,46 @@ async fn test_dynamic_group_management_wire() {
     admin.send_command(&del_cpy_cg).await;
     let _ = admin.recv_until("error", Duration::from_secs(2)).await;
 
+    // 9. Query servergrouplist (as sent on dialog reload)
+    let mut sgl_cmd = Command::new("servergrouplist");
+    sgl_cmd.set("return_code", "sgl_test");
+    admin.send_command(&sgl_cmd).await;
+    let sgl_resp = admin.recv_until("servergrouplist", Duration::from_secs(2)).await.expect("sgl resp");
+    assert!(sgl_resp.raw.contains("sgid=6"));
+    let sgl_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sgl ok");
+    assert_eq!(sgl_ok.get("id"), Some("0"));
+    assert_eq!(sgl_ok.get("return_code"), Some("sgl_test"));
+
+    // 10. Query servergroupclientlist for admin group (sgid=6)
+    let mut sgcl_cmd = Command::new("servergroupclientlist");
+    sgcl_cmd.set("sgid", "6");
+    sgcl_cmd.set("return_code", "sgcl_test");
+    admin.send_command(&sgcl_cmd).await;
+    let sgcl_resp = admin.recv_until("servergroupclientlist", Duration::from_secs(2)).await.expect("sgcl resp");
+    assert!(sgcl_resp.raw.contains("client_unique_identifier="));
+    let sgcl_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sgcl ok");
+    assert_eq!(sgcl_ok.get("id"), Some("0"));
+    assert_eq!(sgcl_ok.get("return_code"), Some("sgcl_test"));
+
+    // 11. Query servergroupclientlist for nonexistent empty group -> error 1281
+    let mut sgcl_empty = Command::new("servergroupclientlist");
+    sgcl_empty.set("sgid", "9999");
+    sgcl_empty.set("return_code", "sgcl_empty_test");
+    admin.send_command(&sgcl_empty).await;
+    let sgcl_empty_err = admin.recv_until("error", Duration::from_secs(2)).await.expect("sgcl empty err");
+    assert_eq!(sgcl_empty_err.get("id"), Some("1281"));
+    assert_eq!(sgcl_empty_err.get("return_code"), Some("sgcl_empty_test"));
+
+    // 12. Query channelgrouplist
+    let mut cgl_cmd = Command::new("channelgrouplist");
+    cgl_cmd.set("return_code", "cgl_test");
+    admin.send_command(&cgl_cmd).await;
+    let cgl_resp = admin.recv_until("channelgrouplist", Duration::from_secs(2)).await.expect("cgl resp");
+    assert!(cgl_resp.raw.contains("cgid=5"));
+    let cgl_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("cgl ok");
+    assert_eq!(cgl_ok.get("id"), Some("0"));
+    assert_eq!(cgl_ok.get("return_code"), Some("cgl_test"));
+
     server_handle.abort();
 }
 
@@ -3053,6 +3118,234 @@ async fn test_server_capacity_rejection_and_reserved_slots() {
         .await
         .expect("admin2 alive");
     assert_eq!(ack2.get("id"), Some("0"));
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_afk_and_away_status_wire() {
+    let db = Database::in_memory().expect("db");
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind");
+    let server_addr = server.local_addr().expect("local addr");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut client_a = ClientSession::connect(server_addr, "UserA").await;
+    let mut client_b = ClientSession::connect(server_addr, "UserB").await;
+
+    // Client A sets Away
+    let mut away_cmd = Command::new("clientupdate");
+    away_cmd.set("client_away", "1");
+    away_cmd.set("client_away_message", "Back soon");
+    client_a.send_command(&away_cmd).await;
+    let ack_a = client_a.recv_until("error", Duration::from_secs(2)).await.expect("ack a");
+    assert_eq!(ack_a.get("id"), Some("0"));
+
+    // Client B must receive notifyclientupdated for client A with away flags
+    let notify_b = client_b.recv_until("notifyclientupdated", Duration::from_secs(2)).await.expect("notify b");
+    assert_eq!(notify_b.get("clid"), Some(client_a.clid.to_string().as_str()));
+    assert_eq!(notify_b.get("client_away"), Some("1"));
+    assert_eq!(notify_b.get("client_away_message"), Some("Back soon"));
+
+    // Client C connects and receives initial enter view: must show Client A is away
+    let client_c = ClientSession::connect(server_addr, "UserC").await;
+    assert_ne!(client_c.clid, 0);
+
+    // Client A clears Away
+    let mut back_cmd = Command::new("clientupdate");
+    back_cmd.set("client_away", "0");
+    back_cmd.set("client_away_message", "");
+    client_a.send_command(&back_cmd).await;
+    let _ = client_a.recv_until("error", Duration::from_secs(2)).await;
+
+    let notify_back = client_b.recv_until("notifyclientupdated", Duration::from_secs(2)).await.expect("notify back");
+    assert_eq!(notify_back.get("clid"), Some(client_a.clid.to_string().as_str()));
+    assert_eq!(notify_back.get("client_away"), Some("0"));
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_privilege_key_prompt_only_when_no_admin() {
+    let db = Database::in_memory().expect("db");
+    let initial_token = db.get_or_create_initial_admin_token().expect("token").unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind");
+    let server_addr = server.local_addr().expect("local addr");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // 1. First client connects when server has NO admin identities:
+    // virtualserver_ask_for_privilegekey must be "1"
+    let mut client1 = ClientSession::connect(server_addr, "FirstUser").await;
+    assert!(client1.ask_for_privilege_key, "First user should be prompted when no admin exists");
+
+    // Client 1 redeems initial admin privilege key
+    let mut use_cmd = Command::new("privilegekeyuse");
+    use_cmd.set("token", &initial_token);
+    client1.send_command(&use_cmd).await;
+    let ok = client1.recv_until("error", Duration::from_secs(2)).await.expect("tok ok");
+    assert_eq!(ok.get("id"), Some("0"));
+
+    // 2. Second user connects: server already has an admin!
+    // virtualserver_ask_for_privilegekey must be "0" (never prompt ordinary users)
+    let client2 = ClientSession::connect(server_addr, "SecondUser").await;
+    assert!(!client2.ask_for_privilege_key, "Second user must NOT be prompted when admin already exists");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_complaints_list_crud_wire() {
+    let db = Database::in_memory().expect("db");
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind");
+    let server_addr = server.local_addr().expect("local addr");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    let user = ClientSession::connect(server_addr, "TargetUser").await;
+
+    // 1. Initial complainlist on empty database: must return error 1281 (empty result set), not crash/disconnect!
+    let list_cmd = Command::new("complainlist");
+    admin.send_command(&list_cmd).await;
+    let list_err = admin.recv_until("error", Duration::from_secs(2)).await.expect("complainlist err");
+    assert_eq!(list_err.get("id"), Some("1281"), "Empty complaints must return error 1281");
+
+    // 2. Add complaint
+    let mut add_cmd = Command::new("complainadd");
+    add_cmd.set("tcldbid", user.clid.to_string());
+    add_cmd.set("message", "Spamming music");
+    admin.send_command(&add_cmd).await;
+    let add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("add ok");
+    assert_eq!(add_ok.get("id"), Some("0"));
+
+    // 3. Query complaints: receives notifycomplainlist
+    admin.send_command(&list_cmd).await;
+    let notify_list = admin.recv_until("notifycomplainlist", Duration::from_secs(2)).await.expect("notify list");
+    assert_eq!(notify_list.get("tcldbid"), Some(user.clid.to_string().as_str()));
+    assert_eq!(notify_list.get("message"), Some("Spamming music"));
+    let list_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("list ok");
+    assert_eq!(list_ok.get("id"), Some("0"));
+
+    // 4. Delete complaints
+    let mut del_cmd = Command::new("complaindelall");
+    del_cmd.set("tcldbid", user.clid.to_string());
+    admin.send_command(&del_cmd).await;
+    let del_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("del ok");
+    assert_eq!(del_ok.get("id"), Some("0"));
+
+    // 5. Subsequent complainlist returns 1281 again
+    admin.send_command(&list_cmd).await;
+    let list_err2 = admin.recv_until("error", Duration::from_secs(2)).await.expect("complainlist empty");
+    assert_eq!(list_err2.get("id"), Some("1281"));
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_server_password_and_temp_password_flow() {
+    let db = Database::in_memory().expect("db");
+    // Seed server password
+    db.set_property("virtualserver_flag_password", "1").unwrap();
+    db.set_property("virtualserver_password", "MySecretPassword").unwrap();
+
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind");
+    let server_addr = server.local_addr().expect("local addr");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // 1. Connect without password -> Rejected with error 1028 (prompts dialog)
+    let no_pw_client = ClientSession::connect(server_addr, "NoPwUser").await;
+    assert_eq!(no_pw_client.clid, 0);
+    assert_eq!(no_pw_client.last_error_id.as_deref(), Some("1028"));
+
+    // 2. Connect with wrong password -> Rejected with error 1028
+    let wrong_pw_client = ClientSession::connect_with_options(server_addr, "WrongPwUser", None, Some("WrongPassword"), None, None).await;
+    assert_eq!(wrong_pw_client.clid, 0);
+    assert_eq!(wrong_pw_client.last_error_id.as_deref(), Some("1028"));
+
+    // 3. Connect with correct server password -> Successfully connected!
+    let mut auth_client = ClientSession::connect_with_options(server_addr, "AuthUser", None, Some("MySecretPassword"), None, None).await;
+    assert_ne!(auth_client.clid, 0, "Client with correct password must connect");
+
+    // 4. Temporary Server Password: Add
+    let mut temp_add = Command::new("servertemppasswordadd");
+    temp_add.set("pw", "EventGuest123");
+    temp_add.set("desc", "Tournament Pass");
+    temp_add.set("duration", "3600");
+    auth_client.send_command(&temp_add).await;
+    let add_ok = auth_client.recv_until("error", Duration::from_secs(2)).await.expect("temp add ok");
+    assert_eq!(add_ok.get("id"), Some("0"));
+
+    // 5. Temporary Server Password: List
+    let temp_list_cmd = Command::new("servertemppasswordlist");
+    auth_client.send_command(&temp_list_cmd).await;
+    let notify_templist = auth_client.recv_until("notifyservertemppasswordlist", Duration::from_secs(2)).await.expect("temp list notify");
+    assert!(notify_templist.build().contains("EventGuest123"));
+    let temp_list_ok = auth_client.recv_until("error", Duration::from_secs(2)).await.expect("temp list ok");
+    assert_eq!(temp_list_ok.get("id"), Some("0"));
+
+    // 6. Connect new guest using the temporary password without knowing main server password!
+    let guest_temp = ClientSession::connect_with_options(server_addr, "TempUser", None, Some("EventGuest123"), None, None).await;
+    assert_ne!(guest_temp.clid, 0, "Temporary password must grant access");
+
+    // 7. Delete temporary password
+    let mut temp_del = Command::new("servertemppassworddel");
+    temp_del.set("pw", "EventGuest123");
+    auth_client.send_command(&temp_del).await;
+    let del_ok = auth_client.recv_until("error", Duration::from_secs(2)).await.expect("temp del ok");
+    assert_eq!(del_ok.get("id"), Some("0"));
+
+    // 8. Connecting with deleted temp password fails with error 1028
+    let dead_temp_client = ClientSession::connect_with_options(server_addr, "DeadTempUser", None, Some("EventGuest123"), None, None).await;
+    assert_eq!(dead_temp_client.clid, 0);
+    assert_eq!(dead_temp_client.last_error_id.as_deref(), Some("1028"));
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_reconnect_ghost_eviction_and_default_channel() {
+    let db = Database::in_memory().expect("db");
+    // Add channel 2 "Special Channel"
+    db.create_channel("Special Channel", "Topic").unwrap();
+
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind");
+    let server_addr = server.local_addr().expect("local addr");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let secret = p256::SecretKey::from_slice(&[77u8; 32]).expect("valid secret");
+
+    // 1. Connect specifying client_default_channel = "Special Channel"
+    let client1 = ClientSession::connect_with_options(
+        server_addr,
+        "FixedUser",
+        Some(&secret),
+        None,
+        Some("Special Channel"),
+        None,
+    ).await;
+    assert_ne!(client1.clid, 0);
+    assert_eq!(client1.current_channel_id, 2, "Client must enter the requested default channel");
+
+    // 2. Client reconnects with same identity key (different UDP port)
+    // Server must evict previous session immediately and admit the new one without renaming to "FixedUser1"
+    let client2 = ClientSession::connect_with_options(
+        server_addr,
+        "FixedUser",
+        Some(&secret),
+        None,
+        Some("Special Channel"),
+        None,
+    ).await;
+    assert_ne!(client2.clid, 0);
+    assert_eq!(client2.current_channel_id, 2);
 
     server_handle.abort();
 }

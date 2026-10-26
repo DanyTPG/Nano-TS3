@@ -109,9 +109,9 @@ impl Command {
 
         for part in parts {
             if let Some((k, v)) = part.split_once('=') {
-                params.insert(unescape(k), unescape(v));
+                params.entry(unescape(k)).or_insert_with(|| unescape(v));
             } else {
-                params.insert(unescape(part), String::new());
+                params.entry(unescape(part)).or_insert_with(String::new);
             }
         }
 
@@ -144,9 +144,9 @@ impl Command {
             };
             for part in item.split_whitespace() {
                 if let Some((k, v)) = part.split_once('=') {
-                    map.insert(unescape(k), unescape(v));
+                    map.entry(unescape(k)).or_insert_with(|| unescape(v));
                 } else {
-                    map.insert(unescape(part), String::new());
+                    map.entry(unescape(part)).or_insert_with(String::new);
                 }
             }
             if idx == 0 {

@@ -1,5 +1,7 @@
+use base64::prelude::*;
 use rand::{Rng, distributions::Alphanumeric};
 use rusqlite::{Connection, Result, params};
+use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -117,6 +119,29 @@ pub struct PermFindMatch {
     pub perm_value: i64,
     pub perm_negated: bool,
     pub perm_skip: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComplaintRecord {
+    pub tcldbid: u64,
+    pub tname: String,
+    pub fcldbid: u64,
+    pub fname: String,
+    pub message: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TempPasswordRecord {
+    pub password: String,
+    pub description: String,
+    pub client_nickname: String,
+    pub client_uid: String,
+    pub duration: u64,
+    pub timestamp_start: u64,
+    pub timestamp_end: u64,
+    pub target_channel_id: u64,
+    pub target_channel_pw: String,
 }
 
 pub struct Database {
@@ -274,6 +299,29 @@ impl Database {
                 perm_negated INTEGER NOT NULL DEFAULT 0,
                 perm_skip INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(cid, client_uid, perm_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS complaints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tcldbid INTEGER NOT NULL,
+                tname TEXT NOT NULL,
+                fcldbid INTEGER NOT NULL,
+                fname TEXT NOT NULL,
+                message TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS temporary_server_passwords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                password TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL,
+                client_nickname TEXT NOT NULL,
+                client_uid TEXT NOT NULL,
+                duration INTEGER NOT NULL,
+                timestamp_start INTEGER NOT NULL,
+                timestamp_end INTEGER NOT NULL,
+                target_channel_id INTEGER NOT NULL DEFAULT 0,
+                target_channel_pw TEXT NOT NULL DEFAULT ''
             );
             ",
         )?;
@@ -521,6 +569,16 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Checks if any Server Admin exists on the server.
+    pub fn has_any_admin(&self) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM admin_identities) + (SELECT COUNT(*) FROM group_server_to_client WHERE group_id = 6)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Checks if a client UID is a known Server Admin.
     pub fn is_admin_identity(&self, uid: &str) -> Result<bool> {
         let in_group: i64 = self.conn.query_row(
@@ -615,6 +673,46 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    pub fn get_server_group_members(&self, group_id: u64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT client_uid FROM group_server_to_client WHERE group_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![group_id as i64], |row| row.get::<_, String>(0))?;
+        let mut uids = rows.collect::<Result<Vec<_>, _>>()?;
+        if group_id == 6 {
+            let mut admin_stmt = self.conn.prepare("SELECT client_uid FROM admin_identities")?;
+            let admin_rows = admin_stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for adm in admin_rows {
+                if let Ok(u) = adm {
+                    if !uids.contains(&u) {
+                        uids.push(u);
+                    }
+                }
+            }
+        }
+        Ok(uids)
+    }
+
+    pub fn get_channel_group_members(&self, group_id: u64, cid: Option<u64>) -> Result<Vec<(u64, String)>> {
+        if let Some(cid) = cid {
+            let mut stmt = self.conn.prepare(
+                "SELECT cid, client_uid FROM group_channel_to_client WHERE group_id = ?1 AND cid = ?2",
+            )?;
+            let rows = stmt.query_map(params![group_id as i64, cid as i64], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })?;
+            rows.collect()
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT cid, client_uid FROM group_channel_to_client WHERE group_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![group_id as i64], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })?;
+            rows.collect()
+        }
     }
 
     pub fn get_client_channel_group(&self, uid: &str, cid: u64) -> Result<u64> {
@@ -1739,6 +1837,183 @@ impl Database {
         }
 
         Ok(matches)
+    }
+
+    // --- Complaints Subsystem ---
+
+    /// Adds a complaint against a target client.
+    pub fn add_complaint(
+        &self,
+        tcldbid: u64,
+        tname: &str,
+        fcldbid: u64,
+        fname: &str,
+        message: &str,
+        timestamp: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO complaints (tcldbid, tname, fcldbid, fname, message, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![tcldbid as i64, tname, fcldbid as i64, fname, message, timestamp as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieves complaints, optionally filtered by target client dbid.
+    pub fn get_complaints(&self, tcldbid: Option<u64>) -> Result<Vec<ComplaintRecord>> {
+        let mut complaints = Vec::new();
+        if let Some(target) = tcldbid {
+            let mut stmt = self.conn.prepare(
+                "SELECT tcldbid, tname, fcldbid, fname, message, timestamp FROM complaints WHERE tcldbid = ?1 ORDER BY timestamp DESC",
+            )?;
+            let rows = stmt.query_map(params![target as i64], |row| {
+                Ok(ComplaintRecord {
+                    tcldbid: row.get::<_, i64>(0)? as u64,
+                    tname: row.get(1)?,
+                    fcldbid: row.get::<_, i64>(2)? as u64,
+                    fname: row.get(3)?,
+                    message: row.get(4)?,
+                    timestamp: row.get::<_, i64>(5)? as u64,
+                })
+            })?;
+            for r in rows {
+                complaints.push(r?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT tcldbid, tname, fcldbid, fname, message, timestamp FROM complaints ORDER BY timestamp DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(ComplaintRecord {
+                    tcldbid: row.get::<_, i64>(0)? as u64,
+                    tname: row.get(1)?,
+                    fcldbid: row.get::<_, i64>(2)? as u64,
+                    fname: row.get(3)?,
+                    message: row.get(4)?,
+                    timestamp: row.get::<_, i64>(5)? as u64,
+                })
+            })?;
+            for r in rows {
+                complaints.push(r?);
+            }
+        }
+        Ok(complaints)
+    }
+
+    /// Deletes a specific complaint.
+    pub fn delete_complaint(&self, tcldbid: u64, fcldbid: u64) -> Result<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM complaints WHERE tcldbid = ?1 AND fcldbid = ?2",
+            params![tcldbid as i64, fcldbid as i64],
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Deletes all complaints for a target client.
+    pub fn delete_all_complaints(&self, tcldbid: u64) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM complaints WHERE tcldbid = ?1",
+            params![tcldbid as i64],
+        )?;
+        Ok(count)
+    }
+
+    // --- Temporary Server Passwords ---
+
+    /// Adds a temporary server password.
+    pub fn add_temp_password(&self, record: &TempPasswordRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO temporary_server_passwords \
+             (password, description, client_nickname, client_uid, duration, timestamp_start, timestamp_end, target_channel_id, target_channel_pw) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.password,
+                record.description,
+                record.client_nickname,
+                record.client_uid,
+                record.duration as i64,
+                record.timestamp_start as i64,
+                record.timestamp_end as i64,
+                record.target_channel_id as i64,
+                record.target_channel_pw,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieves all active temporary server passwords.
+    pub fn get_temp_passwords(&self) -> Result<Vec<TempPasswordRecord>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT password, description, client_nickname, client_uid, duration, timestamp_start, timestamp_end, target_channel_id, target_channel_pw \
+             FROM temporary_server_passwords WHERE timestamp_end >= ?1 ORDER BY timestamp_start ASC",
+        )?;
+        let rows = stmt.query_map(params![now], |row| {
+            Ok(TempPasswordRecord {
+                password: row.get(0)?,
+                description: row.get(1)?,
+                client_nickname: row.get(2)?,
+                client_uid: row.get(3)?,
+                duration: row.get::<_, i64>(4)? as u64,
+                timestamp_start: row.get::<_, i64>(5)? as u64,
+                timestamp_end: row.get::<_, i64>(6)? as u64,
+                target_channel_id: row.get::<_, i64>(7)? as u64,
+                target_channel_pw: row.get(8)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    /// Deletes a temporary server password by cleartext password string.
+    pub fn delete_temp_password(&self, password: &str) -> Result<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM temporary_server_passwords WHERE password = ?1",
+            params![password],
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Validates a temporary server password against active non-expired records.
+    /// Accepts cleartext password or base64-encoded SHA1 password hash.
+    pub fn validate_temp_password(&self, password_or_hash: &str) -> Result<Option<TempPasswordRecord>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT password, description, client_nickname, client_uid, duration, timestamp_start, timestamp_end, target_channel_id, target_channel_pw \
+             FROM temporary_server_passwords WHERE timestamp_end >= ?1",
+        )?;
+        let rows = stmt.query_map(params![now], |row| {
+            Ok(TempPasswordRecord {
+                password: row.get(0)?,
+                description: row.get(1)?,
+                client_nickname: row.get(2)?,
+                client_uid: row.get(3)?,
+                duration: row.get::<_, i64>(4)? as u64,
+                timestamp_start: row.get::<_, i64>(5)? as u64,
+                timestamp_end: row.get::<_, i64>(6)? as u64,
+                target_channel_id: row.get::<_, i64>(7)? as u64,
+                target_channel_pw: row.get(8)?,
+            })
+        })?;
+        for r in rows {
+            let record = r?;
+            let mut hasher = Sha1::new();
+            hasher.update(record.password.as_bytes());
+            let hash = BASE64_STANDARD.encode(hasher.finalize());
+            if record.password == password_or_hash || hash == password_or_hash {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
     }
 }
 

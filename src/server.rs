@@ -34,6 +34,8 @@ fn build_client_enter_view(
     cfid: u64,
     is_admin: bool,
     audio: ClientAudioState,
+    away: bool,
+    away_message: &str,
 ) -> Command {
     let mut cmd = Command::new("notifycliententerview");
     cmd.set("reasonid", reasonid);
@@ -68,8 +70,8 @@ fn build_client_enter_view(
         channel_id.to_string(),
     );
     cmd.set("client_servergroups", if is_admin { "6" } else { "8" });
-    cmd.set("client_away", "0");
-    cmd.set("client_away_message", "");
+    cmd.set("client_away", bool_wire(away));
+    cmd.set("client_away_message", away_message);
     cmd.set("client_talk_power", "0");
     cmd.set("client_talk_request", "0");
     cmd.set("client_talk_request_msg", "");
@@ -1012,7 +1014,7 @@ impl Server {
         if channels.is_empty() {
             return;
         }
-        let occupants: Vec<(u16, String, String, u64, bool, ClientAudioState)> = {
+        let occupants: Vec<(u16, String, String, u64, bool, ClientAudioState, bool, String)> = {
             let mut state = self.state.lock().await;
             let known = match state.get_client(&peer) {
                 Some(c) => c.known_clients.clone(),
@@ -1032,6 +1034,8 @@ impl Server {
                         c.current_channel_id,
                         c.is_admin,
                         c.audio,
+                        c.away,
+                        c.away_message.clone(),
                     ));
                 }
             }
@@ -1042,8 +1046,8 @@ impl Server {
             }
             to_send
         };
-        for (clid, uid, nickname, cid, is_admin, audio) in occupants {
-            let view = build_client_enter_view("2", clid, &uid, &nickname, cid, 0, is_admin, audio);
+        for (clid, uid, nickname, cid, is_admin, audio, away, away_message) in occupants {
+            let view = build_client_enter_view("2", clid, &uid, &nickname, cid, 0, is_admin, audio, away, &away_message);
             let _ = self.send_encrypted_command(peer, &view).await;
         }
     }
@@ -1110,7 +1114,11 @@ impl Server {
             (count, eps)
         };
 
-        let updated = build_server_updated(false, port, &props, clients_online, channels_online);
+        let ask_privilege = {
+            let db = self.db.lock().await;
+            !db.has_any_admin().unwrap_or(false) && db.has_unused_privilege_key().unwrap_or(false)
+        };
+        let updated = build_server_updated(ask_privilege, port, &props, clients_online, channels_online);
         for ep in endpoints {
             let _ = self.send_encrypted_command(ep, &updated).await;
         }
@@ -1606,6 +1614,27 @@ impl Server {
                         .unwrap_or_else(|| format!("nano_uid_{}", clid))
                 };
 
+                // Evict any existing session with the same UID (e.g. on client reconnect)
+                // so old ghost sessions do not block nicknames, slots, or require timeout waits.
+                let stale_peers: Vec<(SocketAddr, u16, u64)> = {
+                    let mut state = self.state.lock().await;
+                    let mut stale = Vec::new();
+                    for (addr, client) in state.clients.iter_mut() {
+                        if *addr != peer && client.uid == uid && client.clid != clid {
+                            stale.push((*addr, client.clid, client.current_channel_id));
+                            client.handshake_phase = HandshakePhase::Disconnected;
+                            client.disconnect_time = Some(std::time::Instant::now());
+                        }
+                    }
+                    stale
+                };
+                for (stale_addr, stale_clid, stale_cid) in stale_peers {
+                    info!("Evicting stale session for uid {}: clid {} at {}", uid, stale_clid, stale_addr);
+                    self.broadcast_client_left(stale_clid, stale_cid, "3", "connection replaced").await;
+                    let mut state = self.state.lock().await;
+                    state.clients.remove(&stale_addr);
+                }
+
                 // Deduplicate nicknames: the official client rejects a second
                 // client whose nickname collides with one already in its tree.
                 let nickname = {
@@ -1623,7 +1652,6 @@ impl Server {
                     if let Some(c) = state.get_client_mut(&peer) {
                         c.nickname = chosen_nick.clone();
                         c.uid = uid.clone();
-                        c.current_channel_id = 1;
                         c.audio = audio;
                     }
                     chosen_nick
@@ -1685,7 +1713,25 @@ impl Server {
                     .map(|s| s.as_str())
                     .unwrap_or("");
 
-                if flag_pw == "1" && !server_pw_hash.is_empty() {
+                let client_pw = cmd
+                    .get("client_server_password")
+                    .or_else(|| cmd.get("serverpassword"))
+                    .or_else(|| cmd.get("password"))
+                    .unwrap_or("");
+
+                let mut temp_pw_target_cid: Option<u64> = None;
+                let mut is_temp_pw_valid = false;
+                if !client_pw.is_empty() {
+                    let db = self.db.lock().await;
+                    if let Ok(Some(record)) = db.validate_temp_password(client_pw) {
+                        is_temp_pw_valid = true;
+                        if record.target_channel_id > 0 {
+                            temp_pw_target_cid = Some(record.target_channel_id);
+                        }
+                    }
+                }
+
+                if flag_pw == "1" && !server_pw_hash.is_empty() && !is_temp_pw_valid {
                     let has_pw_bypass = is_admin || {
                         let db = self.db.lock().await;
                         permissions::has_permission(
@@ -1696,10 +1742,6 @@ impl Server {
                         )
                     };
                     if !has_pw_bypass {
-                        let client_pw = cmd
-                            .get("serverpassword")
-                            .or_else(|| cmd.get("password"))
-                            .unwrap_or("");
                         let mut hasher = Sha1::new();
                         hasher.update(client_pw.as_bytes());
                         let client_hash = BASE64_STANDARD.encode(hasher.finalize());
@@ -1713,7 +1755,8 @@ impl Server {
                                 }
                             }
                             let mut err_resp = Command::new("error");
-                            err_resp.set("id", "520");
+                            // Official TeamSpeak 3 client expects error 1028 to show the password dialog
+                            err_resp.set("id", "1028");
                             err_resp.set("msg", "invalid server password");
                             if let Some(rc) = cmd.get("return_code") {
                                 err_resp.set("return_code", rc);
@@ -1791,10 +1834,53 @@ impl Server {
                     return Ok(());
                 }
 
-                let channels_count = {
+                let (db_channels, default_cid) = {
                     let db = self.db.lock().await;
-                    db.get_channels().map(|ch| ch.len()).unwrap_or(1)
+                    let chs = db.get_channels().unwrap_or_default();
+                    let def = chs.iter().find(|c| c.is_default).map(|c| c.cid).unwrap_or(1);
+                    (chs, def)
                 };
+                let channels_count = db_channels.len().max(1);
+
+                // Resolve target initial channel (respecting default channel parameter and temporary passwords)
+                let mut target_cid = default_cid;
+                if let Some(temp_cid) = temp_pw_target_cid {
+                    if db_channels.iter().any(|c| c.cid == temp_cid) {
+                        target_cid = temp_cid;
+                    }
+                } else if let Some(req_ch) = cmd
+                    .get("client_default_channel")
+                    .or_else(|| cmd.get("default_channel"))
+                    .filter(|s| !s.is_empty())
+                {
+                    let req_clean = req_ch.strip_prefix('/').unwrap_or(req_ch);
+                    let req_last_part = req_clean.rsplit('/').next().unwrap_or(req_clean);
+                    let matched_ch = db_channels.iter().find(|c| {
+                        c.cid.to_string() == req_ch
+                            || c.name == req_ch
+                            || c.name == req_clean
+                            || c.name == req_last_part
+                    });
+                    if let Some(ch) = matched_ch {
+                        let req_pw = cmd
+                            .get("client_default_channel_password")
+                            .or_else(|| cmd.get("default_channel_password"))
+                            .unwrap_or("");
+                        let pw_matches = ch.password_hash.is_empty()
+                            || hash_channel_password(req_pw) == ch.password_hash
+                            || is_admin;
+                        if pw_matches {
+                            target_cid = ch.cid;
+                        }
+                    }
+                }
+
+                {
+                    let mut state = self.state.lock().await;
+                    if let Some(c) = state.get_client_mut(&peer) {
+                        c.current_channel_id = target_cid;
+                    }
+                }
 
                 // 1. initserver
                 let mut initserver = Command::new("initserver");
@@ -1867,7 +1953,7 @@ impl Server {
                 initserver.set("virtualserver_id", "1");
                 let ask_privilege = {
                     let db = self.db.lock().await;
-                    !is_admin && db.has_unused_privilege_key().unwrap_or(false)
+                    !db.has_any_admin().unwrap_or(false) && db.has_unused_privilege_key().unwrap_or(false)
                 };
                 initserver.set("virtualserver_status", "online");
                 initserver.set("virtualserver_ip", "127.0.0.1");
@@ -1977,7 +2063,7 @@ impl Server {
                 initserver.set("pv", "7");
                 initserver.set("client_nickname", &nickname);
                 initserver.set("client_version", "3.6.2 [Build: 1695203293]");
-                initserver.set("client_platform", "Windows");
+                initserver.set("client_platform", "Linux");
                 initserver.set("client_input_muted", bool_wire(audio.input_muted));
                 initserver.set("client_output_muted", bool_wire(audio.output_muted));
                 initserver.set(
@@ -1986,8 +2072,8 @@ impl Server {
                 );
                 initserver.set("client_input_hardware", bool_wire(audio.input_hardware));
                 initserver.set("client_output_hardware", bool_wire(audio.output_hardware));
-                initserver.set("client_default_channel", "");
-                initserver.set("client_default_channel_password", "");
+                initserver.set("client_default_channel", cmd.get("client_default_channel").unwrap_or(""));
+                initserver.set("client_default_channel_password", cmd.get("client_default_channel_password").unwrap_or(""));
                 initserver.set("client_server_password", "");
                 initserver.set("client_meta_data", "");
                 initserver.set("client_version_sign", "");
@@ -2014,7 +2100,7 @@ impl Server {
                 // reasonid=2 identifies this as the client's own entry; the client
                 // treats 0 as "another client" and asserts in serverview.cpp.
                 let own_view =
-                    build_client_enter_view("2", clid, &uid, &nickname, 1, 0, is_admin, audio);
+                    build_client_enter_view("2", clid, &uid, &nickname, target_cid, 0, is_admin, audio, false, "");
                 self.send_encrypted_command(peer, &own_view).await?;
 
                 self.send_channellist_finished(peer).await?;
@@ -2028,7 +2114,7 @@ impl Server {
                     .await?;
 
                 // 3. Tell the newcomer about everybody who is already online.
-                let existing_clients: Vec<(u16, String, String, u64, bool, ClientAudioState)> = {
+                let existing_clients: Vec<(u16, String, String, u64, bool, ClientAudioState, bool, String)> = {
                     let state = self.state.lock().await;
                     state
                         .clients
@@ -2046,12 +2132,14 @@ impl Server {
                                 c.current_channel_id,
                                 c.is_admin,
                                 c.audio,
+                                c.away,
+                                c.away_message.clone(),
                             )
                         })
                         .collect()
                 };
 
-                for (other_clid, other_uid, other_nick, other_cid, other_admin, other_audio) in
+                for (other_clid, other_uid, other_nick, other_cid, other_admin, other_audio, other_away, other_away_msg) in
                     &existing_clients
                 {
                     let view = build_client_enter_view(
@@ -2063,6 +2151,8 @@ impl Server {
                         0,
                         *other_admin,
                         *other_audio,
+                        *other_away,
+                        other_away_msg,
                     );
                     self.send_encrypted_command(peer, &view).await?;
                 }
@@ -2088,8 +2178,8 @@ impl Server {
                 }
 
                 let newcomer_view =
-                    build_client_enter_view("0", clid, &uid, &nickname, 1, 0, is_admin, audio);
-                let other_endpoints = self.watching_recipients(&[1], Some(peer)).await;
+                    build_client_enter_view("0", clid, &uid, &nickname, target_cid, 0, is_admin, audio, false, "");
+                let other_endpoints = self.watching_recipients(&[target_cid], Some(peer)).await;
                 for ep in &other_endpoints {
                     let _ = self.send_encrypted_command(*ep, &newcomer_view).await;
                     let _ = self.send_encrypted_raw(*ep, &format!("notifyclientpermhints clid={} flags=65535", clid)).await;
@@ -2191,6 +2281,28 @@ impl Server {
                         update_audio_flag!("client_outputonly_muted", output_only_muted);
                         update_audio_flag!("client_input_hardware", input_hardware);
                         update_audio_flag!("client_output_hardware", output_hardware);
+
+                        if let Some(away) = parse_wire_bool(cmd.get("client_away")) {
+                            client.away = away;
+                            notify.set("client_away", bool_wire(away));
+                        }
+                        if let Some(msg) = cmd.get("client_away_message") {
+                            client.away_message = msg.to_string();
+                            notify.set("client_away_message", msg);
+                        }
+                        if let Some(nick) = cmd.get("client_nickname") {
+                            client.nickname = nick.to_string();
+                            notify.set("client_nickname", nick);
+                        }
+                        if let Some(desc) = cmd.get("client_description") {
+                            notify.set("client_description", desc);
+                        }
+                        if let Some(talker) = cmd.get("client_is_talker") {
+                            notify.set("client_is_talker", talker);
+                        }
+                        if let Some(prio) = cmd.get("client_is_priority_speaker") {
+                            notify.set("client_is_priority_speaker", prio);
+                        }
                     }
 
                     let recipients = if notify.params.len() > 1 {
@@ -2626,15 +2738,8 @@ impl Server {
             "servergetvariables" => {
                 let port = self.local_addr().map(|a| a.port()).unwrap_or(9988);
                 let ask_for_privilege_key = {
-                    let is_admin = {
-                        let state = self.state.lock().await;
-                        state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
-                    };
-                    let has_key = {
-                        let db = self.db.lock().await;
-                        db.has_unused_privilege_key().unwrap_or(false)
-                    };
-                    !is_admin && has_key
+                    let db = self.db.lock().await;
+                    !db.has_any_admin().unwrap_or(false) && db.has_unused_privilege_key().unwrap_or(false)
                 };
                 let props = {
                     let db = self.db.lock().await;
@@ -3394,6 +3499,7 @@ impl Server {
             }
             "servergrouplist" => {
                 self.send_server_group_list(peer, false).await?;
+                self.send_server_group_list(peer, true).await?;
 
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
@@ -3402,6 +3508,67 @@ impl Server {
                     err_resp.set("return_code", rc);
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "servergroupclientlist" => {
+                let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let member_uids = {
+                    let db = self.db.lock().await;
+                    db.get_server_group_members(sgid).unwrap_or_default()
+                };
+
+                let mut members: Vec<(u64, String, String)> = Vec::new();
+                {
+                    let state = self.state.lock().await;
+                    for c in state.clients.values() {
+                        let matches = if sgid == 6 {
+                            c.is_admin || member_uids.contains(&c.uid)
+                        } else if sgid == 8 {
+                            member_uids.contains(&c.uid) || !c.is_admin
+                        } else {
+                            member_uids.contains(&c.uid)
+                        };
+                        if matches && !members.iter().any(|m| m.2 == c.uid) {
+                            members.push((c.clid as u64, c.nickname.clone(), c.uid.clone()));
+                        }
+                    }
+                    for uid in &member_uids {
+                        if !members.iter().any(|m| &m.2 == uid) {
+                            members.push((1, "User".to_string(), uid.clone()));
+                        }
+                    }
+                }
+
+                if members.is_empty() {
+                    let mut err_resp = Command::new("error");
+                    err_resp.set("id", "1281");
+                    err_resp.set("msg", "database empty result set");
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    self.send_encrypted_command(peer, &err_resp).await?;
+                } else {
+                    let parts: Vec<String> = members
+                        .into_iter()
+                        .map(|(cldbid, nick, uid)| {
+                            format!(
+                                "cldbid={} client_nickname={} client_unique_identifier={}",
+                                cldbid,
+                                crate::command::escape(&nick),
+                                crate::command::escape(&uid)
+                            )
+                        })
+                        .collect();
+                    let wire = format!("servergroupclientlist {}", parts.join("|"));
+                    self.send_encrypted_raw(peer, &wire).await?;
+
+                    let mut err_resp = Command::new("error");
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    self.send_encrypted_command(peer, &err_resp).await?;
+                }
             }
             "permissionlist" => {
                 // Send the complete notifypermissionlist wire string
@@ -3691,6 +3858,7 @@ impl Server {
             }
             "channelgrouplist" => {
                 self.send_channel_group_list(peer, false).await?;
+                self.send_channel_group_list(peer, true).await?;
 
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
@@ -3699,6 +3867,54 @@ impl Server {
                     err_resp.set("return_code", rc);
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "channelgroupclientlist" => {
+                let cgid: Option<u64> = cmd.get("cgid").and_then(|v| v.parse().ok());
+                let cid: Option<u64> = cmd.get("cid").and_then(|v| v.parse().ok());
+
+                let members = {
+                    let db = self.db.lock().await;
+                    let cgid_val = cgid.unwrap_or(5);
+                    db.get_channel_group_members(cgid_val, cid).unwrap_or_default()
+                };
+
+                if members.is_empty() {
+                    let mut err_resp = Command::new("error");
+                    err_resp.set("id", "1281");
+                    err_resp.set("msg", "database empty result set");
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    self.send_encrypted_command(peer, &err_resp).await?;
+                } else {
+                    let mut parts = Vec::new();
+                    let state = self.state.lock().await;
+                    for (ch_id, uid) in members {
+                        let cldbid = state
+                            .clients
+                            .values()
+                            .find(|c| c.uid == uid)
+                            .map(|c| c.clid as u64)
+                            .unwrap_or(1);
+                        parts.push(format!(
+                            "cid={} cldbid={} client_unique_identifier={} cgid={}",
+                            ch_id,
+                            cldbid,
+                            crate::command::escape(&uid),
+                            cgid.unwrap_or(5)
+                        ));
+                    }
+                    let wire = format!("channelgroupclientlist {}", parts.join("|"));
+                    self.send_encrypted_raw(peer, &wire).await?;
+
+                    let mut err_resp = Command::new("error");
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    self.send_encrypted_command(peer, &err_resp).await?;
+                }
             }
             "channelgrouppermlist" => {
                 let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(8);
@@ -4899,6 +5115,8 @@ impl Server {
                                             client.nickname.clone(),
                                             client.is_admin,
                                             client.audio,
+                                            client.away,
+                                            client.away_message.clone(),
                                         ));
                                     }
                                 }
@@ -4913,7 +5131,7 @@ impl Server {
                                 (move_clients, recipients)
                             };
 
-                            for (moved_clid, moved_ep, moved_uid, moved_nick, moved_admin, moved_audio) in
+                            for (moved_clid, moved_ep, moved_uid, moved_nick, moved_admin, moved_audio, moved_away, moved_away_msg) in
                                 move_clients
                             {
                                 let mut moved = Command::new("notifyclientmoved");
@@ -4944,6 +5162,8 @@ impl Server {
                                         cid,
                                         moved_admin,
                                         moved_audio,
+                                        moved_away,
+                                        &moved_away_msg,
                                     );
                                     let _ = self.send_encrypted_command(*recipient, &view).await;
                                 }
@@ -5031,9 +5251,24 @@ impl Server {
                             };
                             let mut resp = Command::new(resp_name);
                             resp.set("token", &rand_token);
+                            resp.set("tokenKey", &rand_token);
+                            if let Some(rc) = cmd.get("return_code") {
+                                resp.set("return_code", rc);
+                            }
                             self.send_encrypted_command(peer, &resp).await?;
+
+                            let mut notify_resp = Command::new("notifytokenadd");
+                            notify_resp.set("token", &rand_token);
+                            notify_resp.set("tokenKey", &rand_token);
+                            if let Some(rc) = cmd.get("return_code") {
+                                notify_resp.set("return_code", rc);
+                            }
+                            let _ = self.send_encrypted_command(peer, &notify_resp).await;
+
                             err_resp.set("id", "0");
                             err_resp.set("msg", "ok");
+                            err_resp.set("token", &rand_token);
+                            err_resp.set("tokenKey", &rand_token);
                         }
                         Err(_) => {
                             err_resp.set("id", "1280");
@@ -5069,7 +5304,10 @@ impl Server {
                         let db = self.db.lock().await;
                         db.list_tokens().unwrap_or_default()
                     };
-                    if !tokens.is_empty() {
+                    if tokens.is_empty() {
+                        err_resp.set("id", "1281");
+                        err_resp.set("msg", "database empty result set");
+                    } else {
                         let parts: Vec<String> = tokens
                             .iter()
                             .map(|t| {
@@ -5084,16 +5322,13 @@ impl Server {
                                 )
                             })
                             .collect();
-                        let resp_name = if cmd.name.starts_with("privilegekey") {
-                            "privilegekeylist"
-                        } else {
-                            "tokenlist"
-                        };
-                        let wire = format!("{} {}", resp_name, parts.join("|"));
+                        let wire = format!("notifytokenlist {}", parts.join("|"));
                         self.send_encrypted_raw(peer, &wire).await?;
+                        let wire_query = format!("tokenlist {}", parts.join("|"));
+                        self.send_encrypted_raw(peer, &wire_query).await?;
+                        err_resp.set("id", "0");
+                        err_resp.set("msg", "ok");
                     }
-                    err_resp.set("id", "0");
-                    err_resp.set("msg", "ok");
                 }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
@@ -5545,7 +5780,7 @@ impl Server {
                                         state
                                             .clients
                                             .get(&target_ep)
-                                            .map(|c| (c.uid.clone(), c.is_admin, c.audio))
+                                            .map(|c| (c.uid.clone(), c.is_admin, c.audio, c.away, c.away_message.clone()))
                                     };
                                     let (mut moved_eps, enter_eps) = self
                                         .move_recipients(old_cid, default_cid, target_ep)
@@ -5554,7 +5789,7 @@ impl Server {
                                     for ep in &moved_eps {
                                         let _ = self.send_encrypted_command(*ep, &moved).await;
                                     }
-                                    if let Some((t_uid, t_admin, t_audio)) = target_details {
+                                    if let Some((t_uid, t_admin, t_audio, t_away, t_away_msg)) = target_details {
                                         for ep in &enter_eps {
                                             let view = build_client_enter_view(
                                                 "0",
@@ -5565,6 +5800,8 @@ impl Server {
                                                 old_cid,
                                                 t_admin,
                                                 t_audio,
+                                                t_away,
+                                                &t_away_msg,
                                             );
                                             let _ = self.send_encrypted_command(*ep, &view).await;
                                         }
@@ -6083,19 +6320,255 @@ impl Server {
             "logview" => {
                 let instance = cmd.get("instance").map(|v| v == "1").unwrap_or(false);
                 let log_entry = if instance {
-                    "2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |TeamSpeak 3 Server 3.13.8 (2026-05-27 09:34:31)"
+                    "2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |TeamSpeak 3 Server 3.13.8 (2026-05-27 09:34:31)\n2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |SystemInformation: Linux 6.6.0 x86_64 Binary: 64bit\n2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |Server version: 3.13.8, build: 1685172871"
                 } else {
-                    "2026-10-26 08:00:00.000000|INFO    |VirtualServerBase|1  |listening on 0.0.0.0:9988"
+                    "2026-10-26 08:00:00.000000|INFO    |VirtualServerBase|1  |listening on 0.0.0.0:9988\n2026-10-26 08:00:00.000000|INFO    |VirtualServer |1  |server started\n2026-10-26 08:00:00.000000|INFO    |CIDRManager   |   |registered 0 CIDR blocks"
                 };
-                let mut log_resp = Command::new("logview");
+                let mut log_resp = Command::new("notifyserverlog");
                 log_resp.set("last_pos", log_entry.len().to_string());
                 log_resp.set("file_size", log_entry.len().to_string());
                 log_resp.set("l", log_entry);
                 self.send_encrypted_command(peer, &log_resp).await?;
 
+                let mut log_query_resp = Command::new("logview");
+                log_query_resp.set("last_pos", log_entry.len().to_string());
+                log_query_resp.set("file_size", log_entry.len().to_string());
+                log_query_resp.set("l", log_entry);
+                self.send_encrypted_command(peer, &log_query_resp).await?;
+
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
                 err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "complainlist" => {
+                let tcldbid = cmd.get("tcldbid").and_then(|v| v.parse::<u64>().ok());
+                let complaints = {
+                    let db = self.db.lock().await;
+                    db.get_complaints(tcldbid).unwrap_or_default()
+                };
+
+                let mut err_resp = Command::new("error");
+                if complaints.is_empty() {
+                    err_resp.set("id", "1281");
+                    err_resp.set("msg", "database empty result set");
+                } else {
+                    let parts: Vec<String> = complaints
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "tcldbid={} tname={} fcldbid={} fname={} message={} timestamp={}",
+                                c.tcldbid,
+                                crate::command::escape(&c.tname),
+                                c.fcldbid,
+                                crate::command::escape(&c.fname),
+                                crate::command::escape(&c.message),
+                                c.timestamp
+                            )
+                        })
+                        .collect();
+                    let wire = format!("notifycomplainlist {}", parts.join("|"));
+                    self.send_encrypted_raw(peer, &wire).await?;
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "complainadd" => {
+                let tcldbid: u64 = cmd
+                    .get("tcldbid")
+                    .or_else(|| cmd.get("cldbid"))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let message = cmd.get("message").unwrap_or("");
+                let (caller_nick, caller_cldbid) = {
+                    let state = self.state.lock().await;
+                    match state.get_client(&peer) {
+                        Some(c) => (c.nickname.clone(), c.clid as u64),
+                        None => ("User".to_string(), clid as u64),
+                    }
+                };
+                let target_name = {
+                    let state = self.state.lock().await;
+                    state
+                        .clients
+                        .values()
+                        .find(|c| c.clid as u64 == tcldbid)
+                        .map(|c| c.nickname.clone())
+                        .unwrap_or_else(|| "Target".to_string())
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let mut err_resp = Command::new("error");
+                if tcldbid == 0 || message.is_empty() {
+                    err_resp.set("id", "1538");
+                    err_resp.set("msg", "invalid parameter");
+                } else {
+                    let db = self.db.lock().await;
+                    match db.add_complaint(tcldbid, &target_name, caller_cldbid, &caller_nick, message, now) {
+                        Ok(()) => {
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                        }
+                        Err(_) => {
+                            err_resp.set("id", "1280");
+                            err_resp.set("msg", "database error");
+                        }
+                    }
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "complaindel" => {
+                let tcldbid: u64 = cmd.get("tcldbid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let fcldbid: u64 = cmd.get("fcldbid").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+                let mut err_resp = Command::new("error");
+                if tcldbid == 0 || fcldbid == 0 {
+                    err_resp.set("id", "1538");
+                    err_resp.set("msg", "invalid parameter");
+                } else {
+                    let db = self.db.lock().await;
+                    let _ = db.delete_complaint(tcldbid, fcldbid);
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "complaindelall" => {
+                let tcldbid: u64 = cmd.get("tcldbid").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+                let mut err_resp = Command::new("error");
+                if tcldbid == 0 {
+                    err_resp.set("id", "1538");
+                    err_resp.set("msg", "invalid parameter");
+                } else {
+                    let db = self.db.lock().await;
+                    let _ = db.delete_all_complaints(tcldbid);
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "servertemppasswordadd" => {
+                let pw = cmd.get("pw").or_else(|| cmd.get("password")).unwrap_or("");
+                let desc = cmd.get("desc").or_else(|| cmd.get("description")).unwrap_or("");
+                let duration: u64 = cmd.get("duration").and_then(|v| v.parse().ok()).unwrap_or(3600);
+                let tcid: u64 = cmd.get("tcid").or_else(|| cmd.get("target_channel")).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let tcpw = cmd.get("tcpw").or_else(|| cmd.get("target_channel_pw")).unwrap_or("");
+
+                let (caller_uid, caller_nick) = {
+                    let state = self.state.lock().await;
+                    match state.get_client(&peer) {
+                        Some(c) => (c.uid.clone(), c.nickname.clone()),
+                        None => (String::new(), "User".to_string()),
+                    }
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let mut err_resp = Command::new("error");
+                if pw.is_empty() {
+                    err_resp.set("id", "1538");
+                    err_resp.set("msg", "invalid parameter");
+                } else {
+                    let rec = crate::database::TempPasswordRecord {
+                        password: pw.to_string(),
+                        description: desc.to_string(),
+                        client_nickname: caller_nick,
+                        client_uid: caller_uid,
+                        duration,
+                        timestamp_start: now,
+                        timestamp_end: now.saturating_add(duration),
+                        target_channel_id: tcid,
+                        target_channel_pw: tcpw.to_string(),
+                    };
+                    let db = self.db.lock().await;
+                    match db.add_temp_password(&rec) {
+                        Ok(()) => {
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                        }
+                        Err(_) => {
+                            err_resp.set("id", "1280");
+                            err_resp.set("msg", "database error");
+                        }
+                    }
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "servertemppassworddel" => {
+                let pw = cmd.get("pw").or_else(|| cmd.get("password")).unwrap_or("");
+
+                let mut err_resp = Command::new("error");
+                if pw.is_empty() {
+                    err_resp.set("id", "1538");
+                    err_resp.set("msg", "invalid parameter");
+                } else {
+                    let db = self.db.lock().await;
+                    let _ = db.delete_temp_password(pw);
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "servertemppasswordlist" => {
+                let passwords = {
+                    let db = self.db.lock().await;
+                    db.get_temp_passwords().unwrap_or_default()
+                };
+
+                let mut err_resp = Command::new("error");
+                if passwords.is_empty() {
+                    err_resp.set("id", "1281");
+                    err_resp.set("msg", "database empty result set");
+                } else {
+                    let parts: Vec<String> = passwords
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "pw={} desc={} nickname={} uid={} duration={} time_start={} time_end={} tcid={}",
+                                crate::command::escape(&p.password),
+                                crate::command::escape(&p.description),
+                                crate::command::escape(&p.client_nickname),
+                                crate::command::escape(&p.client_uid),
+                                p.duration,
+                                p.timestamp_start,
+                                p.timestamp_end,
+                                p.target_channel_id
+                            )
+                        })
+                        .collect();
+                    let wire = format!("notifyservertemppasswordlist {}", parts.join("|"));
+                    self.send_encrypted_raw(peer, &wire).await?;
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
@@ -6153,13 +6626,15 @@ impl Server {
                         c.nickname.clone(),
                         c.is_admin,
                         c.audio,
+                        c.away,
+                        c.away_message.clone(),
                     ))
                 }
                 _ => None,
             }
         };
 
-        if let Some((old_cid, was_watching, target_ep, target_uid, target_nick, target_admin, target_audio)) =
+        if let Some((old_cid, was_watching, target_ep, target_uid, target_nick, target_admin, target_audio, target_away, target_away_msg)) =
             move_ctx
         {
             let mut notify = Command::new("notifyclientmoved");
@@ -6194,6 +6669,8 @@ impl Server {
                     old_cid,
                     target_admin,
                     target_audio,
+                    target_away,
+                    &target_away_msg,
                 );
                 let _ = self.send_encrypted_command(*ep, &view).await;
             }
