@@ -853,7 +853,7 @@ fn build_server_updated(
 impl Server {
     pub async fn bind(addr: &str, db: Database) -> Result<Self, Box<dyn std::error::Error>> {
         let socket = UdpSocket::bind(addr).await?;
-        info!("Nano-TS3 UDP server listening on {}", socket.local_addr()?);
+        info!("Nano-TS3 Server v{} UDP server listening on {}", env!("CARGO_PKG_VERSION"), socket.local_addr()?);
         Ok(Self {
             socket: Arc::new(socket),
             state: Arc::new(Mutex::new(ServerState::new())),
@@ -1690,8 +1690,8 @@ impl Server {
                         .map(|s| s.as_str())
                         .unwrap_or("Welcome to Nano-TS3 Server!"),
                 );
-                initserver.set("virtualserver_platform", "Windows");
-                initserver.set("virtualserver_version", "3.13.7 [Build: 1600000000]");
+                initserver.set("virtualserver_platform", "Linux");
+                initserver.set("virtualserver_version", "3.13.8 [Build: 1685172871]");
                 initserver.set(
                     "virtualserver_maxclients",
                     props
@@ -2818,6 +2818,8 @@ impl Server {
                         .map(|s| s.as_str())
                         .unwrap_or("0"),
                 );
+                resp.set("virtualserver_version", "3.13.8 [Build: 1685172871]");
+                resp.set("virtualserver_platform", "Linux");
                 self.send_encrypted_command(peer, &resp).await?;
 
                 let mut err_resp = Command::new("error");
@@ -5897,6 +5899,42 @@ impl Server {
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
+            "version" => {
+                let mut ver_resp = Command::new("version");
+                ver_resp.set("version", "3.13.8");
+                ver_resp.set("build", "1685172871");
+                ver_resp.set("platform", "Linux");
+                self.send_encrypted_command(peer, &ver_resp).await?;
+
+                let mut err_resp = Command::new("error");
+                err_resp.set("id", "0");
+                err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "logview" => {
+                let instance = cmd.get("instance").map(|v| v == "1").unwrap_or(false);
+                let log_entry = if instance {
+                    "2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |TeamSpeak 3 Server 3.13.8 (2026-05-27 09:34:31)"
+                } else {
+                    "2026-10-26 08:00:00.000000|INFO    |VirtualServerBase|1  |listening on 0.0.0.0:9988"
+                };
+                let mut log_resp = Command::new("logview");
+                log_resp.set("last_pos", log_entry.len().to_string());
+                log_resp.set("file_size", log_entry.len().to_string());
+                log_resp.set("l", log_entry);
+                self.send_encrypted_command(peer, &log_resp).await?;
+
+                let mut err_resp = Command::new("error");
+                err_resp.set("id", "0");
+                err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
             _ => {
                 debug!("Unhandled command: {}", cmd.name);
                 let mut err_resp = Command::new("error");
@@ -6018,16 +6056,20 @@ impl Server {
     }
 
     async fn handle_voice(&self, peer: SocketAddr, packet: &[u8]) -> Result<(), String> {
-        let (cid, clid) = {
+        let (cid, clid, is_muted) = {
             let state = self.state.lock().await;
             match state.get_client(&peer) {
-                Some(c) => (c.current_channel_id, c.clid),
+                Some(c) => (c.current_channel_id, c.clid, c.audio.input_muted),
                 None => return Ok(()),
             }
         };
 
+        if is_muted {
+            return Ok(());
+        }
+
         // C2S voice header: MAC(8) + packet id(2) + client id(2) + flags(1).
-        if packet.len() < 17 {
+        if packet.len() < 16 {
             return Ok(());
         }
         let sender_pid = u16::from_be_bytes([packet[8], packet[9]]);
@@ -6038,19 +6080,29 @@ impl Server {
             // Encrypted channel: the speaker's payload is EAX-encrypted with
             // the sender's c2s voice key for (generation, packet id). The
             // generation advances whenever the sender's 16-bit voice packet
-            // id wraps.
+            // id wraps around 65535 -> 0.
             let generation = {
                 let mut state = self.state.lock().await;
                 let voice_generation = match state.get_client_mut(&peer) {
                     Some(c) => {
-                        let wrapped = c
-                            .last_c2s_voice_pid
-                            .map(|last| last.wrapping_sub(sender_pid) > 32768)
-                            .unwrap_or(false);
+                        let (wrapped, should_update_last) = match c.last_c2s_voice_pid {
+                            Some(last) => {
+                                if sender_pid < last && (last - sender_pid) > 32768 {
+                                    (true, true)
+                                } else if sender_pid >= last {
+                                    (false, true)
+                                } else {
+                                    (false, false)
+                                }
+                            }
+                            None => (false, true),
+                        };
                         if wrapped {
                             c.c2s_voice_generation += 1;
                         }
-                        c.last_c2s_voice_pid = Some(sender_pid);
+                        if should_update_last {
+                            c.last_c2s_voice_pid = Some(sender_pid);
+                        }
                         c.c2s_voice_generation
                     }
                     None => return Ok(()),
@@ -6074,12 +6126,14 @@ impl Server {
             packet[13..].to_vec()
         };
 
-        if payload.len() < 5 {
+        // C2S Voice packet payload format:
+        // [seq_id (2 bytes)][codec (1 byte)][audio_data (N bytes)]
+        if payload.len() < 3 {
             return Ok(());
         }
         let seq_id = &payload[0..2];
-        let codec = payload[4];
-        let audio_data = &payload[5..];
+        let codec = payload[2];
+        let audio_data = &payload[3..];
 
         let recipients: Vec<SocketAddr> = {
             let state = self.state.lock().await;
@@ -6135,7 +6189,7 @@ impl Server {
                     p_id,
                     &receiver_iv,
                 );
-                let mut body = Vec::with_capacity(payload.len());
+                let mut body = Vec::with_capacity(5 + audio_data.len());
                 body.extend_from_slice(seq_id);
                 body.extend_from_slice(&clid.to_be_bytes());
                 body.push(codec);

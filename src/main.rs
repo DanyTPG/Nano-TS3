@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     println!("=======================================================");
-    println!("             Nano-TS3 Minimal Server v{}            ", env!("CARGO_PKG_VERSION"));
+    println!("                Nano-TS3 Server v{}                 ", env!("CARGO_PKG_VERSION"));
     println!("=======================================================");
 
     let port: u16 = env::args()
@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = format!("0.0.0.0:{}", port);
     let server = Server::bind(&bind_addr, db).await?;
 
-    info!("Server successfully initialized on port {}", port);
+    info!("Nano-TS3 Server v{} successfully initialized on port {}", env!("CARGO_PKG_VERSION"), port);
     println!("Ready for TeamSpeak 3 clients on udp://127.0.0.1:{}", port);
 
     let running = server.run();

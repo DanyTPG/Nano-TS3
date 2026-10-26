@@ -10,6 +10,7 @@ use tsproto_packets::packets::*;
 use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::scalar::Scalar;
+use sha1::Sha1;
 use sha2::{Digest, Sha512};
 
 use nano_ts3::command::Command;
@@ -350,6 +351,102 @@ impl ClientSession {
             } else {
                 return None;
             }
+        }
+        None
+    }
+
+    async fn send_voice_unencrypted(&mut self, seq_id: u16, codec: u8, audio: &[u8]) {
+        let p_id = self.c2s_pid;
+        self.c2s_pid = self.c2s_pid.wrapping_add(1);
+
+        let mac: [u8; 8] = Sha1::digest(&self.shared_iv)[..8].try_into().unwrap();
+        let mut pkt = Vec::with_capacity(13 + 3 + audio.len());
+        pkt.extend_from_slice(&mac);
+        pkt.extend_from_slice(&p_id.to_be_bytes());
+        pkt.extend_from_slice(&self.clid.to_be_bytes());
+        pkt.push(Flags::UNENCRYPTED.bits() | (PacketType::Voice as u8));
+        pkt.extend_from_slice(&seq_id.to_be_bytes());
+        pkt.push(codec);
+        pkt.extend_from_slice(audio);
+        self.sock.send(&pkt).await.unwrap();
+    }
+
+    async fn send_voice_encrypted(&mut self, seq_id: u16, codec: u8, audio: &[u8]) {
+        let p_id = self.c2s_pid;
+        self.c2s_pid = self.c2s_pid.wrapping_add(1);
+
+        let (key, nonce) = derive_key_nonce(
+            Direction::C2S,
+            PacketType::Voice as u8,
+            0,
+            p_id,
+            &self.shared_iv,
+        );
+        let mut aad = Vec::with_capacity(5);
+        aad.extend_from_slice(&p_id.to_be_bytes());
+        aad.extend_from_slice(&self.clid.to_be_bytes());
+        aad.push(PacketType::Voice as u8);
+
+        let mut payload = Vec::with_capacity(3 + audio.len());
+        payload.extend_from_slice(&seq_id.to_be_bytes());
+        payload.push(codec);
+        payload.extend_from_slice(audio);
+
+        let mac = encrypt_eax(&key, &nonce, &aad, &mut payload).unwrap();
+        let mut pkt = Vec::with_capacity(13 + payload.len());
+        pkt.extend_from_slice(&mac);
+        pkt.extend_from_slice(&aad);
+        pkt.extend_from_slice(&payload);
+        self.sock.send(&pkt).await.unwrap();
+    }
+
+    async fn recv_voice(&mut self, timeout_dur: Duration) -> Option<(u16, u16, u8, Vec<u8>)> {
+        let mut buf = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline - tokio::time::Instant::now();
+            let len = match timeout(remaining, self.sock.recv(&mut buf)).await {
+                Ok(Ok(l)) => l,
+                _ => return None,
+            };
+            if len < 11 {
+                continue;
+            }
+            let flags_type = buf[10];
+            let p_type = flags_type & 0x0f;
+            if p_type != PacketType::Voice as u8 {
+                continue;
+            }
+            let is_unencrypted = (flags_type & Flags::UNENCRYPTED.bits()) != 0;
+            let p_id = u16::from_be_bytes([buf[8], buf[9]]);
+
+            let payload: Vec<u8> = if is_unencrypted {
+                buf[11..len].to_vec()
+            } else {
+                let (s_key, s_nonce) = derive_key_nonce(
+                    Direction::S2C,
+                    PacketType::Voice as u8,
+                    0,
+                    p_id,
+                    &self.shared_iv,
+                );
+                let mac: [u8; 8] = buf[..8].try_into().unwrap();
+                let aad = &buf[8..11];
+                let mut text_buf = buf[11..len].to_vec();
+                if decrypt_eax(&s_key, &s_nonce, aad, &mac, &mut text_buf).is_err() {
+                    continue;
+                }
+                text_buf
+            };
+
+            if payload.len() < 5 {
+                continue;
+            }
+            let seq_id = u16::from_be_bytes([payload[0], payload[1]]);
+            let from_clid = u16::from_be_bytes([payload[2], payload[3]]);
+            let codec = payload[4];
+            let audio_data = payload[5..].to_vec();
+            return Some((seq_id, from_clid, codec, audio_data));
         }
         None
     }
@@ -2659,6 +2756,92 @@ async fn test_serveredit_and_serverinfo_wire() {
     let perm_name_resp = admin.recv_until("permnamebyid", Duration::from_secs(2)).await.expect("permname resp");
     assert_eq!(perm_name_resp.get("permsid"), Some("b_virtualserver_modify_name"));
     let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_voice_relay_and_audio_fidelity() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+
+    // Connect Speaker (admin) and Listener (regular user)
+    let mut speaker = ClientSession::connect(server_addr, "Speaker").await;
+    let mut listener = ClientSession::connect(server_addr, "Listener").await;
+
+    let mut usekey = Command::new("privilegekeyuse");
+    usekey.set("token", &admin_token);
+    speaker.send_command(&usekey).await;
+    let _ = speaker.recv_until("error", Duration::from_secs(2)).await;
+
+    // Drain initial notifications
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 1. Unencrypted Channel Voice Relay
+    // Speaker transmits voice packet: seq_id = 42, codec = 4 (Opus Voice), raw audio bytes
+    let raw_opus_frame = vec![0xf8, 0xff, 0xfe, 0x01, 0x02, 0x03, 0xaa, 0xbb];
+    speaker.send_voice_unencrypted(42, 4, &raw_opus_frame).await;
+
+    let received = listener.recv_voice(Duration::from_secs(2)).await.expect("listener received voice");
+    let (seq_id, from_clid, codec, audio) = received;
+    assert_eq!(seq_id, 42, "Voice sequence id must be preserved");
+    assert_eq!(from_clid, speaker.clid, "From clid must match speaker clid");
+    assert_eq!(codec, 4, "Codec byte must be intact (Opus Voice), NOT corrupted by slicing");
+    assert_eq!(audio, raw_opus_frame, "Audio payload must match raw Opus frame without truncated bytes");
+
+    // 2. Encrypted Channel Voice Relay
+    // Switch channel 1 to encrypted (channel_codec_is_unencrypted = 0)
+    let mut edit_cmd = Command::new("channeledit");
+    edit_cmd.set("cid", "1");
+    edit_cmd.set("channel_codec_is_unencrypted", "0");
+    speaker.send_command(&edit_cmd).await;
+    let _ = speaker.recv_until("error", Duration::from_secs(2)).await;
+
+    // Speaker transmits encrypted voice packet: seq_id = 100, codec = 5 (Opus Music)
+    let music_opus_frame = vec![0xfc, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    speaker.send_voice_encrypted(100, 5, &music_opus_frame).await;
+
+    let received_enc = listener.recv_voice(Duration::from_secs(2)).await.expect("listener received encrypted voice");
+    let (seq_id_enc, from_clid_enc, codec_enc, audio_enc) = received_enc;
+    assert_eq!(seq_id_enc, 100);
+    assert_eq!(from_clid_enc, speaker.clid);
+    assert_eq!(codec_enc, 5, "Codec byte must be intact (Opus Music)");
+    assert_eq!(audio_enc, music_opus_frame, "Encrypted audio payload must be decrypted cleanly");
+
+    // 3. Sequential packets - verify generation wrap logic does not falsely increment
+    for i in 1..=5 {
+        let frame = vec![0xf8, i as u8, 0x00, 0x11];
+        speaker.send_voice_encrypted(100 + i, 4, &frame).await;
+        let (seq, from, c_id, a_data) = listener.recv_voice(Duration::from_secs(2)).await.expect("seq voice");
+        assert_eq!(seq, 100 + i);
+        assert_eq!(from, speaker.clid);
+        assert_eq!(c_id, 4);
+        assert_eq!(a_data, frame);
+    }
+
+    // 4. Test version and logview commands
+    let ver_cmd = Command::new("version");
+    listener.send_command(&ver_cmd).await;
+    let ver_resp = listener.recv_until("version", Duration::from_secs(3)).await.expect("version resp");
+    assert_eq!(ver_resp.get("version"), Some("3.13.8"));
+    assert_eq!(ver_resp.get("platform"), Some("Linux"));
+    let _ = listener.recv_until("error", Duration::from_secs(2)).await;
+
+    let log_cmd = Command::new("logview");
+    listener.send_command(&log_cmd).await;
+    let log_resp = listener.recv_until("logview", Duration::from_secs(3)).await.expect("logview resp");
+    assert!(log_resp.get("l").is_some());
+    let _ = listener.recv_until("error", Duration::from_secs(2)).await;
 
     server_handle.abort();
 }
