@@ -183,17 +183,18 @@ pub fn check_power(
     power >= needed_power
 }
 
-/// Checks if the invoker's power is sufficient against the target client's needed power.
+/// Checks if the invoker's power in their channel is sufficient against the target client's needed power in their channel.
 pub fn check_target_power(
     db: &Database,
     invoker_uid: &str,
     target_uid: &str,
-    cid: u64,
+    invoker_cid: u64,
+    target_cid: u64,
     power_perm: &str,
     needed_power_perm: &str,
 ) -> bool {
-    let invoker_power = get_power(db, invoker_uid, cid, power_perm);
-    let target_needed = get_power(db, target_uid, cid, needed_power_perm);
+    let invoker_power = get_power(db, invoker_uid, invoker_cid, power_perm);
+    let target_needed = get_power(db, target_uid, target_cid, needed_power_perm);
     invoker_power >= target_needed
 }
 
@@ -209,6 +210,10 @@ pub fn check_modify_permission(
     is_grant: bool,
 ) -> Result<(), u32> {
     if invoker_uid.is_empty() {
+        return Ok(());
+    }
+
+    if has_permission(db, invoker_uid, cid, "b_permission_modify_power_ignore") {
         return Ok(());
     }
 
@@ -233,11 +238,13 @@ pub fn check_modify_permission(
     }
 
     // 3. Delegation ceiling: caller cannot grant a value exceeding their own modify power
-    // (except boolean 0/1 values and negative values)
-    if let Some(val) = target_value {
-        if val > 1 && val > invoker_modify_power {
-            let failed_id = perm_name_to_id(target_perm_name).unwrap_or(32800);
-            return Err(failed_id);
+    // for grant permissions or modify powers
+    if is_grant || target_perm_name.starts_with("i_needed_modify_power_") || target_perm_name.contains("modify_power") {
+        if let Some(val) = target_value {
+            if val > 1 && val > invoker_modify_power {
+                let failed_id = perm_name_to_id(target_perm_name).unwrap_or(32800);
+                return Err(failed_id);
+            }
         }
     }
 

@@ -1629,14 +1629,14 @@ impl Server {
 
         let cost = Self::command_flood_cost(&cmd.name);
         if cost > 0 {
-            let (caller_uid, is_admin) = {
+            let caller_uid = {
                 let state = self.state.lock().await;
                 state
                     .get_client(&peer)
-                    .map(|c| (c.uid.clone(), c.is_admin))
+                    .map(|c| c.uid.clone())
                     .unwrap_or_default()
             };
-            let has_bypass = is_admin || {
+            let has_bypass = {
                 let db = self.db.lock().await;
                 permissions::has_permission(&db, &caller_uid, 0, "b_client_ignore_antiflood")
             };
@@ -1865,7 +1865,7 @@ impl Server {
                 }
 
                 if flag_pw == "1" && !server_pw_hash.is_empty() && !is_temp_pw_valid {
-                    let has_pw_bypass = is_admin || {
+                    let has_pw_bypass = {
                         let db = self.db.lock().await;
                         permissions::has_permission(
                             &db,
@@ -1926,7 +1926,7 @@ impl Server {
                         .count()
                 };
 
-                let has_reserved_slot = is_admin || {
+                let has_reserved_slot = {
                     let db = self.db.lock().await;
                     permissions::has_permission(
                         &db,
@@ -1999,10 +1999,24 @@ impl Server {
                             .get("client_default_channel_password")
                             .or_else(|| cmd.get("default_channel_password"))
                             .unwrap_or("");
-                        let pw_matches = ch.password_hash.is_empty()
-                            || hash_channel_password(req_pw) == ch.password_hash
-                            || is_admin;
-                        if pw_matches {
+                        let (join_power_ok, pw_matches) = {
+                            let db = self.db.lock().await;
+                            let jp = permissions::get_power(&db, &uid, ch.cid, "i_channel_join_power");
+                            let njp = permissions::get_power(&db, &uid, ch.cid, "i_channel_needed_join_power");
+                            let has_pw_bypass = permissions::has_permission(
+                                &db,
+                                &uid,
+                                ch.cid,
+                                "b_channel_join_ignore_password",
+                            );
+                            (
+                                jp >= njp,
+                                ch.password_hash.is_empty()
+                                    || hash_channel_password(req_pw) == ch.password_hash
+                                    || has_pw_bypass,
+                            )
+                        };
+                        if join_power_ok && pw_matches {
                             target_cid = ch.cid;
                         }
                     }
@@ -2249,19 +2263,16 @@ impl Server {
                 let allowed_cids: std::collections::HashSet<u64> = {
                     let db = self.db.lock().await;
                     let channels = db.get_channels().unwrap_or_default();
-                    if is_admin {
-                        channels.into_iter().map(|ch| ch.cid).collect()
-                    } else {
-                        let power = permissions::get_power(&db, &uid, 0, "i_channel_subscribe_power");
-                        let mut cids = std::collections::HashSet::new();
-                        cids.insert(target_cid);
-                        for ch in channels {
-                            if power >= ch.needed_subscribe_power {
-                                cids.insert(ch.cid);
-                            }
+                    let power = permissions::get_power(&db, &uid, 0, "i_channel_subscribe_power");
+                    let mut cids = std::collections::HashSet::new();
+                    cids.insert(target_cid);
+                    for ch in channels {
+                        let needed = permissions::get_power(&db, &uid, ch.cid, "i_channel_needed_subscribe_power").max(ch.needed_subscribe_power);
+                        if power >= needed {
+                            cids.insert(ch.cid);
                         }
-                        cids
                     }
+                    cids
                 };
 
                 // 3. Tell the newcomer about everybody who is already online.
@@ -2404,6 +2415,42 @@ impl Server {
                 self.broadcast_server_updated(Some(peer)).await;
             }
             "clientupdate" => {
+                let (caller_uid, caller_cid) = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| (c.uid.clone(), c.current_channel_id)).unwrap_or_default()
+                };
+
+                let perm_failure = {
+                    let db = self.db.lock().await;
+                    if cmd.get("client_description").is_some()
+                        && !permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_modify_own_description")
+                    {
+                        Some(229)
+                    } else if cmd.get("client_is_talker").is_some()
+                        && !permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_set_flag_talker")
+                    {
+                        Some(225)
+                    } else if cmd.get("client_is_priority_speaker").is_some()
+                        && !permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_is_priority_speaker")
+                    {
+                        Some(180)
+                    } else {
+                        None
+                    }
+                };
+
+                let mut err_resp = Command::new("error");
+                if let Some(failed_id) = perm_failure {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", failed_id.to_string());
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    self.send_encrypted_command(peer, &err_resp).await?;
+                    return Ok(());
+                }
+
                 let (notify, recipients) = {
                     let mut notify = Command::new("notifyclientupdated");
                     notify.set("clid", clid.to_string());
@@ -2476,22 +2523,25 @@ impl Server {
             "channelsubscribeall" | "channelunsubscribeall" => {
                 let subscribe = cmd.name == "channelsubscribeall";
                 let channel_ids = {
-                    let (invoker_uid, is_admin, current_cid) = {
+                    let (invoker_uid, current_cid) = {
                         let state = self.state.lock().await;
                         state
                             .get_client(&peer)
-                            .map(|c| (c.uid.clone(), c.is_admin, c.current_channel_id))
-                            .unwrap_or_else(|| (String::new(), false, 1))
+                            .map(|c| (c.uid.clone(), c.current_channel_id))
+                            .unwrap_or_else(|| (String::new(), 1))
                     };
                     let db = self.db.lock().await;
                     let channels = db.get_channels().unwrap_or_default();
-                    if !subscribe || is_admin {
+                    if !subscribe {
                         channels.into_iter().map(|channel| channel.cid).collect::<Vec<_>>()
                     } else {
                         let power = permissions::get_power(&db, &invoker_uid, 0, "i_channel_subscribe_power");
                         channels
                             .into_iter()
-                            .filter(|channel| channel.cid == current_cid || power >= channel.needed_subscribe_power)
+                            .filter(|channel| {
+                                let needed = permissions::get_power(&db, &invoker_uid, channel.cid, "i_channel_needed_subscribe_power").max(channel.needed_subscribe_power);
+                                channel.cid == current_cid || power >= needed
+                            })
                             .map(|channel| channel.cid)
                             .collect::<Vec<_>>()
                     }
@@ -2570,26 +2620,25 @@ impl Server {
             "channelsubscribe" | "channelunsubscribe" => {
                 let subscribe = cmd.name == "channelsubscribe";
                 let requested = parse_channel_ids(&cmd);
-                let (channels_map, user_subscribe_power, is_admin, current_cid) = {
-                    let (invoker_uid, is_admin, current_cid) = {
+                let (channels_map, user_subscribe_power, current_cid) = {
+                    let (invoker_uid, current_cid) = {
                         let state = self.state.lock().await;
                         state
                             .get_client(&peer)
-                            .map(|c| (c.uid.clone(), c.is_admin, c.current_channel_id))
-                            .unwrap_or_else(|| (String::new(), false, 1))
+                            .map(|c| (c.uid.clone(), c.current_channel_id))
+                            .unwrap_or_else(|| (String::new(), 1))
                     };
                     let db = self.db.lock().await;
                     let channels = db.get_channels().unwrap_or_default();
                     let map: std::collections::HashMap<u64, i64> = channels
                         .into_iter()
-                        .map(|ch| (ch.cid, ch.needed_subscribe_power))
+                        .map(|ch| {
+                            let needed = permissions::get_power(&db, &invoker_uid, ch.cid, "i_channel_needed_subscribe_power").max(ch.needed_subscribe_power);
+                            (ch.cid, needed)
+                        })
                         .collect();
-                    let power = if is_admin {
-                        100
-                    } else {
-                        permissions::get_power(&db, &invoker_uid, 0, "i_channel_subscribe_power")
-                    };
-                    (map, power, is_admin, current_cid)
+                    let power = permissions::get_power(&db, &invoker_uid, 0, "i_channel_subscribe_power");
+                    (map, power, current_cid)
                 };
 
                 let requested = requested
@@ -2600,7 +2649,7 @@ impl Server {
                 if subscribe && requested.len() == 1 {
                     let target_cid = requested[0];
                     let needed = channels_map.get(&target_cid).copied().unwrap_or(0);
-                    if !is_admin && target_cid != current_cid && user_subscribe_power < needed {
+                    if target_cid != current_cid && user_subscribe_power < needed {
                         let mut err_resp = Command::new("error");
                         err_resp.set("id", "2568");
                         err_resp.set("msg", "insufficient client permissions");
@@ -2613,7 +2662,7 @@ impl Server {
                     }
                 }
 
-                let requested: Vec<u64> = if subscribe && !is_admin {
+                let requested: Vec<u64> = if subscribe {
                     requested
                         .into_iter()
                         .filter(|cid| *cid == current_cid || user_subscribe_power >= channels_map.get(cid).copied().unwrap_or(0))
@@ -2722,13 +2771,10 @@ impl Server {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let is_admin = {
+                    let (caller_cid, target_clients) = {
                         let state = self.state.lock().await;
-                        state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
-                    };
-                    let target_clients: Vec<(u16, SocketAddr, String)> = {
-                        let state = self.state.lock().await;
-                        targets
+                        let caller_cid = state.get_client(&peer).map(|c| c.current_channel_id).unwrap_or(0);
+                        let targets_data: Vec<(u16, SocketAddr, String, u64)> = targets
                             .iter()
                             .filter_map(|target| {
                                 state
@@ -2738,23 +2784,25 @@ impl Server {
                                         c.clid == *target
                                             && c.handshake_phase == HandshakePhase::Connected
                                     })
-                                    .map(|c| (*target, c.endpoint, c.uid.clone()))
+                                    .map(|c| (*target, c.endpoint, c.uid.clone(), c.current_channel_id))
                             })
-                            .collect()
+                            .collect();
+                        (caller_cid, targets_data)
                     };
                     if target_clients.is_empty() {
                         err_resp.set("id", "512");
                         err_resp.set("msg", "invalid clientID");
                     } else {
-                        let can_pm = is_admin || {
+                        let can_pm = {
                             let db = self.db.lock().await;
                             let mut allowed = true;
-                            for (_, _, target_uid) in &target_clients {
+                            for (_, _, target_uid, target_cid) in &target_clients {
                                 if !permissions::check_target_power(
                                     &db,
                                     &invoker_uid,
                                     target_uid,
-                                    0,
+                                    caller_cid,
+                                    *target_cid,
                                     "i_client_private_textmessage_power",
                                     "i_client_needed_private_textmessage_power",
                                 ) {
@@ -2771,7 +2819,7 @@ impl Server {
                             err_resp.set(
                                 "failed_permid",
                                 permissions::perm_name_to_id("i_client_needed_private_textmessage_power")
-                                    .unwrap_or(0)
+                                    .unwrap_or(217)
                                     .to_string(),
                             );
                             if let Some(rc) = cmd.get("return_code") {
@@ -2781,7 +2829,7 @@ impl Server {
                             return Ok(());
                         }
 
-                        for (target_clid, ep, _) in &target_clients {
+                        for (target_clid, ep, _, _) in &target_clients {
                             let mut target_notify = notify.clone();
                             target_notify.set("target", target_clid.to_string());
                             let _ = self.send_encrypted_command(*ep, &target_notify).await;
@@ -2795,27 +2843,64 @@ impl Server {
                         err_resp.set("id", "0");
                         err_resp.set("msg", "ok");
                     }
-                } else {
+                } else if target_mode == "2" {
+                    let (cur_cid, can_send_channel) = {
+                        let state = self.state.lock().await;
+                        let cid = state.get_client(&peer).map(|c| c.current_channel_id).unwrap_or(1);
+                        drop(state);
+                        let db = self.db.lock().await;
+                        (cid, permissions::has_permission(&db, &invoker_uid, cid, "b_client_channel_textmessage_send"))
+                    };
+                    if !can_send_channel {
+                        err_resp.set("id", "2568");
+                        err_resp.set("msg", "insufficient client permissions");
+                        err_resp.set("failed_permid", "219"); // b_client_channel_textmessage_send
+                        if let Some(rc) = cmd.get("return_code") {
+                            err_resp.set("return_code", rc);
+                        }
+                        self.send_encrypted_command(peer, &err_resp).await?;
+                        return Ok(());
+                    }
+
                     let endpoints: Vec<SocketAddr> = {
                         let state = self.state.lock().await;
-                        if target_mode == "2" {
-                            let cur_cid = state
-                                .get_client(&peer)
-                                .map(|c| c.current_channel_id)
-                                .unwrap_or(1);
-                            state
-                                .clients_in_channel(cur_cid)
-                                .iter()
-                                .map(|c| c.endpoint)
-                                .collect()
-                        } else {
-                            state
-                                .clients
-                                .values()
-                                .filter(|c| c.handshake_phase == HandshakePhase::Connected)
-                                .map(|c| c.endpoint)
-                                .collect()
+                        state
+                            .clients_in_channel(cur_cid)
+                            .iter()
+                            .map(|c| c.endpoint)
+                            .collect()
+                    };
+
+                    for ep in endpoints {
+                        let _ = self.send_encrypted_command(ep, &notify).await;
+                    }
+
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                } else {
+                    let can_send_server = {
+                        let db = self.db.lock().await;
+                        permissions::has_permission(&db, &invoker_uid, 0, "b_client_server_textmessage_send")
+                    };
+                    if !can_send_server {
+                        err_resp.set("id", "2568");
+                        err_resp.set("msg", "insufficient client permissions");
+                        err_resp.set("failed_permid", "218"); // b_client_server_textmessage_send
+                        if let Some(rc) = cmd.get("return_code") {
+                            err_resp.set("return_code", rc);
                         }
+                        self.send_encrypted_command(peer, &err_resp).await?;
+                        return Ok(());
+                    }
+
+                    let endpoints: Vec<SocketAddr> = {
+                        let state = self.state.lock().await;
+                        state
+                            .clients
+                            .values()
+                            .filter(|c| c.handshake_phase == HandshakePhase::Connected)
+                            .map(|c| c.endpoint)
+                            .collect()
                     };
 
                     for ep in endpoints {
@@ -2852,26 +2937,52 @@ impl Server {
                     target_clids.push(clid);
                 }
 
-                let (sender_nick, sender_uid, sender_admin) = {
+                let (sender_nick, sender_uid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
-                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                        .map(|c| (c.nickname.clone(), c.uid.clone()))
+                        .unwrap_or_else(|| ("User".to_string(), String::new()))
                 };
 
                 // Moving another client requires move power.
                 let moves_others = target_clids.iter().any(|t| *t != clid);
-                let can_move = !moves_others || sender_admin || {
+                let can_move_target = if !moves_others {
+                    true
+                } else {
+                    let state = self.state.lock().await;
+                    let caller_cid = state.get_client(&peer).map(|c| c.current_channel_id).unwrap_or(0);
+                    let target_data: Vec<(String, u64)> = target_clids
+                        .iter()
+                        .filter(|t| **t != clid)
+                        .filter_map(|t| {
+                            state.clients.values().find(|c| c.clid == *t).map(|c| (c.uid.clone(), c.current_channel_id))
+                        })
+                        .collect();
+                    drop(state);
                     let db = self.db.lock().await;
-                    let move_power = permissions::get_power(&db, &sender_uid, 0, "i_client_move_power");
-                    move_power >= 50
+                    let mut ok = true;
+                    for (target_uid, target_cid) in target_data {
+                        if !permissions::check_target_power(
+                            &db,
+                            &sender_uid,
+                            &target_uid,
+                            caller_cid,
+                            target_cid,
+                            "i_client_move_power",
+                            "i_client_needed_move_power",
+                        ) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 };
                 let mut err_resp = Command::new("error");
-                if !can_move {
+                if !can_move_target {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
-                    err_resp.set("failed_permid", "43"); // i_client_move_power
+                    err_resp.set("failed_permid", "205"); // i_client_needed_move_power
                 } else {
                     // Channel properties for the join checks: password and
                     // max clients.
@@ -2904,7 +3015,7 @@ impl Server {
                             .unwrap_or(false)
                     };
 
-                    let can_join_power = sender_admin || {
+                    let can_join_power = {
                         let db = self.db.lock().await;
                         let needed_join = permissions::get_power(&db, &sender_uid, new_cid, "i_channel_needed_join_power");
                         let join_power = permissions::get_power(&db, &sender_uid, new_cid, "i_channel_join_power");
@@ -2935,7 +3046,7 @@ impl Server {
                                 .count() as i64;
                             (occupants, already_there)
                         };
-                        let can_ignore_maxclients = sender_admin || {
+                        let can_ignore_maxclients = {
                             let db = self.db.lock().await;
                             permissions::has_permission(&db, &sender_uid, new_cid, "b_channel_join_ignore_maxclients")
                         };
@@ -3005,11 +3116,11 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "serveredit" => {
-                let (caller_uid, caller_name, is_admin) = {
+                let (caller_uid, caller_name) = {
                     let state = self.state.lock().await;
                     match state.get_client(&peer) {
-                        Some(c) => (c.uid.clone(), c.nickname.clone(), c.is_admin),
-                        None => (String::new(), "Admin".to_string(), false),
+                        Some(c) => (c.uid.clone(), c.nickname.clone()),
+                        None => (String::new(), "Admin".to_string()),
                     }
                 };
 
@@ -3058,7 +3169,7 @@ impl Server {
                     let db = self.db.lock().await;
                     for (prop, perm_name) in edit_perms {
                         if cmd.params.contains_key(*prop) {
-                            if !is_admin && !permissions::has_permission(&db, &caller_uid, 0, perm_name) {
+                            if !permissions::has_permission(&db, &caller_uid, 0, perm_name) {
                                 failure = Some(permissions::perm_name_to_id(perm_name).unwrap_or(0));
                                 break;
                             }
@@ -3324,7 +3435,7 @@ impl Server {
                     .and_then(|v| v.parse().ok())
                     .map(|id| if id == 0 { clid } else { id })
                     .unwrap_or(clid);
-                let (nickname, is_admin, connected_secs) = {
+                let (nickname, is_admin, connected_secs, target_uid) = {
                     let state = self.state.lock().await;
                     match state.clients.values().find(|c| {
                         c.clid == target_clid && c.handshake_phase == HandshakePhase::Connected
@@ -3333,14 +3444,25 @@ impl Server {
                             c.nickname.clone(),
                             c.is_admin,
                             c.connected_time.elapsed().as_secs(),
+                            c.uid.clone(),
                         ),
-                        None => ("User".to_string(), false, 0),
+                        None => ("User".to_string(), false, 0, String::new()),
                     }
                 };
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
+
+                let sgs_str = {
+                    let db = self.db.lock().await;
+                    let sgs = db.get_client_server_groups(&target_uid).unwrap_or_default();
+                    if sgs.is_empty() {
+                        if is_admin { "6".to_string() } else { "8".to_string() }
+                    } else {
+                        sgs.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(",")
+                    }
+                };
 
                 let mut upd = Command::new("notifyclientupdated");
                 upd.set("clid", target_clid.to_string());
@@ -3358,7 +3480,7 @@ impl Server {
                 upd.set("client_month_bytes_downloaded", "0");
                 upd.set("client_total_bytes_uploaded", "0");
                 upd.set("client_total_bytes_downloaded", "0");
-                upd.set("client_servergroups", if is_admin { "6" } else { "8" });
+                upd.set("client_servergroups", &sgs_str);
                 self.send_encrypted_command(peer, &upd).await?;
 
                 let mut err_resp = Command::new("error");
@@ -3380,9 +3502,9 @@ impl Server {
                     Some(v) => v.parse().ok().map(|id| if id == 0 { clid } else { id }),
                     None => Some(clid),
                 };
-                let requester_admin = {
+                let (caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state.get_client(&peer).map(|c| (c.current_channel_id, c.uid.clone())).unwrap_or_default()
                 };
 
                 match target_clid {
@@ -3433,6 +3555,10 @@ impl Server {
                                     .await;
 
                                 let is_self = target_clid == clid;
+                                let can_view_ip = is_self || {
+                                    let db = self.db.lock().await;
+                                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_remoteaddress_view")
+                                };
                                 let notify = build_connection_info(
                                     target_clid,
                                     &stats,
@@ -3440,7 +3566,7 @@ impl Server {
                                     target_port,
                                     connected_time,
                                     idle_time,
-                                    requester_admin || is_self,
+                                    can_view_ip,
                                 );
                                 self.send_encrypted_command(peer, &notify).await?;
                             }
@@ -3512,22 +3638,24 @@ impl Server {
                         .get(&clid)
                         .cloned()
                         .unwrap_or_default();
-                    let recps: Vec<(SocketAddr, bool)> = watchers
+                    let recps: Vec<(SocketAddr, String, u64)> = watchers
                         .into_iter()
                         .filter_map(|ep| {
                             state
                                 .clients
                                 .get(&ep)
                                 .filter(|c| c.handshake_phase == HandshakePhase::Connected)
-                                .map(|c| (ep, c.is_admin))
+                                .map(|c| (ep, c.uid.clone(), c.current_channel_id))
                         })
                         .collect();
                     (target_ip, target_port, connected_time, idle_time, recps)
                 };
 
                 if has_stats {
-                    for (ep, is_admin) in recipients {
+                    let db = self.db.lock().await;
+                    for (ep, w_uid, w_cid) in recipients {
                         let is_self = ep == peer;
+                        let can_view_ip = is_self || permissions::has_permission(&db, &w_uid, w_cid, "b_client_remoteaddress_view");
                         let notify = build_connection_info(
                             clid,
                             &stats,
@@ -3535,7 +3663,7 @@ impl Server {
                             target_port,
                             connected_time,
                             idle_time,
-                            is_admin || is_self,
+                            can_view_ip,
                         );
                         let _ = self.send_encrypted_command(ep, &notify).await;
                     }
@@ -3561,14 +3689,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "servergroupadd" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| c.uid.clone())
                         .unwrap_or_default()
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_servergroup_create")
                 };
@@ -3604,14 +3732,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "servergroupdel" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| c.uid.clone())
                         .unwrap_or_default()
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_servergroup_delete")
                 };
@@ -3651,14 +3779,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "servergrouprename" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| c.uid.clone())
                         .unwrap_or_default()
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_servergroup_create")
                 };
@@ -3687,14 +3815,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "servergroupcopy" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| c.uid.clone())
                         .unwrap_or_default()
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_servergroup_create")
                 };
@@ -3824,13 +3952,29 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "servergrouppermlist" => {
-                let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(6);
-                let use_permsid = cmd.params.contains_key("permsid");
-                self.send_server_group_perm_list(peer, sgid, use_permsid).await?;
-
+                let (caller_cid, caller_uid) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
+                };
+                let can_list = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_virtualserver_servergroup_permission_list")
+                };
                 let mut err_resp = Command::new("error");
-                err_resp.set("id", "0");
-                err_resp.set("msg", "ok");
+                if !can_list {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "154");
+                } else {
+                    let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(6);
+                    let use_permsid = cmd.params.contains_key("permsid");
+                    self.send_server_group_perm_list(peer, sgid, use_permsid).await?;
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
@@ -3839,15 +3983,48 @@ impl Server {
             "servergroupaddperm" => {
                 let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let param_sets = cmd.parse_piped_param_sets();
-                let is_admin = {
+                let (caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
+                    let db = self.db.lock().await;
+                    for pset in &param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                        let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                            || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                        if let Some(pname) = perm_name {
+                            if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, caller_cid, &pname, val, is_grant) {
+                                failed_info = Some((pname, failed_permid));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -3884,15 +4061,48 @@ impl Server {
             "servergroupdelperm" => {
                 let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let param_sets = cmd.parse_piped_param_sets();
-                let is_admin = {
+                let (caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
+                    let db = self.db.lock().await;
+                    for pset in &param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                        let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                            || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                        if let Some(pname) = perm_name {
+                            if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, caller_cid, &pname, val, is_grant) {
+                                failed_info = Some((pname, failed_permid));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -3920,14 +4130,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "channelgroupadd" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| c.uid.clone())
                         .unwrap_or_default()
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_channelgroup_create")
                 };
@@ -3963,14 +4173,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "channelgroupdel" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| c.uid.clone())
                         .unwrap_or_default()
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_channelgroup_delete")
                 };
@@ -4010,14 +4220,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "channelgrouprename" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| c.uid.clone())
                         .unwrap_or_default()
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_channelgroup_create")
                 };
@@ -4046,14 +4256,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "channelgroupcopy" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| c.uid.clone())
                         .unwrap_or_default()
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_channelgroup_create")
                 };
@@ -4151,13 +4361,29 @@ impl Server {
                 }
             }
             "channelgrouppermlist" => {
-                let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(8);
-                let use_permsid = cmd.params.contains_key("permsid");
-                self.send_channel_group_perm_list(peer, cgid, use_permsid).await?;
-
+                let (caller_cid, caller_uid) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
+                };
+                let can_list = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_virtualserver_channelgroup_permission_list")
+                };
                 let mut err_resp = Command::new("error");
-                err_resp.set("id", "0");
-                err_resp.set("msg", "ok");
+                if !can_list {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "157");
+                } else {
+                    let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(8);
+                    let use_permsid = cmd.params.contains_key("permsid");
+                    self.send_channel_group_perm_list(peer, cgid, use_permsid).await?;
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
@@ -4166,25 +4392,48 @@ impl Server {
             "channelgroupaddperm" => {
                 let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let param_sets = cmd.parse_piped_param_sets();
-                let (uid, is_admin) = {
+                let (caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
                         .unwrap_or_default()
                 };
 
                 let mut err_resp = Command::new("error");
-                let mut permission_ok = is_admin;
-                if !permission_ok {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
                     let db = self.db.lock().await;
-                    let mod_power =
-                        permissions::get_power(&db, &uid, 0, "i_group_modify_power");
-                    permission_ok = mod_power >= 50;
+                    for pset in &param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                        let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                            || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                        if let Some(pname) = perm_name {
+                            if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, caller_cid, &pname, val, is_grant) {
+                                failed_info = Some((pname, failed_permid));
+                                break;
+                            }
+                        }
+                    }
                 }
-                if !permission_ok {
+
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -4221,15 +4470,48 @@ impl Server {
             "channelgroupdelperm" => {
                 let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let param_sets = cmd.parse_piped_param_sets();
-                let is_admin = {
+                let (caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
+                    let db = self.db.lock().await;
+                    for pset in &param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                        let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                            || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                        if let Some(pname) = perm_name {
+                            if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, caller_cid, &pname, val, is_grant) {
+                                failed_info = Some((pname, failed_permid));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -4259,28 +4541,28 @@ impl Server {
             "channelpermlist" => {
                 let cid: u64 = cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let use_permsid = cmd.params.contains_key("permsid");
-                let (has_list_perm, is_admin) = {
-                    let (uid, is_adm) = {
+                let has_list_perm = {
+                    let uid = {
                         let state = self.state.lock().await;
                         state
                             .get_client(&peer)
-                            .map(|c| (c.uid.clone(), c.is_admin))
+                            .map(|c| c.uid.clone())
                             .unwrap_or_default()
                     };
                     let db = self.db.lock().await;
-                    let has_p = permissions::has_permission(
+                    permissions::has_permission(
                         &db,
                         &uid,
                         cid,
                         "b_virtualserver_channel_permission_list",
-                    );
-                    (has_p, is_adm)
+                    )
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin && !has_list_perm {
+                if !has_list_perm {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "160");
                 } else {
                     let wire = {
                         let db = self.db.lock().await;
@@ -4298,11 +4580,11 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "channeladdperm" => {
-                let (uid, is_admin) = {
+                let (_caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
                         .unwrap_or_default()
                 };
                 let param_sets = cmd.parse_piped_param_sets();
@@ -4310,27 +4592,47 @@ impl Server {
                     cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(0);
 
                 let mut err_resp = Command::new("error");
-                let mut permission_ok = is_admin;
-                if !permission_ok {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
                     let db = self.db.lock().await;
-                    let mod_power = permissions::get_power(
-                        &db,
-                        &uid,
-                        default_cid,
-                        "i_channel_permission_modify_power",
-                    );
-                    let needed = permissions::get_power(
-                        &db,
-                        &uid,
-                        default_cid,
-                        "i_channel_needed_permission_modify_power",
-                    );
-                    permission_ok = mod_power >= needed && mod_power > 0;
+                    let mod_power = permissions::get_power(&db, &caller_uid, default_cid, "i_channel_permission_modify_power");
+                    let needed = permissions::get_power(&db, &caller_uid, default_cid, "i_channel_needed_permission_modify_power");
+                    let has_bypass = permissions::has_permission(&db, &caller_uid, default_cid, "b_permission_modify_power_ignore");
+                    if !has_bypass && (mod_power < needed || mod_power == 0) {
+                        failed_info = Some(("i_channel_needed_permission_modify_power".to_string(), 129));
+                    } else {
+                        for pset in &param_sets {
+                            let cid = pset.get("cid").and_then(|v| v.parse::<u64>().ok()).unwrap_or(default_cid);
+                            let perm_name = if let Some(sid) = pset.get("permsid") {
+                                Some(sid.clone())
+                            } else if let Some(pid_str) = pset.get("permid") {
+                                pid_str
+                                    .parse::<u32>()
+                                    .ok()
+                                    .and_then(permissions::perm_id_to_name)
+                                    .map(str::to_string)
+                            } else {
+                                None
+                            };
+                            let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                            let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                                || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                            if let Some(pname) = perm_name {
+                                if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, cid, &pname, val, is_grant) {
+                                    failed_info = Some((pname, failed_permid));
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
 
-                if !permission_ok {
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -4369,11 +4671,11 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "channeldelperm" => {
-                let (uid, is_admin) = {
+                let (_caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
                         .unwrap_or_default()
                 };
                 let param_sets = cmd.parse_piped_param_sets();
@@ -4381,27 +4683,47 @@ impl Server {
                     cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(0);
 
                 let mut err_resp = Command::new("error");
-                let mut permission_ok = is_admin;
-                if !permission_ok {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
                     let db = self.db.lock().await;
-                    let mod_power = permissions::get_power(
-                        &db,
-                        &uid,
-                        default_cid,
-                        "i_channel_permission_modify_power",
-                    );
-                    let needed = permissions::get_power(
-                        &db,
-                        &uid,
-                        default_cid,
-                        "i_channel_needed_permission_modify_power",
-                    );
-                    permission_ok = mod_power >= needed && mod_power > 0;
+                    let mod_power = permissions::get_power(&db, &caller_uid, default_cid, "i_channel_permission_modify_power");
+                    let needed = permissions::get_power(&db, &caller_uid, default_cid, "i_channel_needed_permission_modify_power");
+                    let has_bypass = permissions::has_permission(&db, &caller_uid, default_cid, "b_permission_modify_power_ignore");
+                    if !has_bypass && (mod_power < needed || mod_power == 0) {
+                        failed_info = Some(("i_channel_needed_permission_modify_power".to_string(), 129));
+                    } else {
+                        for pset in &param_sets {
+                            let cid = pset.get("cid").and_then(|v| v.parse::<u64>().ok()).unwrap_or(default_cid);
+                            let perm_name = if let Some(sid) = pset.get("permsid") {
+                                Some(sid.clone())
+                            } else if let Some(pid_str) = pset.get("permid") {
+                                pid_str
+                                    .parse::<u32>()
+                                    .ok()
+                                    .and_then(permissions::perm_id_to_name)
+                                    .map(str::to_string)
+                            } else {
+                                None
+                            };
+                            let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                            let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                                || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                            if let Some(pname) = perm_name {
+                                if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, cid, &pname, val, is_grant) {
+                                    failed_info = Some((pname, failed_permid));
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
 
-                if !permission_ok {
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -4446,6 +4768,14 @@ impl Server {
                     0
                 };
 
+                let (_caller_cid, caller_uid) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
+                };
+
                 let target_uid = {
                     let state = self.state.lock().await;
                     state
@@ -4453,31 +4783,41 @@ impl Server {
                         .values()
                         .find(|c| c.clid as u64 == cldbid)
                         .map(|c| c.uid.clone())
-                        .unwrap_or_else(|| {
-                            state
-                                .get_client(&peer)
-                                .map(|c| c.uid.clone())
-                                .unwrap_or_default()
-                        })
+                        .unwrap_or_else(|| caller_uid.clone())
                 };
 
-                let wire = {
+                let can_view = {
                     let db = self.db.lock().await;
-                    permissions::build_permission_overview(
-                        &db,
-                        &target_uid,
-                        cldbid,
-                        cid,
-                        filter_permid,
-                    )
+                    if target_uid == caller_uid {
+                        permissions::has_permission(&db, &caller_uid, cid, "b_client_permissionoverview_own")
+                            || permissions::has_permission(&db, &caller_uid, cid, "b_client_permissionoverview_view")
+                    } else {
+                        permissions::has_permission(&db, &caller_uid, cid, "b_client_permissionoverview_view")
+                    }
                 };
-                if wire != "notifypermoverview" {
-                    self.send_encrypted_raw(peer, &wire).await?;
-                }
 
                 let mut err_resp = Command::new("error");
-                err_resp.set("id", "0");
-                err_resp.set("msg", "ok");
+                if !can_view {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "192");
+                } else {
+                    let wire = {
+                        let db = self.db.lock().await;
+                        permissions::build_permission_overview(
+                            &db,
+                            &target_uid,
+                            cldbid,
+                            cid,
+                            filter_permid,
+                        )
+                    };
+                    if wire != "notifypermoverview" {
+                        self.send_encrypted_raw(peer, &wire).await?;
+                    }
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
@@ -4491,11 +4831,11 @@ impl Server {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(clid as u64);
 
-                let (invoker_uid, is_admin) = {
+                let invoker_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .map(|c| c.uid.clone())
                         .unwrap_or_default()
                 };
 
@@ -4510,20 +4850,22 @@ impl Server {
                 };
 
                 let mut err_resp = Command::new("error");
-                let can_set = is_admin || {
+                let (can_set, needed_permid) = {
                     let db = self.db.lock().await;
-                    permissions::check_power(
-                        &db,
-                        &invoker_uid,
-                        cid,
-                        "i_group_member_add_power",
-                        50,
-                    )
+                    let caller_power = permissions::get_power(&db, &invoker_uid, cid, "i_group_member_add_power");
+                    let needed_power = db.get_channel_group_perms(cgid)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|p| p.perm_id == "i_group_needed_member_add_power")
+                        .map(|p| p.perm_value)
+                        .unwrap_or(50);
+                    (caller_power >= needed_power, 167)
                 };
 
                 if !can_set {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", needed_permid.to_string());
                 } else {
                     {
                         let db = self.db.lock().await;
@@ -4563,26 +4905,34 @@ impl Server {
                     .get("cldbid")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(clid);
-                let is_admin = {
+                let target_uid = {
                     let state = self.state.lock().await;
                     state
                         .clients
                         .values()
                         .find(|c| c.clid == dbid)
-                        .map(|c| c.is_admin)
-                        .unwrap_or(false)
+                        .map(|c| c.uid.clone())
+                        .unwrap_or_default()
                 };
-                let mut resp = Command::new("notifyservergroupsbyclientid");
-                resp.set("name", if is_admin { "Server Admin" } else { "Guest" });
-                resp.set("sgid", if is_admin { "6" } else { "8" });
-                resp.set("cldbid", dbid.to_string());
-                self.send_encrypted_command(peer, &resp).await?;
-                if is_admin {
-                    let mut guest = Command::new("notifyservergroupsbyclientid");
-                    guest.set("name", "Guest");
-                    guest.set("sgid", "8");
-                    guest.set("cldbid", dbid.to_string());
-                    self.send_encrypted_command(peer, &guest).await?;
+                let groups = {
+                    let db = self.db.lock().await;
+                    db.get_client_server_groups(&target_uid).unwrap_or_else(|_| vec![8])
+                };
+                let all_groups = {
+                    let db = self.db.lock().await;
+                    db.get_server_groups().unwrap_or_default()
+                };
+                for sgid in groups {
+                    let name = all_groups
+                        .iter()
+                        .find(|g| g.group_id == sgid)
+                        .map(|g| g.name.clone())
+                        .unwrap_or_else(|| if sgid == 6 { "Server Admin".to_string() } else { "Guest".to_string() });
+                    let mut resp = Command::new("notifyservergroupsbyclientid");
+                    resp.set("name", &name);
+                    resp.set("sgid", sgid.to_string());
+                    resp.set("cldbid", dbid.to_string());
+                    self.send_encrypted_command(peer, &resp).await?;
                 }
 
                 let mut err_resp = Command::new("error");
@@ -4596,9 +4946,16 @@ impl Server {
             "clientpermlist" => {
                 let cldbid: u64 = cmd.get("cldbid").and_then(|v| v.parse().ok()).unwrap_or(clid as u64);
                 let use_permsid = cmd.params.contains_key("permsid");
-                let is_admin = {
+                let (caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
+                };
+                let can_list = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_virtualserver_client_permission_list")
                 };
                 let target_uid = {
                     let state = self.state.lock().await;
@@ -4611,9 +4968,10 @@ impl Server {
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                if !can_list {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "159");
                 } else {
                     let wire = {
                         let db = self.db.lock().await;
@@ -4632,9 +4990,12 @@ impl Server {
             }
             "clientaddperm" => {
                 let cldbid: u64 = cmd.get("cldbid").and_then(|v| v.parse().ok()).unwrap_or(clid as u64);
-                let is_admin = {
+                let (caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
                 };
                 let target_uid = {
                     let state = self.state.lock().await;
@@ -4648,9 +5009,39 @@ impl Server {
                 let param_sets = cmd.parse_piped_param_sets();
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
+                    let db = self.db.lock().await;
+                    for pset in &param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                        let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                            || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                        if let Some(pname) = perm_name {
+                            if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, caller_cid, &pname, val, is_grant) {
+                                failed_info = Some((pname, failed_permid));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -4686,9 +5077,12 @@ impl Server {
             }
             "clientdelperm" => {
                 let cldbid: u64 = cmd.get("cldbid").and_then(|v| v.parse().ok()).unwrap_or(clid as u64);
-                let is_admin = {
+                let (caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
                 };
                 let target_uid = {
                     let state = self.state.lock().await;
@@ -4702,9 +5096,39 @@ impl Server {
                 let param_sets = cmd.parse_piped_param_sets();
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
+                    let db = self.db.lock().await;
+                    for pset in &param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                        let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                            || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                        if let Some(pname) = perm_name {
+                            if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, caller_cid, &pname, val, is_grant) {
+                                failed_info = Some((pname, failed_permid));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -4735,9 +5159,16 @@ impl Server {
                 let cid: u64 = cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(1);
                 let cldbid: u64 = cmd.get("cldbid").and_then(|v| v.parse().ok()).unwrap_or(clid as u64);
                 let use_permsid = cmd.params.contains_key("permsid");
-                let is_admin = {
+                let (_caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
+                };
+                let can_list = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, cid, "b_virtualserver_channelclient_permission_list")
                 };
                 let target_uid = {
                     let state = self.state.lock().await;
@@ -4750,9 +5181,10 @@ impl Server {
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                if !can_list {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "161");
                 } else {
                     let wire = {
                         let db = self.db.lock().await;
@@ -4772,16 +5204,50 @@ impl Server {
             "channelclientaddperm" => {
                 let default_cid: u64 = cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(1);
                 let default_cldbid: u64 = cmd.get("cldbid").and_then(|v| v.parse().ok()).unwrap_or(clid as u64);
-                let is_admin = {
+                let (_caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
                 };
                 let param_sets = cmd.parse_piped_param_sets();
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
+                    let db = self.db.lock().await;
+                    for pset in &param_sets {
+                        let cid = pset.get("cid").and_then(|v| v.parse().ok()).unwrap_or(default_cid);
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                        let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                            || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                        if let Some(pname) = perm_name {
+                            if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, cid, &pname, val, is_grant) {
+                                failed_info = Some((pname, failed_permid));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -4829,16 +5295,50 @@ impl Server {
             "channelclientdelperm" => {
                 let default_cid: u64 = cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(1);
                 let default_cldbid: u64 = cmd.get("cldbid").and_then(|v| v.parse().ok()).unwrap_or(clid as u64);
-                let is_admin = {
+                let (_caller_cid, caller_uid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
                 };
                 let param_sets = cmd.parse_piped_param_sets();
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                let mut failed_info: Option<(String, u32)> = None;
+                {
+                    let db = self.db.lock().await;
+                    for pset in &param_sets {
+                        let cid = pset.get("cid").and_then(|v| v.parse().ok()).unwrap_or(default_cid);
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val = pset.get("permvalue").and_then(|v| v.parse::<i64>().ok());
+                        let is_grant = pset.get("permsid").map(|s| s.starts_with("i_needed_modify_power_")).unwrap_or(false)
+                            || pset.get("permid").and_then(|id| id.parse::<u32>().ok()).map(|id| id >= 32768).unwrap_or(false);
+                        if let Some(pname) = perm_name {
+                            if let Err(failed_permid) = permissions::check_modify_permission(&db, &caller_uid, cid, &pname, val, is_grant) {
+                                failed_info = Some((pname, failed_permid));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, failed_permid)) = failed_info {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if failed_permid > 0 {
+                        err_resp.set("failed_permid", failed_permid.to_string());
+                    }
                 } else {
                     let db = self.db.lock().await;
                     for pset in param_sets {
@@ -4879,9 +5379,20 @@ impl Server {
             "servergroupaddclient" => {
                 let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let cldbid: u64 = cmd.get("cldbid").and_then(|v| v.parse().ok()).unwrap_or(0);
-                let is_admin = {
+                let caller_uid = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state.get_client(&peer).map(|c| c.uid.clone()).unwrap_or_default()
+                };
+                let (can_add, needed_permid) = {
+                    let db = self.db.lock().await;
+                    let caller_power = permissions::get_power(&db, &caller_uid, 0, "i_group_member_add_power");
+                    let needed_power = db.get_server_group_perms(sgid)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|p| p.perm_id == "i_group_needed_member_add_power")
+                        .map(|p| p.perm_value)
+                        .unwrap_or(75);
+                    (caller_power >= needed_power, 167)
                 };
                 let (target_clid, target_uid) = {
                     let state = self.state.lock().await;
@@ -4894,9 +5405,10 @@ impl Server {
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                if !can_add {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", needed_permid.to_string());
                 } else {
                     let db = self.db.lock().await;
                     let _ = db.add_client_to_server_group(&target_uid, sgid);
@@ -4917,9 +5429,20 @@ impl Server {
             "servergroupdelclient" => {
                 let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let cldbid: u64 = cmd.get("cldbid").and_then(|v| v.parse().ok()).unwrap_or(0);
-                let is_admin = {
+                let caller_uid = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state.get_client(&peer).map(|c| c.uid.clone()).unwrap_or_default()
+                };
+                let (can_del, needed_permid) = {
+                    let db = self.db.lock().await;
+                    let caller_power = permissions::get_power(&db, &caller_uid, 0, "i_group_member_remove_power");
+                    let needed_power = db.get_server_group_perms(sgid)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|p| p.perm_id == "i_group_needed_member_remove_power")
+                        .map(|p| p.perm_value)
+                        .unwrap_or(75);
+                    (caller_power >= needed_power, 169)
                 };
                 let (target_clid, target_uid) = {
                     let state = self.state.lock().await;
@@ -4932,9 +5455,10 @@ impl Server {
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                if !can_del {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", needed_permid.to_string());
                 } else {
                     let db = self.db.lock().await;
                     let _ = db.remove_client_from_server_group(&target_uid, sgid);
@@ -4954,14 +5478,14 @@ impl Server {
             }
             "channelgetdescription" => {
                 let cid: u64 = cmd.get("cid").and_then(|s| s.parse().ok()).unwrap_or(1);
-                let (invoker_uid, is_admin) = {
+                let invoker_uid = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.uid.clone(), c.is_admin))
-                        .unwrap_or_else(|| (String::new(), false))
+                        .map(|c| c.uid.clone())
+                        .unwrap_or_default()
                 };
-                let can_view_desc = is_admin || {
+                let can_view_desc = {
                     let db = self.db.lock().await;
                     let needed_power = permissions::get_power(&db, &invoker_uid, cid, "i_channel_needed_description_view_power");
                     let view_power = permissions::get_power(&db, &invoker_uid, cid, "i_channel_description_view_power");
@@ -5002,32 +5526,72 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "channelcreate" => {
-                let (nickname, invoker_uid, is_admin) = {
+                let (nickname, invoker_uid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
-                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                        .map(|c| (c.nickname.clone(), c.uid.clone()))
+                        .unwrap_or_else(|| ("User".to_string(), String::new()))
                 };
 
                 let mut err_resp = Command::new("error");
                 let (perm_name, failed_permid) = if cmd.get("channel_flag_permanent") == Some("1") {
-                    ("b_channel_create_permanent", "89")
+                    ("b_channel_create_permanent", 89)
                 } else if cmd.get("channel_flag_semi_permanent") == Some("1") {
-                    ("b_channel_create_semi_permanent", "90")
+                    ("b_channel_create_semi_permanent", 90)
                 } else if cmd.get("channel_flag_temporary") == Some("1") {
-                    ("b_channel_create_temporary", "91")
+                    ("b_channel_create_temporary", 91)
                 } else {
-                    ("b_channel_create_permanent", "89")
+                    ("b_channel_create_permanent", 89)
                 };
-                let can_create = is_admin || {
+
+                let (can_create, failure_id) = {
                     let db = self.db.lock().await;
-                    permissions::has_permission(&db, &invoker_uid, 0, perm_name)
+                    if !permissions::has_permission(&db, &invoker_uid, 0, perm_name) {
+                        (false, Some(failed_permid))
+                    } else if cmd.get("cpid").map(|s| s != "0").unwrap_or(false)
+                        && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_child")
+                    {
+                        (false, Some(88))
+                    } else if cmd.get("channel_password").map(|s| !s.is_empty()).unwrap_or(false)
+                        && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_with_password")
+                    {
+                        (false, Some(94))
+                    } else if cmd.get("channel_topic").map(|s| !s.is_empty()).unwrap_or(false)
+                        && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_with_topic")
+                    {
+                        (false, Some(92))
+                    } else if cmd.get("channel_description").map(|s| !s.is_empty()).unwrap_or(false)
+                        && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_with_description")
+                    {
+                        (false, Some(93))
+                    } else if cmd.get("channel_order").is_some()
+                        && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_with_sortorder")
+                    {
+                        (false, Some(102))
+                    } else if cmd.get("channel_maxclients").is_some()
+                        && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_with_maxclients")
+                    {
+                        (false, Some(100))
+                    } else if cmd.get("channel_maxfamilyclients").is_some()
+                        && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_with_maxfamilyclients")
+                    {
+                        (false, Some(101))
+                    } else if cmd.get("channel_needed_talk_power").is_some()
+                        && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_with_needed_talk_power")
+                    {
+                        (false, Some(104))
+                    } else {
+                        (true, None)
+                    }
                 };
+
                 if !can_create {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
-                    err_resp.set("failed_permid", failed_permid);
+                    if let Some(fid) = failure_id {
+                        err_resp.set("failed_permid", fid.to_string());
+                    }
                 } else {
                     let ch_name = cmd.get("channel_name").unwrap_or("New Channel");
                     let ch_topic = cmd.get("channel_topic").unwrap_or("");
@@ -5132,14 +5696,14 @@ impl Server {
             }
             "channeledit" => {
                 let cid = cmd.get("cid").and_then(|value| value.parse::<u64>().ok());
-                let (nickname, uid, is_admin) = {
+                let (nickname, uid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
                         .map(|client| {
-                            (client.nickname.clone(), client.uid.clone(), client.is_admin)
+                            (client.nickname.clone(), client.uid.clone())
                         })
-                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                        .unwrap_or_else(|| ("User".to_string(), String::new()))
                 };
 
                 let mut err_resp = Command::new("error");
@@ -5150,9 +5714,7 @@ impl Server {
                             err_resp.set("msg", reason);
                         }
                         Ok(edit) => {
-                            let (can_edit, failed_permid) = if is_admin {
-                                (true, None)
-                            } else {
+                            let (can_edit, failed_permid) = {
                                 let db = self.db.lock().await;
                                 let mod_power = permissions::get_power(&db, &uid, target_cid, "i_channel_modify_power");
                                 let needed = permissions::get_power(&db, &uid, target_cid, "i_channel_needed_modify_power");
@@ -5276,27 +5838,40 @@ impl Server {
             "channeldelete" => {
                 let cid = cmd.get("cid").and_then(|value| value.parse::<u64>().ok());
                 let force = cmd.get("force") == Some("1");
-                let (nickname, uid, is_admin) = {
+                let (nickname, uid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
                         .map(|client| {
-                            (client.nickname.clone(), client.uid.clone(), client.is_admin)
+                            (client.nickname.clone(), client.uid.clone())
                         })
-                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                        .unwrap_or_else(|| ("User".to_string(), String::new()))
                 };
-                let can_delete = is_admin || {
+                let (can_delete, failed_permid) = {
                     if let Some(target_cid) = cid {
                         let db = self.db.lock().await;
                         let del_power = permissions::get_power(&db, &uid, target_cid, "i_channel_delete_power");
                         let needed = permissions::get_power(&db, &uid, target_cid, "i_channel_needed_delete_power");
-                        del_power >= needed && (
-                            permissions::has_permission(&db, &uid, target_cid, "b_channel_delete_permanent")
-                            || permissions::has_permission(&db, &uid, target_cid, "b_channel_delete_semi_permanent")
-                            || permissions::has_permission(&db, &uid, target_cid, "b_channel_delete_temporary")
-                        )
+                        if del_power < needed {
+                            (false, Some(133))
+                        } else if force && !permissions::has_permission(&db, &uid, target_cid, "b_channel_delete_flag_force") {
+                            (false, Some(131))
+                        } else {
+                            let channels = db.get_channels().unwrap_or_default();
+                            let target_ch = channels.into_iter().find(|c| c.cid == target_cid);
+                            let perm_req = match target_ch {
+                                Some(ref ch) if ch.is_permanent => ("b_channel_delete_permanent", 128),
+                                Some(ref ch) if ch.is_semi_permanent => ("b_channel_delete_semi_permanent", 129),
+                                _ => ("b_channel_delete_temporary", 130),
+                            };
+                            if !permissions::has_permission(&db, &uid, target_cid, perm_req.0) {
+                                (false, Some(perm_req.1))
+                            } else {
+                                (true, None)
+                            }
+                        }
                     } else {
-                        false
+                        (false, None)
                     }
                 };
 
@@ -5304,6 +5879,9 @@ impl Server {
                 if !can_delete {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    if let Some(fpid) = failed_permid {
+                        err_resp.set("failed_permid", fpid.to_string());
+                    }
                 } else if let Some(cid) = cid {
                     let (channel_exists, is_default, default_cid) = {
                         let db = self.db.lock().await;
@@ -5453,14 +6031,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "tokenadd" | "privilegekeyadd" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     match state.get_client(&peer) {
-                        Some(c) => (c.uid.clone(), c.is_admin),
-                        None => (String::new(), false),
+                        Some(c) => c.uid.clone(),
+                        None => String::new(),
                     }
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_token_add")
                 };
@@ -5535,14 +6113,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "tokenlist" | "privilegekeylist" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     match state.get_client(&peer) {
-                        Some(c) => (c.uid.clone(), c.is_admin),
-                        None => (String::new(), false),
+                        Some(c) => c.uid.clone(),
+                        None => String::new(),
                     }
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_token_list")
                 };
@@ -5589,14 +6167,14 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "tokendelete" | "privilegekeydelete" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     match state.get_client(&peer) {
-                        Some(c) => (c.uid.clone(), c.is_admin),
-                        None => (String::new(), false),
+                        Some(c) => c.uid.clone(),
+                        None => String::new(),
                     }
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_token_delete")
                 };
@@ -5632,13 +6210,22 @@ impl Server {
                     }
                 };
 
+                let can_use = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &client_uid, 0, "b_virtualserver_token_use")
+                };
+
                 let redeemed_tok = {
                     let db = self.db.lock().await;
                     db.redeem_token(token).unwrap_or(None)
                 };
 
                 let mut err_resp = Command::new("error");
-                if let Some(tok) = redeemed_tok {
+                if !can_use {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "40");
+                } else if let Some(tok) = redeemed_tok {
                     let db = self.db.lock().await;
                     if tok.token_type == 0 {
                         // Server Group Token
@@ -5746,14 +6333,14 @@ impl Server {
                 let _ = self.send_encrypted_command(peer, &err_resp).await;
             }
             "permfind" => {
-                let (caller_uid, is_admin) = {
+                let caller_uid = {
                     let state = self.state.lock().await;
                     match state.get_client(&peer) {
-                        Some(c) => (c.uid.clone(), c.is_admin),
-                        None => (String::new(), false),
+                        Some(c) => c.uid.clone(),
+                        None => String::new(),
                     }
                 };
-                let has_perm = is_admin || {
+                let has_perm = {
                     let db = self.db.lock().await;
                     permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_permission_find")
                 };
@@ -5850,15 +6437,22 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "permreset" => {
-                let is_admin = {
+                let caller_uid = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    match state.get_client(&peer) {
+                        Some(c) => c.uid.clone(),
+                        None => String::new(),
+                    }
+                };
+                let has_perm = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_permission_reset")
                 };
                 let mut err_resp = Command::new("error");
-                if !is_admin {
+                if !has_perm {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
-                    err_resp.set("failed_permid", "32800");
+                    err_resp.set("failed_permid", "51");
                 } else {
                     err_resp.set("id", "0");
                     err_resp.set("msg", "ok");
@@ -5926,12 +6520,12 @@ impl Server {
                 let reason_msg = cmd.get("reasonmsg").unwrap_or("");
                 let target_clid: Option<u16> = cmd.get("clid").and_then(|v| v.parse().ok());
 
-                let (invoker_nickname, invoker_uid, is_admin) = {
+                let (invoker_nickname, invoker_uid, caller_cid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
-                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.current_channel_id))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), 0))
                 };
 
                 let mut err_resp = Command::new("error");
@@ -5961,32 +6555,37 @@ impl Server {
                             err_resp.set("msg", "invalid clientID");
                         }
                         Some((target_ep, old_cid, target_nick, target_uid)) => {
-                            let can_kick = is_admin || {
+                            let (can_kick, failed_permid) = {
                                 let db = self.db.lock().await;
                                 if reason_id == "4" {
-                                    permissions::check_target_power(
+                                    let ok = permissions::check_target_power(
                                         &db,
                                         &invoker_uid,
                                         &target_uid,
+                                        caller_cid,
                                         old_cid,
                                         "i_client_kick_from_channel_power",
                                         "i_client_needed_kick_from_channel_power",
-                                    )
+                                    );
+                                    (ok, 201)
                                 } else {
-                                    permissions::check_target_power(
+                                    let ok = permissions::check_target_power(
                                         &db,
                                         &invoker_uid,
                                         &target_uid,
-                                        0,
+                                        caller_cid,
+                                        old_cid,
                                         "i_client_kick_from_server_power",
                                         "i_client_needed_kick_from_server_power",
-                                    )
+                                    );
+                                    (ok, 199)
                                 }
                             };
 
                             if !can_kick {
                                 err_resp.set("id", "2568");
                                 err_resp.set("msg", "insufficient client permissions");
+                                err_resp.set("failed_permid", failed_permid.to_string());
                             } else if reason_id == "4" {
                                 // Channel Kick -> move to default channel
                                 let default_cid = {
@@ -6140,12 +6739,12 @@ impl Server {
                 let target_clid: Option<u16> = cmd.get("clid").and_then(|v| v.parse().ok());
                 let poke_msg = cmd.get("msg").unwrap_or("").to_string();
 
-                let (invoker_nickname, invoker_uid, is_admin) = {
+                let (invoker_nickname, invoker_uid, caller_cid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
-                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.current_channel_id))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), 0))
                 };
 
                 let mut err_resp = Command::new("error");
@@ -6159,19 +6758,20 @@ impl Server {
                                 c.clid == t_clid
                                     && c.handshake_phase == HandshakePhase::Connected
                             })
-                            .map(|c| (c.endpoint, c.uid.clone()))
+                            .map(|c| (c.endpoint, c.uid.clone(), c.current_channel_id))
                     })
                 };
 
                 match target_info {
-                    Some((target_ep, target_uid)) => {
-                        let can_poke = is_admin || {
+                    Some((target_ep, target_uid, target_cid)) => {
+                        let can_poke = {
                             let db = self.db.lock().await;
                             permissions::check_target_power(
                                 &db,
                                 &invoker_uid,
                                 &target_uid,
-                                0,
+                                caller_cid,
+                                target_cid,
                                 "i_client_poke_power",
                                 "i_client_needed_poke_power",
                             )
@@ -6183,7 +6783,7 @@ impl Server {
                             err_resp.set(
                                 "failed_permid",
                                 permissions::perm_name_to_id("i_client_needed_poke_power")
-                                    .unwrap_or(0)
+                                    .unwrap_or(224)
                                     .to_string(),
                             );
                         } else {
@@ -6220,139 +6820,164 @@ impl Server {
                 let duration: i64 = cmd.get("time").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let ban_reason = cmd.get("banreason").unwrap_or("");
 
-                let (invoker_nickname, invoker_uid, is_admin) = {
+                let (invoker_nickname, invoker_uid, caller_cid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
-                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.current_channel_id))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), 0))
                 };
 
-                let mut err_resp = Command::new("error");
-                if !is_admin {
-                    err_resp.set("id", "2563");
-                    err_resp.set("msg", "insufficient client permissions");
-                } else {
-                    let target_info = {
-                        let state = self.state.lock().await;
-                        state
-                            .clients
-                            .values()
-                            .find(|c| {
-                                c.handshake_phase == HandshakePhase::Connected
-                                    && (
-                                        target_clid.map_or(false, |clid| c.clid == clid)
-                                            || (!target_uid_param.is_empty() && c.uid == target_uid_param)
-                                            || target_cldbid.map_or(false, |cldbid| c.clid as u64 == cldbid)
-                                    )
-                            })
-                            .map(|c| {
-                                (
-                                    c.clid,
-                                    c.endpoint,
-                                    c.current_channel_id,
-                                    c.nickname.clone(),
-                                    c.uid.clone(),
+                let target_info = {
+                    let state = self.state.lock().await;
+                    state
+                        .clients
+                        .values()
+                        .find(|c| {
+                            c.handshake_phase == HandshakePhase::Connected
+                                && (
+                                    target_clid.map_or(false, |clid| c.clid == clid)
+                                        || (!target_uid_param.is_empty() && c.uid == target_uid_param)
+                                        || target_cldbid.map_or(false, |cldbid| c.clid as u64 == cldbid)
                                 )
-                            })
+                        })
+                        .map(|c| {
+                            (
+                                c.clid,
+                                c.endpoint,
+                                c.current_channel_id,
+                                c.nickname.clone(),
+                                c.uid.clone(),
+                            )
+                        })
+                };
+
+                let (found_target, target_clid_opt, target_ep_opt, old_cid_opt, target_nick, target_uid, target_ip) =
+                    if let Some((t_clid, t_ep, t_cid, t_nick, t_uid)) = target_info {
+                        let ip = t_ep.ip().to_string();
+                        (true, Some(t_clid), Some(t_ep), Some(t_cid), t_nick, t_uid, ip)
+                    } else if !target_uid_param.is_empty() {
+                        let name = cmd.get("name").unwrap_or("").to_string();
+                        (true, None, None, None, name, target_uid_param.to_string(), String::new())
+                    } else {
+                        (false, None, None, None, String::new(), String::new(), String::new())
                     };
 
-                    let (found_target, target_clid_opt, target_ep_opt, old_cid_opt, target_nick, target_uid, target_ip) =
-                        if let Some((t_clid, t_ep, t_cid, t_nick, t_uid)) = target_info {
-                            let ip = t_ep.ip().to_string();
-                            (true, Some(t_clid), Some(t_ep), Some(t_cid), t_nick, t_uid, ip)
-                        } else if !target_uid_param.is_empty() {
-                            let name = cmd.get("name").unwrap_or("").to_string();
-                            (true, None, None, None, name, target_uid_param.to_string(), String::new())
+                let mut err_resp = Command::new("error");
+                let (can_ban, failed_permid) = {
+                    let db = self.db.lock().await;
+                    if !permissions::has_permission(&db, &invoker_uid, caller_cid, "b_client_ban_create") {
+                        (false, 212)
+                    } else if found_target && !target_uid.is_empty() && !permissions::check_target_power(
+                        &db,
+                        &invoker_uid,
+                        &target_uid,
+                        caller_cid,
+                        old_cid_opt.unwrap_or(0),
+                        "i_client_ban_power",
+                        "i_client_needed_ban_power",
+                    ) {
+                        (false, 203)
+                    } else if duration > 0 {
+                        let max_time = permissions::get_power(&db, &invoker_uid, caller_cid, "i_client_ban_max_bantime");
+                        if max_time != -1 && (max_time == 0 || duration > max_time) {
+                            (false, 215)
                         } else {
-                            (false, None, None, None, String::new(), String::new(), String::new())
-                        };
-
-                    if !found_target {
-                        err_resp.set("id", "512");
-                        err_resp.set("msg", "invalid clientID");
+                            (true, 0)
+                        }
                     } else {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
+                        (true, 0)
+                    }
+                };
 
-                        let ban_record = BanRecord {
-                            ip: target_ip,
-                            name: target_nick.clone(),
-                            uid: target_uid,
-                            mytsid: String::new(),
-                            lastnickname: target_nick.clone(),
-                            created: now,
-                            duration,
-                            invokercldbid: clid as u64,
-                            invokername: invoker_nickname.clone(),
-                            invokeruid: invoker_uid.clone(),
-                            reason: ban_reason.to_string(),
-                            enforcements: 0,
-                            ..Default::default()
-                        };
+                if !can_ban {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", failed_permid.to_string());
+                } else if !found_target {
+                    err_resp.set("id", "512");
+                    err_resp.set("msg", "invalid clientID");
+                } else {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
 
-                        let ban_id = {
-                            let db = self.db.lock().await;
-                            db.add_ban(&ban_record).unwrap_or(0)
-                        };
+                    let ban_record = BanRecord {
+                        ip: target_ip,
+                        name: target_nick.clone(),
+                        uid: target_uid,
+                        mytsid: String::new(),
+                        lastnickname: target_nick.clone(),
+                        created: now,
+                        duration,
+                        invokercldbid: clid as u64,
+                        invokername: invoker_nickname.clone(),
+                        invokeruid: invoker_uid.clone(),
+                        reason: ban_reason.to_string(),
+                        enforcements: 0,
+                        ..Default::default()
+                    };
 
-                        if let (Some(target_clid), Some(target_ep), Some(old_cid)) = (target_clid_opt, target_ep_opt, old_cid_opt) {
-                            // Disconnect target client with reasonid=6 (Banned)
-                            let mut notify = Command::new("notifyclientleftview");
-                            notify.set("clid", target_clid.to_string());
-                            notify.set("cfid", old_cid.to_string());
-                            notify.set("ctid", "0");
-                            notify.set("reasonid", "6");
-                            notify.set("bantime", duration.to_string());
-                            notify.set("reasonmsg", ban_reason);
-                            notify.set("invokerid", clid.to_string());
-                            notify.set("invokername", &invoker_nickname);
-                            notify.set("invokeruid", &invoker_uid);
+                    let ban_id = {
+                        let db = self.db.lock().await;
+                        db.add_ban(&ban_record).unwrap_or(0)
+                    };
 
-                            // Send to banned client first
-                            let _ = self.send_encrypted_command(target_ep, &notify).await;
+                    if let (Some(target_clid), Some(target_ep), Some(old_cid)) = (target_clid_opt, target_ep_opt, old_cid_opt) {
+                        // Disconnect target client with reasonid=6 (Banned)
+                        let mut notify = Command::new("notifyclientleftview");
+                        notify.set("clid", target_clid.to_string());
+                        notify.set("cfid", old_cid.to_string());
+                        notify.set("ctid", "0");
+                        notify.set("reasonid", "6");
+                        notify.set("bantime", duration.to_string());
+                        notify.set("reasonmsg", ban_reason);
+                        notify.set("invokerid", clid.to_string());
+                        notify.set("invokername", &invoker_nickname);
+                        notify.set("invokeruid", &invoker_uid);
 
-                            {
-                                let mut state = self.state.lock().await;
-                                if let Some(c) = state.clients.get_mut(&target_ep) {
-                                    c.handshake_phase = HandshakePhase::Disconnected;
-                                    c.disconnect_time = Some(std::time::Instant::now());
-                                }
+                        // Send to banned client first
+                        let _ = self.send_encrypted_command(target_ep, &notify).await;
+
+                        {
+                            let mut state = self.state.lock().await;
+                            if let Some(c) = state.clients.get_mut(&target_ep) {
+                                c.handshake_phase = HandshakePhase::Disconnected;
+                                c.disconnect_time = Some(std::time::Instant::now());
                             }
-                            let other_peers = self
-                                .watching_recipients(&[old_cid], Some(target_ep))
-                                .await;
+                        }
+                        let other_peers = self
+                            .watching_recipients(&[old_cid], Some(target_ep))
+                            .await;
 
+                        for ep in &other_peers {
+                            let _ = self.send_encrypted_command(*ep, &notify).await;
+                        }
+                        {
+                            let mut state = self.state.lock().await;
                             for ep in &other_peers {
-                                let _ = self.send_encrypted_command(*ep, &notify).await;
-                            }
-                            {
-                                let mut state = self.state.lock().await;
-                                for ep in &other_peers {
-                                    if let Some(c) = state.get_client_mut(ep) {
-                                        c.known_clients.remove(&target_clid);
-                                    }
+                                if let Some(c) = state.get_client_mut(ep) {
+                                    c.known_clients.remove(&target_clid);
                                 }
                             }
-
-                            info!(
-                                "Client {} banned {} ({}) ban_id={}",
-                                clid, target_clid, target_nick, ban_id
-                            );
-                            self.broadcast_server_updated(None).await;
-                        } else {
-                            info!(
-                                "Client {} added ban for uid {} ban_id={}",
-                                clid, target_uid_param, ban_id
-                            );
                         }
 
-                        err_resp.set("id", "0");
-                        err_resp.set("msg", "ok");
-                        err_resp.set("banid", ban_id.to_string());
+                        info!(
+                            "Client {} banned {} ({}) ban_id={}",
+                            clid, target_clid, target_nick, ban_id
+                        );
+                        self.broadcast_server_updated(None).await;
+                    } else {
+                        info!(
+                            "Client {} added ban for uid {} ban_id={}",
+                            clid, target_uid_param, ban_id
+                        );
                     }
+
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                    err_resp.set("banid", ban_id.to_string());
                 }
 
                 if let Some(rc) = cmd.get("return_code") {
@@ -6367,18 +6992,35 @@ impl Server {
                 let duration: i64 = cmd.get("time").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let ban_reason = cmd.get("banreason").unwrap_or("");
 
-                let (invoker_nickname, invoker_uid, is_admin) = {
+                let (invoker_nickname, invoker_uid, caller_cid) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
-                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.current_channel_id))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), 0))
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
-                    err_resp.set("id", "2563");
+                let (can_ban, failed_permid) = {
+                    let db = self.db.lock().await;
+                    if !permissions::has_permission(&db, &invoker_uid, caller_cid, "b_client_ban_create") {
+                        (false, 212)
+                    } else if duration > 0 {
+                        let max_time = permissions::get_power(&db, &invoker_uid, caller_cid, "i_client_ban_max_bantime");
+                        if max_time != -1 && (max_time == 0 || duration > max_time) {
+                            (false, 215)
+                        } else {
+                            (true, 0)
+                        }
+                    } else {
+                        (true, 0)
+                    }
+                };
+
+                if !can_ban {
+                    err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", failed_permid.to_string());
                 } else if ip.is_empty() && uid_param.is_empty() && name_param.is_empty() {
                     err_resp.set("id", "1024");
                     err_resp.set("msg", "parameter not found");
@@ -6467,15 +7109,21 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "banlist" => {
-                let is_admin = {
+                let (caller_uid, caller_cid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state.get_client(&peer).map(|c| (c.uid.clone(), c.current_channel_id)).unwrap_or_default()
+                };
+
+                let has_perm = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_ban_list")
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
-                    err_resp.set("id", "2563");
+                if !has_perm {
+                    err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "211");
                 } else {
                     let bans = {
                         let db = self.db.lock().await;
@@ -6511,15 +7159,21 @@ impl Server {
             }
             "bandel" => {
                 let ban_id: Option<u64> = cmd.get("banid").and_then(|v| v.parse().ok());
-                let is_admin = {
+                let (caller_uid, caller_cid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state.get_client(&peer).map(|c| (c.uid.clone(), c.current_channel_id)).unwrap_or_default()
+                };
+
+                let has_perm = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_ban_delete")
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
-                    err_resp.set("id", "2563");
+                if !has_perm {
+                    err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "214");
                 } else if let Some(ban_id) = ban_id {
                     let deleted = {
                         let db = self.db.lock().await;
@@ -6543,15 +7197,21 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "bandelall" => {
-                let is_admin = {
+                let (caller_uid, caller_cid) = {
                     let state = self.state.lock().await;
-                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    state.get_client(&peer).map(|c| (c.uid.clone(), c.current_channel_id)).unwrap_or_default()
+                };
+
+                let has_perm = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_ban_delete")
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
-                    err_resp.set("id", "2563");
+                if !has_perm {
+                    err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "214");
                 } else {
                     let db = self.db.lock().await;
                     let _ = db.delete_all_bans();
@@ -6594,62 +7254,92 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "logview" => {
-                let instance = cmd.get("instance").map(|v| v == "1").unwrap_or(false);
-                let log_entry = if instance {
-                    "2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |TeamSpeak 3 Server 3.13.8 (2026-05-27 09:34:31)\n2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |SystemInformation: Linux 6.6.0 x86_64 Binary: 64bit\n2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |Server version: 3.13.8, build: 1685172871"
-                } else {
-                    "2026-10-26 08:00:00.000000|INFO    |VirtualServerBase|1  |listening on 0.0.0.0:9988\n2026-10-26 08:00:00.000000|INFO    |VirtualServer |1  |server started\n2026-10-26 08:00:00.000000|INFO    |CIDRManager   |   |registered 0 CIDR blocks"
+                let (caller_uid, caller_cid) = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| (c.uid.clone(), c.current_channel_id)).unwrap_or_default()
                 };
-                let mut log_resp = Command::new("notifyserverlog");
-                log_resp.set("last_pos", log_entry.len().to_string());
-                log_resp.set("file_size", log_entry.len().to_string());
-                log_resp.set("l", log_entry);
-                self.send_encrypted_command(peer, &log_resp).await?;
-
-                let mut log_query_resp = Command::new("logview");
-                log_query_resp.set("last_pos", log_entry.len().to_string());
-                log_query_resp.set("file_size", log_entry.len().to_string());
-                log_query_resp.set("l", log_entry);
-                self.send_encrypted_command(peer, &log_query_resp).await?;
+                let has_perm = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_virtualserver_log_view")
+                };
 
                 let mut err_resp = Command::new("error");
-                err_resp.set("id", "0");
-                err_resp.set("msg", "ok");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "44");
+                } else {
+                    let instance = cmd.get("instance").map(|v| v == "1").unwrap_or(false);
+                    let log_entry = if instance {
+                        "2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |TeamSpeak 3 Server 3.13.8 (2026-05-27 09:34:31)\n2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |SystemInformation: Linux 6.6.0 x86_64 Binary: 64bit\n2026-10-26 08:00:00.000000|INFO    |ServerLibPriv |   |Server version: 3.13.8, build: 1685172871"
+                    } else {
+                        "2026-10-26 08:00:00.000000|INFO    |VirtualServerBase|1  |listening on 0.0.0.0:9988\n2026-10-26 08:00:00.000000|INFO    |VirtualServer |1  |server started\n2026-10-26 08:00:00.000000|INFO    |CIDRManager   |   |registered 0 CIDR blocks"
+                    };
+                    let mut log_resp = Command::new("notifyserverlog");
+                    log_resp.set("last_pos", log_entry.len().to_string());
+                    log_resp.set("file_size", log_entry.len().to_string());
+                    log_resp.set("l", log_entry);
+                    self.send_encrypted_command(peer, &log_resp).await?;
+
+                    let mut log_query_resp = Command::new("logview");
+                    log_query_resp.set("last_pos", log_entry.len().to_string());
+                    log_query_resp.set("file_size", log_entry.len().to_string());
+                    log_query_resp.set("l", log_entry);
+                    self.send_encrypted_command(peer, &log_query_resp).await?;
+
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "complainlist" => {
-                let tcldbid = cmd.get("tcldbid").and_then(|v| v.parse::<u64>().ok());
-                let complaints = {
+                let (caller_uid, caller_cid) = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| (c.uid.clone(), c.current_channel_id)).unwrap_or_default()
+                };
+                let has_perm = {
                     let db = self.db.lock().await;
-                    db.get_complaints(tcldbid).unwrap_or_default()
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_complain_list")
                 };
 
                 let mut err_resp = Command::new("error");
-                if complaints.is_empty() {
-                    err_resp.set("id", "1281");
-                    err_resp.set("msg", "database empty result set");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "208");
                 } else {
-                    let parts: Vec<String> = complaints
-                        .iter()
-                        .map(|c| {
-                            format!(
-                                "tcldbid={} tname={} fcldbid={} fname={} message={} timestamp={}",
-                                c.tcldbid,
-                                crate::command::escape(&c.tname),
-                                c.fcldbid,
-                                crate::command::escape(&c.fname),
-                                crate::command::escape(&c.message),
-                                c.timestamp
-                            )
-                        })
-                        .collect();
-                    let wire = format!("notifycomplainlist {}", parts.join("|"));
-                    self.send_encrypted_raw(peer, &wire).await?;
-                    err_resp.set("id", "0");
-                    err_resp.set("msg", "ok");
+                    let tcldbid = cmd.get("tcldbid").and_then(|v| v.parse::<u64>().ok());
+                    let complaints = {
+                        let db = self.db.lock().await;
+                        db.get_complaints(tcldbid).unwrap_or_default()
+                    };
+
+                    if complaints.is_empty() {
+                        err_resp.set("id", "1281");
+                        err_resp.set("msg", "database empty result set");
+                    } else {
+                        let parts: Vec<String> = complaints
+                            .iter()
+                            .map(|c| {
+                                format!(
+                                    "tcldbid={} tname={} fcldbid={} fname={} message={} timestamp={}",
+                                    c.tcldbid,
+                                    crate::command::escape(&c.tname),
+                                    c.fcldbid,
+                                    crate::command::escape(&c.fname),
+                                    crate::command::escape(&c.message),
+                                    c.timestamp
+                                )
+                            })
+                            .collect();
+                        let wire = format!("notifycomplainlist {}", parts.join("|"));
+                        self.send_encrypted_raw(peer, &wire).await?;
+                        err_resp.set("id", "0");
+                        err_resp.set("msg", "ok");
+                    }
                 }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
@@ -6663,21 +7353,21 @@ impl Server {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
                 let message = cmd.get("message").unwrap_or("");
-                let (caller_nick, caller_cldbid) = {
+                let (caller_nick, caller_uid, caller_cid, caller_cldbid) = {
                     let state = self.state.lock().await;
                     match state.get_client(&peer) {
-                        Some(c) => (c.nickname.clone(), c.clid as u64),
-                        None => ("User".to_string(), clid as u64),
+                        Some(c) => (c.nickname.clone(), c.uid.clone(), c.current_channel_id, c.clid as u64),
+                        None => ("User".to_string(), String::new(), 0, clid as u64),
                     }
                 };
-                let target_name = {
+                let (target_name, target_uid, target_cid) = {
                     let state = self.state.lock().await;
                     state
                         .clients
                         .values()
                         .find(|c| c.clid as u64 == tcldbid)
-                        .map(|c| c.nickname.clone())
-                        .unwrap_or_else(|| "Target".to_string())
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.current_channel_id))
+                        .unwrap_or_else(|| ("Target".to_string(), String::new(), 0))
                 };
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -6685,7 +7375,24 @@ impl Server {
                     .as_secs();
 
                 let mut err_resp = Command::new("error");
-                if tcldbid == 0 || message.is_empty() {
+                let can_complain = {
+                    let db = self.db.lock().await;
+                    permissions::check_target_power(
+                        &db,
+                        &caller_uid,
+                        &target_uid,
+                        caller_cid,
+                        target_cid,
+                        "i_client_complain_power",
+                        "i_client_needed_complain_power",
+                    )
+                };
+
+                if !can_complain {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "207"); // i_client_needed_complain_power
+                } else if tcldbid == 0 || message.is_empty() {
                     err_resp.set("id", "1538");
                     err_resp.set("msg", "invalid parameter");
                 } else {
@@ -6709,9 +7416,32 @@ impl Server {
             "complaindel" => {
                 let tcldbid: u64 = cmd.get("tcldbid").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let fcldbid: u64 = cmd.get("fcldbid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let (caller_uid, caller_cid, caller_cldbid) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.current_channel_id, c.clid as u64))
+                        .unwrap_or_default()
+                };
+
+                let (can_del, failed_permid) = {
+                    let db = self.db.lock().await;
+                    if fcldbid == caller_cldbid {
+                        let ok = permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_complain_delete_own")
+                            || permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_complain_delete");
+                        (ok, 209)
+                    } else {
+                        let ok = permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_complain_delete");
+                        (ok, 210)
+                    }
+                };
 
                 let mut err_resp = Command::new("error");
-                if tcldbid == 0 || fcldbid == 0 {
+                if !can_del {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", failed_permid.to_string());
+                } else if tcldbid == 0 || fcldbid == 0 {
                     err_resp.set("id", "1538");
                     err_resp.set("msg", "invalid parameter");
                 } else {
@@ -6727,9 +7457,25 @@ impl Server {
             }
             "complaindelall" => {
                 let tcldbid: u64 = cmd.get("tcldbid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let (caller_uid, caller_cid) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.current_channel_id))
+                        .unwrap_or_default()
+                };
+
+                let can_del = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_client_complain_delete")
+                };
 
                 let mut err_resp = Command::new("error");
-                if tcldbid == 0 {
+                if !can_del {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "210");
+                } else if tcldbid == 0 {
                     err_resp.set("id", "1538");
                     err_resp.set("msg", "invalid parameter");
                 } else {
@@ -6750,11 +7496,11 @@ impl Server {
                 let tcid: u64 = cmd.get("tcid").or_else(|| cmd.get("target_channel")).and_then(|v| v.parse().ok()).unwrap_or(0);
                 let tcpw = cmd.get("tcpw").or_else(|| cmd.get("target_channel_pw")).unwrap_or("");
 
-                let (caller_uid, caller_nick) = {
+                let (caller_uid, caller_nick, caller_cid) = {
                     let state = self.state.lock().await;
                     match state.get_client(&peer) {
-                        Some(c) => (c.uid.clone(), c.nickname.clone()),
-                        None => (String::new(), "User".to_string()),
+                        Some(c) => (c.uid.clone(), c.nickname.clone(), c.current_channel_id),
+                        None => (String::new(), "User".to_string(), 0),
                     }
                 };
                 let now = std::time::SystemTime::now()
@@ -6762,8 +7508,17 @@ impl Server {
                     .unwrap_or_default()
                     .as_secs();
 
+                let can_add = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_virtualserver_modify_temporary_passwords")
+                };
+
                 let mut err_resp = Command::new("error");
-                if pw.is_empty() {
+                if !can_add {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "77");
+                } else if pw.is_empty() {
                     err_resp.set("id", "1538");
                     err_resp.set("msg", "invalid parameter");
                 } else {
@@ -6797,9 +7552,23 @@ impl Server {
             }
             "servertemppassworddel" => {
                 let pw = cmd.get("pw").or_else(|| cmd.get("password")).unwrap_or("");
+                let (caller_uid, caller_cid) = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| (c.uid.clone(), c.current_channel_id)).unwrap_or_default()
+                };
+
+                let can_del = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_virtualserver_modify_temporary_passwords")
+                        || permissions::has_permission(&db, &caller_uid, caller_cid, "b_virtualserver_modify_temporary_passwords_own")
+                };
 
                 let mut err_resp = Command::new("error");
-                if pw.is_empty() {
+                if !can_del {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "77");
+                } else if pw.is_empty() {
                     err_resp.set("id", "1538");
                     err_resp.set("msg", "invalid parameter");
                 } else {
@@ -6814,36 +7583,52 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "servertemppasswordlist" => {
-                let passwords = {
+                let (caller_uid, caller_cid) = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| (c.uid.clone(), c.current_channel_id)).unwrap_or_default()
+                };
+
+                let can_list = {
                     let db = self.db.lock().await;
-                    db.get_temp_passwords().unwrap_or_default()
+                    permissions::has_permission(&db, &caller_uid, caller_cid, "b_virtualserver_modify_temporary_passwords")
                 };
 
                 let mut err_resp = Command::new("error");
-                if passwords.is_empty() {
-                    err_resp.set("id", "1281");
-                    err_resp.set("msg", "database empty result set");
+                if !can_list {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "77");
                 } else {
-                    let parts: Vec<String> = passwords
-                        .iter()
-                        .map(|p| {
-                            format!(
-                                "nickname={} uid={} desc={} pw_clear={} start={} end={} tcid={} tcpw={}",
-                                crate::command::escape(&p.client_nickname),
-                                crate::command::escape(&p.client_uid),
-                                crate::command::escape(&p.description),
-                                crate::command::escape(&p.password),
-                                p.timestamp_start,
-                                p.timestamp_end,
-                                p.target_channel_id,
-                                crate::command::escape(&p.target_channel_pw)
-                            )
-                        })
-                        .collect();
-                    let payload = parts.join("|");
-                    self.send_encrypted_raw(peer, &format!("notifyservertemppasswordlist {}", payload)).await?;
-                    err_resp.set("id", "0");
-                    err_resp.set("msg", "ok");
+                    let passwords = {
+                        let db = self.db.lock().await;
+                        db.get_temp_passwords().unwrap_or_default()
+                    };
+
+                    if passwords.is_empty() {
+                        err_resp.set("id", "1281");
+                        err_resp.set("msg", "database empty result set");
+                    } else {
+                        let parts: Vec<String> = passwords
+                            .iter()
+                            .map(|p| {
+                                format!(
+                                    "nickname={} uid={} desc={} pw_clear={} start={} end={} tcid={} tcpw={}",
+                                    crate::command::escape(&p.client_nickname),
+                                    crate::command::escape(&p.client_uid),
+                                    crate::command::escape(&p.description),
+                                    crate::command::escape(&p.password),
+                                    p.timestamp_start,
+                                    p.timestamp_end,
+                                    p.target_channel_id,
+                                    crate::command::escape(&p.target_channel_pw)
+                                )
+                            })
+                            .collect();
+                        let payload = parts.join("|");
+                        self.send_encrypted_raw(peer, &format!("notifyservertemppasswordlist {}", payload)).await?;
+                        err_resp.set("id", "0");
+                        err_resp.set("msg", "ok");
+                    }
                 }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);

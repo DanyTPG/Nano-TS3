@@ -2856,6 +2856,7 @@ async fn test_voice_relay_and_audio_fidelity() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let db = Database::in_memory().expect("failed to open in-memory db");
+    db.set_server_group_perm(8, "b_virtualserver_log_view", 1, false, false).unwrap();
     let admin_token = db
         .get_or_create_initial_admin_token()
         .expect("token error")
@@ -3199,6 +3200,10 @@ async fn test_privilege_key_prompt_only_when_no_admin() {
 #[tokio::test]
 async fn test_complaints_list_crud_wire() {
     let db = Database::in_memory().expect("db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
     let server = Server::bind("127.0.0.1:0", db).await.expect("bind");
     let server_addr = server.local_addr().expect("local addr");
     let server_handle = tokio::spawn(async move {
@@ -3206,6 +3211,11 @@ async fn test_complaints_list_crud_wire() {
     });
 
     let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
     let user = ClientSession::connect(server_addr, "TargetUser").await;
 
     // 1. Initial complainlist on empty database: must return error 1281 (empty result set), not crash/disconnect!
@@ -3248,6 +3258,10 @@ async fn test_complaints_list_crud_wire() {
 #[tokio::test]
 async fn test_server_password_and_temp_password_flow() {
     let db = Database::in_memory().expect("db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
     // Seed server password
     db.set_property("virtualserver_flag_password", "1").unwrap();
     db.set_property("virtualserver_password", "MySecretPassword").unwrap();
@@ -3271,6 +3285,12 @@ async fn test_server_password_and_temp_password_flow() {
     // 3. Connect with correct server password -> Successfully connected!
     let mut auth_client = ClientSession::connect_with_options(server_addr, "AuthUser", None, Some("MySecretPassword"), None, None).await;
     assert_ne!(auth_client.clid, 0, "Client with correct password must connect");
+
+    // Upgrade auth_client to Server Admin with token
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    auth_client.send_command(&token_cmd).await;
+    let _ = auth_client.recv_until("error", Duration::from_secs(2)).await;
 
     // 4. Temporary Server Password: Add
     let mut temp_add = Command::new("servertemppasswordadd");
@@ -3464,6 +3484,137 @@ async fn test_channel_needed_subscribe_power_enforcement() {
         Some("142"),
         "Failed permid must be 142 (i_channel_needed_subscribe_power)"
     );
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_poke_and_private_message_and_channel_delete_power_enforcement() {
+    let db = Database::in_memory().expect("db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // 1. Admin connects and redeems token
+    let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    assert_ne!(admin.clid, 0);
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // 2. Guest connects (group 8)
+    let mut guest = ClientSession::connect(server_addr, "GuestUser").await;
+    assert_ne!(guest.clid, 0);
+
+    // 3. Guest pokes Admin: Admin needed poke power 75 > Guest poke power 0 -> Rejected (2568, failed_permid 224)
+    let mut poke_cmd = Command::new("clientpoke");
+    poke_cmd.set("clid", admin.clid.to_string());
+    poke_cmd.set("msg", "Hey Admin");
+    guest.send_command(&poke_cmd).await;
+    let poke_err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("poke error");
+    assert_eq!(poke_err.get("id"), Some("2568"));
+    assert_eq!(poke_err.get("failed_permid"), Some("224"));
+
+    // 4. Admin pokes Guest: Admin poke power 75 >= Guest needed poke power 0 -> Allowed (id=0)
+    let mut admin_poke = Command::new("clientpoke");
+    admin_poke.set("clid", guest.clid.to_string());
+    admin_poke.set("msg", "Hello Guest");
+    admin.send_command(&admin_poke).await;
+    let poke_ok = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("poke ok");
+    assert_eq!(poke_ok.get("id"), Some("0"));
+    let notify_poke = guest
+        .recv_until("notifyclientpoke", Duration::from_secs(2))
+        .await
+        .expect("guest notifyclientpoke");
+    assert_eq!(notify_poke.get("msg"), Some("Hello Guest"));
+
+    // 5. Guest sends PM to Admin: Admin needed pm power 75 > Guest pm power 0 -> Rejected (2568, failed_permid 217)
+    let mut pm_cmd = Command::new("sendtextmessage");
+    pm_cmd.set("targetmode", "1");
+    pm_cmd.set("target", admin.clid.to_string());
+    pm_cmd.set("msg", "Secret message");
+    guest.send_command(&pm_cmd).await;
+    let pm_err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("pm error");
+    assert_eq!(pm_err.get("id"), Some("2568"));
+    assert_eq!(pm_err.get("failed_permid"), Some("217"));
+
+    // 6. Admin sends PM to Guest: Admin pm power 75 >= Guest needed pm power 0 -> Allowed (id=0)
+    let mut admin_pm = Command::new("sendtextmessage");
+    admin_pm.set("targetmode", "1");
+    admin_pm.set("target", guest.clid.to_string());
+    admin_pm.set("msg", "Welcome to the server");
+    admin.send_command(&admin_pm).await;
+    let pm_ok = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin pm ok");
+    assert_eq!(pm_ok.get("id"), Some("0"));
+    let notify_pm = guest
+        .recv_until("notifytextmessage", Duration::from_secs(2))
+        .await
+        .expect("guest notifytextmessage");
+    assert_eq!(notify_pm.get("msg"), Some("Welcome to the server"));
+
+    // 7. Channel delete power check:
+    // Admin creates permanent channel
+    let mut create_ch = Command::new("channelcreate");
+    create_ch.set("channel_name", "SecuredChannel");
+    create_ch.set("channel_flag_permanent", "1");
+    admin.send_command(&create_ch).await;
+    let ch_created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let cid = ch_created.get("cid").expect("cid").to_string();
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // Guest attempts to delete SecuredChannel with force=1: Guest lacks b_channel_delete_flag_force -> Rejected (2568, failed_permid 131)
+    let mut del_ch = Command::new("channeldelete");
+    del_ch.set("cid", &cid);
+    del_ch.set("force", "1");
+    guest.send_command(&del_ch).await;
+    let del_err1 = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("delete channel error");
+    assert_eq!(del_err1.get("id"), Some("2568"));
+    assert_eq!(del_err1.get("failed_permid"), Some("131"));
+
+    // Guest attempts to delete permanent channel without force: Guest lacks b_channel_delete_permanent -> Rejected (2568, failed_permid 128)
+    let mut del_no_force = Command::new("channeldelete");
+    del_no_force.set("cid", &cid);
+    guest.send_command(&del_no_force).await;
+    let del_err2 = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("delete channel error");
+    assert_eq!(del_err2.get("id"), Some("2568"));
+    assert_eq!(del_err2.get("failed_permid"), Some("128"));
+
+    // Admin deletes SecuredChannel: Admin has b_channel_delete_flag_force and b_channel_delete_permanent -> Allowed (id=0)
+    admin.send_command(&del_ch).await;
+    let del_ok = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin delete channel ok");
+    assert_eq!(del_ok.get("id"), Some("0"));
 
     server_handle.abort();
 }
