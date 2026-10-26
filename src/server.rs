@@ -15,7 +15,7 @@ use crate::command::Command;
 use crate::crypto::*;
 use crate::database::{BanRecord, ChannelEdit, ChannelRecord, Database};
 use crate::permissions;
-use crate::state::{ClientAudioState, HandshakePhase, ServerState, IDLE_TIMEOUT};
+use crate::state::{ClientAudioState, FloodAction, HandshakePhase, ServerState, IDLE_TIMEOUT};
 
 pub struct Server {
     socket: Arc<UdpSocket>,
@@ -955,6 +955,18 @@ impl Server {
             self.broadcast_client_left(gone_clid, gone_cid, "3", "connection lost")
                 .await;
         }
+
+        let tick_reduce = {
+            let db = self.db.lock().await;
+            db.get_all_properties()
+                .ok()
+                .and_then(|p| p.get("virtualserver_antiflood_points_tick_reduce").and_then(|v| v.parse().ok()))
+                .unwrap_or(5)
+        };
+        {
+            let mut state = self.state.lock().await;
+            state.decay_and_prune_flood(tick_reduce);
+        }
     }
 
     /// Endpoints of connected clients that watch any of `cids` (through
@@ -1163,6 +1175,14 @@ impl Server {
     }
 
     async fn handle_packet(&self, peer: SocketAddr, data: &[u8]) -> Result<(), String> {
+        let is_banned = {
+            let mut state = self.state.lock().await;
+            state.is_ip_banned(&peer.ip())
+        };
+        if is_banned {
+            return Err(format!("IP {} is temporarily banned due to flooding", peer.ip()));
+        }
+
         let in_pkt = match InPacket::try_new(Direction::C2S, data) {
             Ok(pkt) => pkt,
             Err(e) => return Err(format!("Invalid packet from {}: {:?}", peer, e)),
@@ -1579,6 +1599,26 @@ impl Server {
         Ok(())
     }
 
+    fn command_flood_cost(cmd_name: &str) -> u32 {
+        match cmd_name {
+            // Handshake commands cost nothing
+            "clientinit" | "clientinitiv" | "clientek" => 0,
+            // Lightweight queries
+            "channelsubscribeall" | "clientgetvariables" | "servergetvariables" => 2,
+            // Heavy queries
+            "permissionlist"
+            | "servergrouplist"
+            | "channelgrouplist"
+            | "servergrouppermlist"
+            | "channelgrouppermlist"
+            | "logview"
+            | "complainlist"
+            | "servertemppasswordlist" => 15,
+            // Standard commands
+            _ => 6,
+        }
+    }
+
     async fn dispatch_command(
         &self,
         peer: SocketAddr,
@@ -1586,6 +1626,99 @@ impl Server {
         cmd: Command,
     ) -> Result<(), String> {
         info!("Dispatching command '{}' for clid {}", cmd.name, clid);
+
+        let cost = Self::command_flood_cost(&cmd.name);
+        if cost > 0 {
+            let (caller_uid, is_admin) = {
+                let state = self.state.lock().await;
+                state
+                    .get_client(&peer)
+                    .map(|c| (c.uid.clone(), c.is_admin))
+                    .unwrap_or_default()
+            };
+            let has_bypass = is_admin || {
+                let db = self.db.lock().await;
+                permissions::has_permission(&db, &caller_uid, 0, "b_client_ignore_antiflood")
+            };
+
+            let (tick_reduce, needed_cmd_block, needed_ip_block) = {
+                let db = self.db.lock().await;
+                let props = db.get_all_properties().unwrap_or_default();
+                let tr = props
+                    .get("virtualserver_antiflood_points_tick_reduce")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5);
+                let cb = props
+                    .get("virtualserver_antiflood_points_needed_command_block")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(150);
+                let ib = props
+                    .get("virtualserver_antiflood_points_needed_ip_block")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(250);
+                (tr, cb, ib)
+            };
+
+            let action = {
+                let mut state = self.state.lock().await;
+                state.check_and_accrue_flood(
+                    &peer,
+                    has_bypass,
+                    cost,
+                    tick_reduce,
+                    needed_cmd_block,
+                    needed_ip_block,
+                )
+            };
+
+            match action {
+                FloodAction::Ok => {}
+                FloodAction::CommandBlocked => {
+                    warn!(
+                        "Client {} at {} exceeded command flood threshold (cost {})",
+                        clid, peer, cost
+                    );
+                    let mut err_resp = Command::new("error");
+                    err_resp.set("id", "524");
+                    err_resp.set("msg", "client is flooding");
+                    err_resp.set("extra_msg", "flood prevention, please try again later");
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    let _ = self.send_encrypted_command(peer, &err_resp).await;
+                    return Ok(());
+                }
+                FloodAction::IpBanned(retry_secs) => {
+                    warn!(
+                        "Client {} at {} exceeded IP flood threshold, banning IP for {}s",
+                        clid, peer, retry_secs
+                    );
+                    let mut err_resp = Command::new("error");
+                    err_resp.set("id", "3329");
+                    err_resp.set("msg", "connection failed, you are banned");
+                    err_resp.set("extra_msg", format!("you may retry in {} seconds", retry_secs));
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    let _ = self.send_encrypted_command(peer, &err_resp).await;
+                    // Disconnect client session
+                    let (gone_clid, gone_cid) = {
+                        let mut state = self.state.lock().await;
+                        if let Some(c) = state.clients.remove(&peer) {
+                            (Some(c.clid), Some(c.current_channel_id))
+                        } else {
+                            (None, None)
+                        }
+                    };
+                    if let (Some(clid), Some(cid)) = (gone_clid, gone_cid) {
+                        self.broadcast_client_left(clid, cid, "3", "banned for flooding")
+                            .await;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         match cmd.name.as_str() {
             "clientinit" => {
                 let base_nickname = cmd.get("client_nickname").unwrap_or("User");
@@ -6552,20 +6685,20 @@ impl Server {
                         .iter()
                         .map(|p| {
                             format!(
-                                "pw={} desc={} nickname={} uid={} duration={} time_start={} time_end={} tcid={}",
-                                crate::command::escape(&p.password),
-                                crate::command::escape(&p.description),
+                                "nickname={} uid={} desc={} pw_clear={} start={} end={} tcid={} tcpw={}",
                                 crate::command::escape(&p.client_nickname),
                                 crate::command::escape(&p.client_uid),
-                                p.duration,
+                                crate::command::escape(&p.description),
+                                crate::command::escape(&p.password),
                                 p.timestamp_start,
                                 p.timestamp_end,
-                                p.target_channel_id
+                                p.target_channel_id,
+                                crate::command::escape(&p.target_channel_pw)
                             )
                         })
                         .collect();
-                    let wire = format!("notifyservertemppasswordlist {}", parts.join("|"));
-                    self.send_encrypted_raw(peer, &wire).await?;
+                    let payload = parts.join("|");
+                    self.send_encrypted_raw(peer, &format!("notifyservertemppasswordlist {}", payload)).await?;
                     err_resp.set("id", "0");
                     err_resp.set("msg", "ok");
                 }

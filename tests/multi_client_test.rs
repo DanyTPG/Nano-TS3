@@ -3285,7 +3285,14 @@ async fn test_server_password_and_temp_password_flow() {
     let temp_list_cmd = Command::new("servertemppasswordlist");
     auth_client.send_command(&temp_list_cmd).await;
     let notify_templist = auth_client.recv_until("notifyservertemppasswordlist", Duration::from_secs(2)).await.expect("temp list notify");
-    assert!(notify_templist.build().contains("EventGuest123"));
+    assert_eq!(notify_templist.get("pw_clear"), Some("EventGuest123"));
+    assert!(notify_templist.get("nickname").is_some());
+    assert!(notify_templist.get("uid").is_some());
+    assert_eq!(notify_templist.get("desc"), Some("Tournament Pass"));
+    assert!(notify_templist.get("start").is_some());
+    assert!(notify_templist.get("end").is_some());
+    assert_eq!(notify_templist.get("tcid"), Some("0"));
+    assert_eq!(notify_templist.get("tcpw"), Some(""));
     let temp_list_ok = auth_client.recv_until("error", Duration::from_secs(2)).await.expect("temp list ok");
     assert_eq!(temp_list_ok.get("id"), Some("0"));
 
@@ -3346,6 +3353,60 @@ async fn test_reconnect_ghost_eviction_and_default_channel() {
     ).await;
     assert_ne!(client2.clid, 0);
     assert_eq!(client2.current_channel_id, 2);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_anti_flood_command_throttling_and_ip_ban() {
+    let db = Database::in_memory().expect("db");
+    // Configure tight anti-flood thresholds for testing
+    db.set_property("virtualserver_antiflood_points_needed_command_block", "30").unwrap();
+    db.set_property("virtualserver_antiflood_points_needed_ip_block", "60").unwrap();
+    db.set_property("virtualserver_antiflood_points_tick_reduce", "1").unwrap();
+
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind");
+    let server_addr = server.local_addr().expect("local addr");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // 1. Connect guest client
+    let mut guest = ClientSession::connect(server_addr, "GuestUser").await;
+    assert_ne!(guest.clid, 0);
+
+    // 2. Guest sends a heavy query command (cost 15): 1st call -> 15 points (under 30) -> Ok
+    let cmd1 = Command::new("permissionlist");
+    guest.send_command(&cmd1).await;
+    let ok1 = guest.recv_until("error", Duration::from_secs(2)).await.expect("cmd1 reply");
+    assert_eq!(ok1.get("id"), Some("0"));
+
+    // 3. Guest sends 2nd heavy query command (cost 15): total 30 points >= 30 -> CommandBlocked!
+    let cmd2 = Command::new("permissionlist");
+    guest.send_command(&cmd2).await;
+    let flood_err = guest.recv_until("error", Duration::from_secs(2)).await.expect("cmd2 reply");
+    assert_eq!(flood_err.get("id"), Some("524"), "Command block error must be 524");
+    assert_eq!(flood_err.get("msg"), Some("client is flooding"));
+
+    // 4. Guest sends more commands to reach IP block (cost 15 + 15 = 30 more -> total 60 >= 60)
+    let cmd3 = Command::new("permissionlist");
+    guest.send_command(&cmd3).await;
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+
+    let cmd4 = Command::new("permissionlist");
+    guest.send_command(&cmd4).await;
+    let ban_err = guest.recv_until("error", Duration::from_secs(2)).await.expect("cmd4 reply");
+    assert_eq!(ban_err.get("id"), Some("3329"), "IP ban error must be 3329");
+    assert_eq!(ban_err.get("msg"), Some("connection failed, you are banned"));
+
+    // 5. Subsequent connection from this IP is rejected early (packets dropped)
+    let probe_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    probe_sock.connect(server_addr).await.unwrap();
+    let init0 = OutC2SInit0::new(0, 0, [1, 2, 3, 4]);
+    probe_sock.send(&init0.into_vec()).await.unwrap();
+    let mut buf = [0u8; 1024];
+    let res = timeout(Duration::from_millis(500), probe_sock.recv(&mut buf)).await;
+    assert!(res.is_err(), "Banned IP must be dropped with no response");
 
     server_handle.abort();
 }

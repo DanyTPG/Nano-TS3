@@ -46,6 +46,8 @@ pub struct ClientSession {
     pub uid: String,
     pub away: bool,
     pub away_message: String,
+    pub flood_points: u32,
+    pub last_flood_decay: std::time::Instant,
     pub disconnect_time: Option<std::time::Instant>,
     pub connected_time: std::time::Instant,
 
@@ -110,6 +112,8 @@ impl ClientSession {
             is_admin: false,
             away: false,
             away_message: String::new(),
+            flood_points: 0,
+            last_flood_decay: std::time::Instant::now(),
             handshake_phase: HandshakePhase::Init0Received,
             server_secret,
             r0_reversed: [0u8; 4],
@@ -143,7 +147,16 @@ pub struct ServerState {
     /// (target clid -> watchers). Populated by `getconnectioninfo` and
     /// pruned whenever sessions disappear.
     pub connection_watchers: HashMap<u16, BTreeSet<SocketAddr>>,
+    pub ip_flood_points: HashMap<std::net::IpAddr, (u32, std::time::Instant)>,
+    pub temp_banned_ips: HashMap<std::net::IpAddr, std::time::Instant>,
     next_clid: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloodAction {
+    Ok,
+    CommandBlocked,
+    IpBanned(u64),
 }
 
 /// A connected client that has not sent a single packet (command, ping, pong,
@@ -157,6 +170,8 @@ impl ServerState {
         Self {
             clients: HashMap::new(),
             connection_watchers: HashMap::new(),
+            ip_flood_points: HashMap::new(),
+            temp_banned_ips: HashMap::new(),
             next_clid: 2,
         }
     }
@@ -250,6 +265,100 @@ impl ServerState {
             .count()
     }
 
+    pub fn is_ip_banned(&mut self, ip: &std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        if let Some(&expires) = self.temp_banned_ips.get(ip) {
+            if now < expires {
+                return true;
+            } else {
+                self.temp_banned_ips.remove(ip);
+            }
+        }
+        false
+    }
+
+    pub fn check_and_accrue_flood(
+        &mut self,
+        endpoint: &SocketAddr,
+        bypass: bool,
+        cost: u32,
+        tick_reduce: u32,
+        needed_command_block: u32,
+        needed_ip_block: u32,
+    ) -> FloodAction {
+        if bypass || cost == 0 {
+            return FloodAction::Ok;
+        }
+
+        let now = std::time::Instant::now();
+        let ip = endpoint.ip();
+
+        if self.is_ip_banned(&ip) {
+            return FloodAction::IpBanned(300);
+        }
+
+        // Accrue per-IP flood points
+        let ip_entry = self.ip_flood_points.entry(ip).or_insert((0, now));
+        let ip_elapsed = now.duration_since(ip_entry.1).as_secs();
+        if ip_elapsed > 0 {
+            let decay = (ip_elapsed as u32).saturating_mul(tick_reduce);
+            ip_entry.0 = ip_entry.0.saturating_sub(decay);
+            ip_entry.1 += std::time::Duration::from_secs(ip_elapsed);
+        }
+        ip_entry.0 = ip_entry.0.saturating_add(cost);
+        let current_ip_points = ip_entry.0;
+
+        if current_ip_points >= needed_ip_block {
+            let ban_duration = std::time::Duration::from_secs(300);
+            self.temp_banned_ips.insert(ip, now + ban_duration);
+            return FloodAction::IpBanned(300);
+        }
+
+        // Accrue per-client flood points
+        if let Some(client) = self.clients.get_mut(endpoint) {
+            let client_elapsed = now.duration_since(client.last_flood_decay).as_secs();
+            if client_elapsed > 0 {
+                let decay = (client_elapsed as u32).saturating_mul(tick_reduce);
+                client.flood_points = client.flood_points.saturating_sub(decay);
+                client.last_flood_decay += std::time::Duration::from_secs(client_elapsed);
+            }
+            client.flood_points = client.flood_points.saturating_add(cost);
+
+            if client.flood_points >= needed_command_block {
+                return FloodAction::CommandBlocked;
+            }
+        }
+
+        FloodAction::Ok
+    }
+
+    pub fn decay_and_prune_flood(&mut self, tick_reduce: u32) {
+        let now = std::time::Instant::now();
+        // Prune expired bans
+        self.temp_banned_ips.retain(|_, &mut expires| now < expires);
+
+        // Decay and retain non-zero IP flood points
+        self.ip_flood_points.retain(|_, (points, last_decay)| {
+            let elapsed = now.duration_since(*last_decay).as_secs();
+            if elapsed > 0 {
+                let decay = (elapsed as u32).saturating_mul(tick_reduce);
+                *points = points.saturating_sub(decay);
+                *last_decay += std::time::Duration::from_secs(elapsed);
+            }
+            *points > 0
+        });
+
+        // Decay connected clients
+        for client in self.clients.values_mut() {
+            let elapsed = now.duration_since(client.last_flood_decay).as_secs();
+            if elapsed > 0 {
+                let decay = (elapsed as u32).saturating_mul(tick_reduce);
+                client.flood_points = client.flood_points.saturating_sub(decay);
+                client.last_flood_decay += std::time::Duration::from_secs(elapsed);
+            }
+        }
+    }
+
     fn advance_clid(next: &mut u16) {
         *next = next.wrapping_add(1);
         if *next == 0 {
@@ -311,5 +420,37 @@ mod tests {
         let gone = state.cleanup_stale();
         assert!(gone.is_empty());
         assert!(state.clients.is_empty());
+    }
+
+    #[test]
+    fn flood_control_bypass_works() {
+        let mut state = ServerState::new();
+        let ep: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        state.reset_or_create_client(ep);
+
+        // Even with huge cost, bypass returns Ok and adds no points
+        let res = state.check_and_accrue_flood(&ep, true, 500, 5, 150, 250);
+        assert_eq!(res, FloodAction::Ok);
+        assert_eq!(state.get_client(&ep).unwrap().flood_points, 0);
+    }
+
+    #[test]
+    fn flood_control_blocks_command_and_bans_ip() {
+        let mut state = ServerState::new();
+        let ep: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        state.reset_or_create_client(ep);
+
+        // 100 points: below 150 -> Ok
+        let res = state.check_and_accrue_flood(&ep, false, 100, 5, 150, 250);
+        assert_eq!(res, FloodAction::Ok);
+
+        // Another 60 points: total 160 >= 150 command block, but < 250 IP block -> CommandBlocked
+        let res = state.check_and_accrue_flood(&ep, false, 60, 5, 150, 250);
+        assert_eq!(res, FloodAction::CommandBlocked);
+
+        // Another 100 points: IP total 260 >= 250 -> IpBanned
+        let res = state.check_and_accrue_flood(&ep, false, 100, 5, 150, 250);
+        assert_eq!(res, FloodAction::IpBanned(300));
+        assert!(state.is_ip_banned(&ep.ip()));
     }
 }

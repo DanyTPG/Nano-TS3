@@ -425,6 +425,18 @@ impl Database {
                 "Welcome to Nano-TS3 Server!"
             ],
         )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO server_properties (key, value) VALUES (?1, ?2)",
+            params!["virtualserver_antiflood_points_tick_reduce", "5"],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO server_properties (key, value) VALUES (?1, ?2)",
+            params!["virtualserver_antiflood_points_needed_command_block", "150"],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO server_properties (key, value) VALUES (?1, ?2)",
+            params!["virtualserver_antiflood_points_needed_ip_block", "250"],
+        )?;
 
         // Seed default server groups
         let sg_count: i64 = self
