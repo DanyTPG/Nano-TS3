@@ -98,6 +98,27 @@ pub struct PermRecord {
     pub perm_skip: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRecord {
+    pub token: String,
+    pub token_type: i32, // 0 = ServerGroup, 1 = ChannelGroup
+    pub token_id1: u64,  // sgid or cgid
+    pub token_id2: u64,  // 0 or cid
+    pub description: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermFindMatch {
+    pub tier: u8, // 0 = servergroup, 1 = client, 2 = channel, 3 = channelgroup, 4 = channelclient
+    pub id1: u64,
+    pub id2: u64,
+    pub perm_id: String,
+    pub perm_value: i64,
+    pub perm_negated: bool,
+    pub perm_skip: bool,
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -288,6 +309,24 @@ impl Database {
             if !existing_columns.contains(name) {
                 self.conn.execute_batch(&format!(
                     "ALTER TABLE channels ADD COLUMN {name} {declaration}"
+                ))?;
+            }
+        }
+
+        let existing_pk_columns = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(privilege_keys)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<Result<HashSet<_>, _>>()?
+        };
+        for (name, declaration) in [
+            ("token_type", "INTEGER NOT NULL DEFAULT 0"),
+            ("token_id1", "INTEGER NOT NULL DEFAULT 6"),
+            ("token_id2", "INTEGER NOT NULL DEFAULT 0"),
+            ("description", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !existing_pk_columns.contains(name) {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE privilege_keys ADD COLUMN {name} {declaration}"
                 ))?;
             }
         }
@@ -1345,6 +1384,362 @@ impl Database {
         }
         Ok(None)
     }
+
+    // --- Dynamic Group Management ---
+
+    /// Creates a new server group with the given name and group type (0=template, 1=regular, 2=query).
+    pub fn create_server_group(&self, name: &str, group_type: i32) -> Result<u64> {
+        let max_id: Option<i64> = self.conn.query_row(
+            "SELECT MAX(group_id) FROM groups_server",
+            [],
+            |row| row.get(0),
+        )?;
+        let new_id = (max_id.unwrap_or(0) + 1).max(10) as u64;
+        self.conn.execute(
+            "INSERT INTO groups_server (group_id, name, type, icon_id, save_db) VALUES (?1, ?2, ?3, 0, 1)",
+            params![new_id as i64, name, group_type],
+        )?;
+        Ok(new_id)
+    }
+
+    /// Deletes a server group. If `force` is false and members exist, returns `Ok(false)` without deleting.
+    /// Otherwise deletes members, permissions, and group record, returning `Ok(true)`.
+    pub fn delete_server_group(&self, sgid: u64, force: bool) -> Result<bool> {
+        if !force && (sgid == 6 || sgid == 7 || sgid == 8) {
+            return Ok(false);
+        }
+        let member_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM group_server_to_client WHERE group_id = ?1",
+            params![sgid as i64],
+            |row| row.get(0),
+        )?;
+        if member_count > 0 && !force {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "DELETE FROM group_server_to_client WHERE group_id = ?1",
+            params![sgid as i64],
+        )?;
+        self.conn.execute(
+            "DELETE FROM perm_server_group WHERE group_id = ?1",
+            params![sgid as i64],
+        )?;
+        self.conn.execute(
+            "DELETE FROM groups_server WHERE group_id = ?1",
+            params![sgid as i64],
+        )?;
+        Ok(true)
+    }
+
+    /// Renames an existing server group.
+    pub fn rename_server_group(&self, sgid: u64, new_name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE groups_server SET name = ?1 WHERE group_id = ?2",
+            params![new_name, sgid as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Copies all permissions from `source_sgid` to `target_sgid`. If `target_sgid` is 0,
+    /// a new server group named `target_name` with `group_type` is created.
+    pub fn copy_server_group(
+        &self,
+        source_sgid: u64,
+        target_sgid: u64,
+        target_name: &str,
+        group_type: i32,
+    ) -> Result<u64> {
+        let final_target_id = if target_sgid == 0 {
+            self.create_server_group(target_name, group_type)?
+        } else {
+            target_sgid
+        };
+        self.conn.execute(
+            "DELETE FROM perm_server_group WHERE group_id = ?1",
+            params![final_target_id as i64],
+        )?;
+        self.conn.execute(
+            "INSERT INTO perm_server_group (group_id, perm_id, perm_value, perm_negated, perm_skip) \
+             SELECT ?1, perm_id, perm_value, perm_negated, perm_skip FROM perm_server_group WHERE group_id = ?2",
+            params![final_target_id as i64, source_sgid as i64],
+        )?;
+        Ok(final_target_id)
+    }
+
+    /// Creates a new channel group with the given name and group type (0=template, 1=regular).
+    pub fn create_channel_group(&self, name: &str, group_type: i32) -> Result<u64> {
+        let max_id: Option<i64> = self.conn.query_row(
+            "SELECT MAX(group_id) FROM groups_channel",
+            [],
+            |row| row.get(0),
+        )?;
+        let new_id = (max_id.unwrap_or(0) + 1).max(10) as u64;
+        self.conn.execute(
+            "INSERT INTO groups_channel (group_id, name, type, icon_id, save_db) VALUES (?1, ?2, ?3, 0, 1)",
+            params![new_id as i64, name, group_type],
+        )?;
+        Ok(new_id)
+    }
+
+    /// Deletes a channel group. If `force` is false and assignments exist, returns `Ok(false)` without deleting.
+    pub fn delete_channel_group(&self, cgid: u64, force: bool) -> Result<bool> {
+        if !force && (cgid == 5 || cgid == 6 || cgid == 7 || cgid == 8) {
+            return Ok(false);
+        }
+        let member_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM group_channel_to_client WHERE group_id = ?1",
+            params![cgid as i64],
+            |row| row.get(0),
+        )?;
+        if member_count > 0 && !force {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "DELETE FROM group_channel_to_client WHERE group_id = ?1",
+            params![cgid as i64],
+        )?;
+        self.conn.execute(
+            "DELETE FROM perm_channel_groups WHERE group_id = ?1",
+            params![cgid as i64],
+        )?;
+        self.conn.execute(
+            "DELETE FROM groups_channel WHERE group_id = ?1",
+            params![cgid as i64],
+        )?;
+        Ok(true)
+    }
+
+    /// Renames an existing channel group.
+    pub fn rename_channel_group(&self, cgid: u64, new_name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE groups_channel SET name = ?1 WHERE group_id = ?2",
+            params![new_name, cgid as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Copies all permissions from `source_cgid` to `target_cgid`. If `target_cgid` is 0,
+    /// a new channel group named `target_name` with `group_type` is created.
+    pub fn copy_channel_group(
+        &self,
+        source_cgid: u64,
+        target_cgid: u64,
+        target_name: &str,
+        group_type: i32,
+    ) -> Result<u64> {
+        let final_target_id = if target_cgid == 0 {
+            self.create_channel_group(target_name, group_type)?
+        } else {
+            target_cgid
+        };
+        self.conn.execute(
+            "DELETE FROM perm_channel_groups WHERE group_id = ?1",
+            params![final_target_id as i64],
+        )?;
+        self.conn.execute(
+            "INSERT INTO perm_channel_groups (group_id, perm_id, perm_value, perm_negated, perm_skip) \
+             SELECT ?1, perm_id, perm_value, perm_negated, perm_skip FROM perm_channel_groups WHERE group_id = ?2",
+            params![final_target_id as i64, source_cgid as i64],
+        )?;
+        Ok(final_target_id)
+    }
+
+    // --- Token / Privilege Key CRUD ---
+
+    /// Creates a new privilege token for a server group or channel group.
+    pub fn add_token(
+        &self,
+        token: &str,
+        token_type: i32,
+        id1: u64,
+        id2: u64,
+        description: &str,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            "INSERT INTO privilege_keys (token, is_used, created_at, token_type, token_id1, token_id2, description) \
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6)",
+            params![token, now, token_type, id1 as i64, id2 as i64, description],
+        )?;
+        Ok(())
+    }
+
+    /// Lists all unused privilege tokens.
+    pub fn list_tokens(&self) -> Result<Vec<TokenRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token, token_type, token_id1, token_id2, description, created_at \
+             FROM privilege_keys WHERE is_used = 0 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TokenRecord {
+                token: row.get(0)?,
+                token_type: row.get(1)?,
+                token_id1: row.get::<_, i64>(2)? as u64,
+                token_id2: row.get::<_, i64>(3)? as u64,
+                description: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Deletes a privilege token. Returns true if found and removed.
+    pub fn delete_token(&self, token: &str) -> Result<bool> {
+        let count = self
+            .conn
+            .execute("DELETE FROM privilege_keys WHERE token = ?1", params![token])?;
+        Ok(count > 0)
+    }
+
+    /// Retrieves an unused token by string.
+    pub fn get_token(&self, token: &str) -> Result<Option<TokenRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token, token_type, token_id1, token_id2, description, created_at \
+             FROM privilege_keys WHERE token = ?1 AND is_used = 0",
+        )?;
+        let res = stmt.query_row(params![token], |row| {
+            Ok(TokenRecord {
+                token: row.get(0)?,
+                token_type: row.get(1)?,
+                token_id1: row.get::<_, i64>(2)? as u64,
+                token_id2: row.get::<_, i64>(3)? as u64,
+                description: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        });
+        match res {
+            Ok(tok) => Ok(Some(tok)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Validates and redeems a token, marking it used so it cannot be reused.
+    pub fn redeem_token(&self, token: &str) -> Result<Option<TokenRecord>> {
+        let tok = self.get_token(token)?;
+        if let Some(t) = tok {
+            self.conn.execute(
+                "UPDATE privilege_keys SET is_used = 1 WHERE token = ?1",
+                params![token],
+            )?;
+            Ok(Some(t))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // --- Server Properties KV ---
+
+    /// Sets or updates a server property key-value pair.
+    pub fn set_property(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO server_properties (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieves all server properties.
+    pub fn get_all_properties(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT key, value FROM server_properties")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut map = HashMap::new();
+        for r in rows {
+            let (k, v) = r?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    // --- Permission Finding Across All Tiers ---
+
+    /// Finds all assignments of a given permission across Server Groups (0),
+    /// Client Permissions (1), Channels (2), Channel Groups (3), and Channel-Client (4).
+    pub fn find_permissions(&self, perm_name: &str) -> Result<Vec<PermFindMatch>> {
+        let mut matches = Vec::new();
+
+        // Tier 0: Server Groups
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, perm_value, perm_negated, perm_skip FROM perm_server_group WHERE perm_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![perm_name], |row| {
+            Ok(PermFindMatch {
+                tier: 0,
+                id1: row.get::<_, i64>(0)? as u64,
+                id2: 0,
+                perm_id: perm_name.to_string(),
+                perm_value: row.get(1)?,
+                perm_negated: row.get::<_, i64>(2)? == 1,
+                perm_skip: row.get::<_, i64>(3)? == 1,
+            })
+        })?;
+        for r in rows {
+            matches.push(r?);
+        }
+
+        // Tier 2: Channel Permissions
+        let mut stmt = self.conn.prepare(
+            "SELECT cid, perm_value, perm_negated, perm_skip FROM perm_channel WHERE perm_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![perm_name], |row| {
+            Ok(PermFindMatch {
+                tier: 2,
+                id1: row.get::<_, i64>(0)? as u64,
+                id2: 0,
+                perm_id: perm_name.to_string(),
+                perm_value: row.get(1)?,
+                perm_negated: row.get::<_, i64>(2)? == 1,
+                perm_skip: row.get::<_, i64>(3)? == 1,
+            })
+        })?;
+        for r in rows {
+            matches.push(r?);
+        }
+
+        // Tier 3: Channel Groups
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, perm_value, perm_negated, perm_skip FROM perm_channel_groups WHERE perm_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![perm_name], |row| {
+            Ok(PermFindMatch {
+                tier: 3,
+                id1: row.get::<_, i64>(0)? as u64,
+                id2: 0,
+                perm_id: perm_name.to_string(),
+                perm_value: row.get(1)?,
+                perm_negated: row.get::<_, i64>(2)? == 1,
+                perm_skip: row.get::<_, i64>(3)? == 1,
+            })
+        })?;
+        for r in rows {
+            matches.push(r?);
+        }
+
+        // Tier 4: Channel Client
+        let mut stmt = self.conn.prepare(
+            "SELECT cid, perm_value, perm_negated, perm_skip FROM perm_channel_clients WHERE perm_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![perm_name], |row| {
+            Ok(PermFindMatch {
+                tier: 4,
+                id1: row.get::<_, i64>(0)? as u64,
+                id2: 1,
+                perm_id: perm_name.to_string(),
+                perm_value: row.get(1)?,
+                perm_negated: row.get::<_, i64>(2)? == 1,
+                perm_skip: row.get::<_, i64>(3)? == 1,
+            })
+        })?;
+        for r in rows {
+            matches.push(r?);
+        }
+
+        Ok(matches)
+    }
 }
 
 #[cfg(test)]
@@ -1551,5 +1946,65 @@ mod tests {
         // Delete all bans
         db.delete_all_bans().expect("failed to delete all");
         assert_eq!(db.get_bans().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_dynamic_groups_and_tokens() {
+        let db = Database::in_memory().expect("failed to open in-memory db");
+
+        // 1. Dynamic Server Groups
+        let new_sgid = db.create_server_group("Moderators", 1).unwrap();
+        assert!(new_sgid >= 10);
+        db.rename_server_group(new_sgid, "Senior Mods").unwrap();
+        let sgs = db.get_server_groups().unwrap();
+        assert!(sgs.iter().any(|g| g.group_id == new_sgid && g.name == "Senior Mods"));
+
+        // Copy server group
+        let copy_sgid = db.copy_server_group(6, 0, "Admin Backup", 1).unwrap();
+        let copy_perms = db.get_server_group_perms(copy_sgid).unwrap();
+        assert!(!copy_perms.is_empty());
+
+        // Delete group
+        assert!(db.delete_server_group(new_sgid, false).unwrap());
+        let sgs_after = db.get_server_groups().unwrap();
+        assert!(!sgs_after.iter().any(|g| g.group_id == new_sgid));
+
+        // 2. Dynamic Channel Groups
+        let new_cgid = db.create_channel_group("Trial Operator", 1).unwrap();
+        assert!(new_cgid >= 10);
+        db.rename_channel_group(new_cgid, "Trial Op").unwrap();
+        let cgs = db.get_channel_groups().unwrap();
+        assert!(cgs.iter().any(|g| g.group_id == new_cgid && g.name == "Trial Op"));
+
+        let copy_cgid = db.copy_channel_group(5, 0, "Channel Admin Backup", 1).unwrap();
+        let copy_cg_perms = db.get_channel_group_perms(copy_cgid).unwrap();
+        assert!(!copy_cg_perms.is_empty());
+
+        assert!(db.delete_channel_group(new_cgid, false).unwrap());
+
+        // 3. Tokens CRUD
+        db.add_token("tok_test_123", 0, 6, 0, "Test Token").unwrap();
+        let tokens = db.list_tokens().unwrap();
+        assert!(tokens.iter().any(|t| t.token == "tok_test_123" && t.token_id1 == 6));
+
+        let redeemed = db.redeem_token("tok_test_123").unwrap();
+        assert!(redeemed.is_some());
+        assert_eq!(redeemed.unwrap().token_id1, 6);
+
+        // Redeeming again should fail
+        assert!(db.redeem_token("tok_test_123").unwrap().is_none());
+
+        // 4. Server Properties
+        db.set_property("virtualserver_name", "My Super TS3").unwrap();
+        assert_eq!(
+            db.get_property("virtualserver_name").unwrap(),
+            Some("My Super TS3".to_string())
+        );
+        let props = db.get_all_properties().unwrap();
+        assert_eq!(props.get("virtualserver_name").unwrap(), "My Super TS3");
+
+        // 5. find_permissions
+        let found = db.find_permissions("b_channel_modify_name").unwrap();
+        assert!(!found.is_empty());
     }
 }

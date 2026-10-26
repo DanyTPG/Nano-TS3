@@ -2409,3 +2409,256 @@ async fn test_all_five_tiers_wire_crud() {
 
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn test_dynamic_group_management_wire() {
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // 1. Dynamic Server Group Add
+    let mut sg_add = Command::new("servergroupadd");
+    sg_add.set("name", "TestModerators");
+    sg_add.set("type", "1");
+    admin.send_command(&sg_add).await;
+    let sg_add_resp = admin.recv_until("servergroupadd", Duration::from_secs(2)).await.expect("sg add resp");
+    let new_sgid = sg_add_resp.get("sgid").expect("new sgid").to_string();
+    assert!(new_sgid.parse::<u64>().unwrap() >= 10);
+    let sg_add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sg add ok");
+    assert_eq!(sg_add_ok.get("id"), Some("0"));
+
+    // 2. Dynamic Server Group Rename
+    let mut sg_ren = Command::new("servergrouprename");
+    sg_ren.set("sgid", &new_sgid);
+    sg_ren.set("name", "SeniorModerators");
+    admin.send_command(&sg_ren).await;
+    let sg_ren_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sg ren ok");
+    assert_eq!(sg_ren_ok.get("id"), Some("0"));
+
+    // 3. Dynamic Server Group Copy
+    let mut sg_cpy = Command::new("servergroupcopy");
+    sg_cpy.set("ssgid", "6");
+    sg_cpy.set("tsgid", "0");
+    sg_cpy.set("name", "AdminCopy");
+    sg_cpy.set("type", "1");
+    admin.send_command(&sg_cpy).await;
+    let sg_cpy_resp = admin.recv_until("servergroupcopy", Duration::from_secs(2)).await.expect("sg cpy resp");
+    let cpy_sgid = sg_cpy_resp.get("sgid").expect("copy sgid").to_string();
+    let sg_cpy_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sg cpy ok");
+    assert_eq!(sg_cpy_ok.get("id"), Some("0"));
+
+    // 4. Dynamic Server Group Delete
+    let mut sg_del = Command::new("servergroupdel");
+    sg_del.set("sgid", &new_sgid);
+    sg_del.set("force", "1");
+    admin.send_command(&sg_del).await;
+    let sg_del_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sg del ok");
+    assert_eq!(sg_del_ok.get("id"), Some("0"));
+
+    // 5. Dynamic Channel Group Add
+    let mut cg_add = Command::new("channelgroupadd");
+    cg_add.set("name", "TrialOperator");
+    cg_add.set("type", "1");
+    admin.send_command(&cg_add).await;
+    let cg_add_resp = admin.recv_until("channelgroupadd", Duration::from_secs(2)).await.expect("cg add resp");
+    let new_cgid = cg_add_resp.get("cgid").expect("new cgid").to_string();
+    assert!(new_cgid.parse::<u64>().unwrap() >= 10);
+    let cg_add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("cg add ok");
+    assert_eq!(cg_add_ok.get("id"), Some("0"));
+
+    // 6. Dynamic Channel Group Rename
+    let mut cg_ren = Command::new("channelgrouprename");
+    cg_ren.set("cgid", &new_cgid);
+    cg_ren.set("name", "JuniorOperator");
+    admin.send_command(&cg_ren).await;
+    let cg_ren_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("cg ren ok");
+    assert_eq!(cg_ren_ok.get("id"), Some("0"));
+
+    // 7. Dynamic Channel Group Copy
+    let mut cg_cpy = Command::new("channelgroupcopy");
+    cg_cpy.set("scgid", "5");
+    cg_cpy.set("tcgid", "0");
+    cg_cpy.set("name", "ChannelAdminCopy");
+    cg_cpy.set("type", "1");
+    admin.send_command(&cg_cpy).await;
+    let cg_cpy_resp = admin.recv_until("channelgroupcopy", Duration::from_secs(2)).await.expect("cg cpy resp");
+    let cpy_cgid = cg_cpy_resp.get("cgid").expect("copy cgid").to_string();
+    let cg_cpy_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("cg cpy ok");
+    assert_eq!(cg_cpy_ok.get("id"), Some("0"));
+
+    // 8. Dynamic Channel Group Delete
+    let mut cg_del = Command::new("channelgroupdel");
+    cg_del.set("cgid", &new_cgid);
+    cg_del.set("force", "1");
+    admin.send_command(&cg_del).await;
+    let cg_del_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("cg del ok");
+    assert_eq!(cg_del_ok.get("id"), Some("0"));
+
+    // Clean up copied groups
+    let mut del_cpy_sg = Command::new("servergroupdel");
+    del_cpy_sg.set("sgid", &cpy_sgid);
+    del_cpy_sg.set("force", "1");
+    admin.send_command(&del_cpy_sg).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut del_cpy_cg = Command::new("channelgroupdel");
+    del_cpy_cg.set("cgid", &cpy_cgid);
+    del_cpy_cg.set("force", "1");
+    admin.send_command(&del_cpy_cg).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_privilege_key_and_token_wire() {
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut guest = ClientSession::connect(server_addr, "GuestUser").await;
+
+    // 1. Admin generates a privilege key for Server Admin (group 6)
+    let mut tok_add = Command::new("tokenadd");
+    tok_add.set("tokentype", "0");
+    tok_add.set("tokenid1", "6");
+    tok_add.set("tokendescription", "TestAdminToken");
+    admin.send_command(&tok_add).await;
+    let tok_add_resp = admin.recv_until("tokenadd", Duration::from_secs(2)).await.expect("tok add resp");
+    let token_str = tok_add_resp.get("token").expect("generated token").to_string();
+    let tok_add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("tok add ok");
+    assert_eq!(tok_add_ok.get("id"), Some("0"));
+
+    // 2. Admin lists tokens
+    let tok_list = Command::new("tokenlist");
+    admin.send_command(&tok_list).await;
+    let tok_list_resp = admin.recv_until("tokenlist", Duration::from_secs(2)).await.expect("tok list resp");
+    assert!(tok_list_resp.get("token").unwrap().contains(&token_str) || tok_list_resp.build().contains(&token_str));
+    let tok_list_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("tok list ok");
+    assert_eq!(tok_list_ok.get("id"), Some("0"));
+
+    // 3. Guest redeems the token
+    let mut tok_use = Command::new("tokenuse");
+    tok_use.set("token", &token_str);
+    guest.send_command(&tok_use).await;
+    let tok_use_ok = guest.recv_until("error", Duration::from_secs(2)).await.expect("tok use ok");
+    assert_eq!(tok_use_ok.get("id"), Some("0"));
+
+    // Admin should see guest updated to servergroup 6
+    let notify_upd = admin.recv_until("notifyclientupdated", Duration::from_secs(2)).await.expect("guest upd notify");
+    assert_eq!(notify_upd.get("clid"), Some(guest.clid.to_string().as_str()));
+    assert_eq!(notify_upd.get("client_servergroups"), Some("6"));
+
+    // 4. Redeeming again should fail with invalid privilege key (2561)
+    guest.send_command(&tok_use).await;
+    let tok_use_fail = guest.recv_until("error", Duration::from_secs(2)).await.expect("tok use fail");
+    assert_eq!(tok_use_fail.get("id"), Some("2561"));
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_serveredit_and_serverinfo_wire() {
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut user = ClientSession::connect(server_addr, "NormalUser").await;
+
+    // 1. Admin edits server properties (Standard, Host Banner, Welcome Message)
+    let mut edit_cmd = Command::new("serveredit");
+    edit_cmd.set("virtualserver_name", "Updated Nano TS3");
+    edit_cmd.set("virtualserver_welcomemessage", "Enjoy your stay!");
+    edit_cmd.set("virtualserver_hostbanner_url", "https://nanots3.org/banner");
+    edit_cmd.set("virtualserver_hostmessage", "Server Rules Apply");
+    edit_cmd.set("virtualserver_hostmessage_mode", "1");
+    admin.send_command(&edit_cmd).await;
+
+    // Both Admin and NormalUser receive notifyserveredited broadcast
+    let admin_notify = admin.recv_until("notifyserveredited", Duration::from_secs(2)).await.expect("admin notify");
+    assert_eq!(admin_notify.get("virtualserver_name"), Some("Updated Nano TS3"));
+    assert_eq!(admin_notify.get("virtualserver_welcomemessage"), Some("Enjoy your stay!"));
+    assert_eq!(admin_notify.get("virtualserver_hostbanner_url"), Some("https://nanots3.org/banner"));
+
+    // Admin receives ok
+    let edit_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("edit ok");
+    assert_eq!(edit_ok.get("id"), Some("0"));
+
+    let user_notify = user.recv_until("notifyserveredited", Duration::from_secs(2)).await.expect("user notify");
+    assert_eq!(user_notify.get("virtualserver_name"), Some("Updated Nano TS3"));
+
+    // 2. NormalUser queries serverinfo and receives the updated properties
+    let info_cmd = Command::new("serverinfo");
+    user.send_command(&info_cmd).await;
+    let info_resp = user.recv_until("serverinfo", Duration::from_secs(2)).await.expect("serverinfo resp");
+    assert_eq!(info_resp.get("virtualserver_name"), Some("Updated Nano TS3"));
+    assert_eq!(info_resp.get("virtualserver_welcomemessage"), Some("Enjoy your stay!"));
+    assert_eq!(info_resp.get("virtualserver_hostbanner_url"), Some("https://nanots3.org/banner"));
+    assert_eq!(info_resp.get("virtualserver_status"), Some("online"));
+    let info_ok = user.recv_until("error", Duration::from_secs(2)).await.expect("info ok");
+    assert_eq!(info_ok.get("id"), Some("0"));
+
+    // 3. NormalUser (non-admin) attempts to edit server properties -> rejected with 2568
+    let mut unauth_edit = Command::new("serveredit");
+    unauth_edit.set("virtualserver_name", "Hacked Name");
+    user.send_command(&unauth_edit).await;
+    let unauth_err = user.recv_until("error", Duration::from_secs(2)).await.expect("unauth err");
+    assert_eq!(unauth_err.get("id"), Some("2568"));
+    assert_eq!(unauth_err.get("failed_permid"), Some("52")); // b_virtualserver_modify_name
+
+    // 4. Permission inspection utilities
+    let mut perm_get = Command::new("permidgetbyname");
+    perm_get.set("permsid", "b_virtualserver_modify_name");
+    admin.send_command(&perm_get).await;
+    let perm_get_resp = admin.recv_until("permidgetbyname", Duration::from_secs(2)).await.expect("permidget resp");
+    assert_eq!(perm_get_resp.get("permid"), Some("52"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut perm_name = Command::new("permnamebyid");
+    perm_name.set("permid", "52");
+    admin.send_command(&perm_name).await;
+    let perm_name_resp = admin.recv_until("permnamebyid", Duration::from_secs(2)).await.expect("permname resp");
+    assert_eq!(perm_name_resp.get("permsid"), Some("b_virtualserver_modify_name"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    server_handle.abort();
+}

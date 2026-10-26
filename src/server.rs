@@ -1,5 +1,6 @@
 use base64::prelude::*;
 use rand::Rng;
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -576,25 +577,146 @@ fn build_connection_info(
 }
 
 /// Builds a `notifyserverupdated` command. The official client
+/// Builds a `notifyserverupdated` command. The official client
 /// rejects the message when any of these parameters is missing.
-fn build_server_updated(ask_for_privilegekey: bool, port: u16) -> Command {
+fn build_server_updated(
+    ask_for_privilegekey: bool,
+    port: u16,
+    props: &HashMap<String, String>,
+) -> Command {
     let mut cmd = Command::new("notifyserverupdated");
     cmd.set(
-        "virtualserver_welcomemessage",
-        "Welcome to Nano-TS3 Server!",
+        "virtualserver_name",
+        props
+            .get("virtualserver_name")
+            .map(|s| s.as_str())
+            .unwrap_or("Nano-TS3 Minimal Server"),
     );
-    cmd.set("virtualserver_maxclients", "32");
+    cmd.set(
+        "virtualserver_welcomemessage",
+        props
+            .get("virtualserver_welcomemessage")
+            .map(|s| s.as_str())
+            .unwrap_or("Welcome to Nano-TS3 Server!"),
+    );
+    cmd.set(
+        "virtualserver_maxclients",
+        props
+            .get("virtualserver_maxclients")
+            .map(|s| s.as_str())
+            .unwrap_or("32"),
+    );
     // Nano-TS3 relays both plaintext and EAX-encrypted codec payloads.
     // Mode 0 (individual) lets the client choose per channel via the
     // "Voice Data encrypted" toggle; mode 1 (forced off) greys it out.
-    cmd.set("virtualserver_codec_encryption_mode", "0");
+    cmd.set(
+        "virtualserver_codec_encryption_mode",
+        props
+            .get("virtualserver_codec_encryption_mode")
+            .map(|s| s.as_str())
+            .unwrap_or("0"),
+    );
     cmd.set("virtualserver_clientsonline", "1");
     cmd.set("virtualserver_channelsonline", "1");
     cmd.set("virtualserver_uptime", "1000");
-    cmd.set("virtualserver_hostmessage", "");
-    cmd.set("virtualserver_hostmessage_mode", "0");
-    cmd.set("virtualserver_flag_password", "0");
-    cmd.set("virtualserver_default_channel_admin_group", "5");
+    cmd.set(
+        "virtualserver_hostmessage",
+        props
+            .get("virtualserver_hostmessage")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    );
+    cmd.set(
+        "virtualserver_hostmessage_mode",
+        props
+            .get("virtualserver_hostmessage_mode")
+            .map(|s| s.as_str())
+            .unwrap_or("0"),
+    );
+    cmd.set(
+        "virtualserver_flag_password",
+        props
+            .get("virtualserver_flag_password")
+            .map(|s| s.as_str())
+            .unwrap_or("0"),
+    );
+    cmd.set(
+        "virtualserver_default_channel_admin_group",
+        props
+            .get("virtualserver_default_channel_admin_group")
+            .map(|s| s.as_str())
+            .unwrap_or("5"),
+    );
+    cmd.set(
+        "virtualserver_default_server_group",
+        props
+            .get("virtualserver_default_server_group")
+            .map(|s| s.as_str())
+            .unwrap_or("8"),
+    );
+    cmd.set(
+        "virtualserver_default_channel_group",
+        props
+            .get("virtualserver_default_channel_group")
+            .map(|s| s.as_str())
+            .unwrap_or("8"),
+    );
+    cmd.set(
+        "virtualserver_hostbanner_url",
+        props
+            .get("virtualserver_hostbanner_url")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    );
+    cmd.set(
+        "virtualserver_hostbanner_gfx_url",
+        props
+            .get("virtualserver_hostbanner_gfx_url")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    );
+    cmd.set(
+        "virtualserver_hostbanner_gfx_interval",
+        props
+            .get("virtualserver_hostbanner_gfx_interval")
+            .map(|s| s.as_str())
+            .unwrap_or("0"),
+    );
+    cmd.set(
+        "virtualserver_hostbanner_mode",
+        props
+            .get("virtualserver_hostbanner_mode")
+            .map(|s| s.as_str())
+            .unwrap_or("0"),
+    );
+    cmd.set(
+        "virtualserver_hostbutton_tooltip",
+        props
+            .get("virtualserver_hostbutton_tooltip")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    );
+    cmd.set(
+        "virtualserver_hostbutton_url",
+        props
+            .get("virtualserver_hostbutton_url")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    );
+    cmd.set(
+        "virtualserver_hostbutton_gfx_url",
+        props
+            .get("virtualserver_hostbutton_gfx_url")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    );
+    cmd.set(
+        "virtualserver_icon_id",
+        props
+            .get("virtualserver_icon_id")
+            .map(|s| s.as_str())
+            .unwrap_or("0"),
+    );
     cmd.set(
         "virtualserver_max_download_total_bandwidth",
         "18446744073709551615",
@@ -610,9 +732,27 @@ fn build_server_updated(ask_for_privilegekey: bool, port: u16) -> Command {
         "virtualserver_min_clients_in_channel_before_forced_silence",
         "100",
     );
-    cmd.set("virtualserver_antiflood_points_tick_reduce", "5");
-    cmd.set("virtualserver_antiflood_points_needed_command_block", "150");
-    cmd.set("virtualserver_antiflood_points_needed_ip_block", "250");
+    cmd.set(
+        "virtualserver_antiflood_points_tick_reduce",
+        props
+            .get("virtualserver_antiflood_points_tick_reduce")
+            .map(|s| s.as_str())
+            .unwrap_or("5"),
+    );
+    cmd.set(
+        "virtualserver_antiflood_points_needed_command_block",
+        props
+            .get("virtualserver_antiflood_points_needed_command_block")
+            .map(|s| s.as_str())
+            .unwrap_or("150"),
+    );
+    cmd.set(
+        "virtualserver_antiflood_points_needed_ip_block",
+        props
+            .get("virtualserver_antiflood_points_needed_ip_block")
+            .map(|s| s.as_str())
+            .unwrap_or("250"),
+    );
     cmd.set("virtualserver_client_connections", "0");
     cmd.set("virtualserver_query_client_connections", "0");
     cmd.set("virtualserver_queryclientsonline", "0");
@@ -625,21 +765,81 @@ fn build_server_updated(ask_for_privilegekey: bool, port: u16) -> Command {
     cmd.set("virtualserver_port", port.to_string());
     cmd.set("virtualserver_autostart", "1");
     cmd.set("virtualserver_machine_id", "");
-    cmd.set("virtualserver_needed_identity_security_level", "8");
-    cmd.set("virtualserver_log_client", "1");
-    cmd.set("virtualserver_log_query", "1");
-    cmd.set("virtualserver_log_channel", "1");
-    cmd.set("virtualserver_log_permissions", "1");
-    cmd.set("virtualserver_log_server", "1");
-    cmd.set("virtualserver_log_filetransfer", "1");
-    cmd.set("virtualserver_min_client_version", "1560850141");
-    cmd.set("virtualserver_reserved_slots", "0");
+    cmd.set(
+        "virtualserver_needed_identity_security_level",
+        props
+            .get("virtualserver_needed_identity_security_level")
+            .map(|s| s.as_str())
+            .unwrap_or("8"),
+    );
+    cmd.set(
+        "virtualserver_log_client",
+        props
+            .get("virtualserver_log_client")
+            .map(|s| s.as_str())
+            .unwrap_or("1"),
+    );
+    cmd.set(
+        "virtualserver_log_query",
+        props
+            .get("virtualserver_log_query")
+            .map(|s| s.as_str())
+            .unwrap_or("1"),
+    );
+    cmd.set(
+        "virtualserver_log_channel",
+        props
+            .get("virtualserver_log_channel")
+            .map(|s| s.as_str())
+            .unwrap_or("1"),
+    );
+    cmd.set(
+        "virtualserver_log_permissions",
+        props
+            .get("virtualserver_log_permissions")
+            .map(|s| s.as_str())
+            .unwrap_or("1"),
+    );
+    cmd.set(
+        "virtualserver_log_server",
+        props
+            .get("virtualserver_log_server")
+            .map(|s| s.as_str())
+            .unwrap_or("1"),
+    );
+    cmd.set(
+        "virtualserver_log_filetransfer",
+        props
+            .get("virtualserver_log_filetransfer")
+            .map(|s| s.as_str())
+            .unwrap_or("1"),
+    );
+    cmd.set(
+        "virtualserver_min_client_version",
+        props
+            .get("virtualserver_min_client_version")
+            .map(|s| s.as_str())
+            .unwrap_or("1560850141"),
+    );
+    cmd.set(
+        "virtualserver_reserved_slots",
+        props
+            .get("virtualserver_reserved_slots")
+            .map(|s| s.as_str())
+            .unwrap_or("0"),
+    );
     cmd.set("virtualserver_total_packetloss_speech", "0");
     cmd.set("virtualserver_total_packetloss_keepalive", "0");
     cmd.set("virtualserver_total_packetloss_control", "0");
     cmd.set("virtualserver_total_packetloss_total", "0");
     cmd.set("virtualserver_total_ping", "0");
-    cmd.set("virtualserver_weblist_enabled", "1");
+    cmd.set(
+        "virtualserver_weblist_enabled",
+        props
+            .get("virtualserver_weblist_enabled")
+            .map(|s| s.as_str())
+            .unwrap_or("1"),
+    );
     cmd.set("virtualserver_min_android_version", "1560850141");
     cmd.set("virtualserver_min_ios_version", "1560850141");
     cmd.set("virtualserver_antiflood_points_needed_plugin_block", "0");
@@ -1428,34 +1628,120 @@ impl Server {
                     return Ok(());
                 }
 
+                let props = {
+                    let db = self.db.lock().await;
+                    db.get_all_properties().unwrap_or_default()
+                };
+
+                let flag_pw = props
+                    .get("virtualserver_flag_password")
+                    .map(|s| s.as_str())
+                    .unwrap_or("0");
+                let server_pw_hash = props
+                    .get("virtualserver_password")
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+
+                if flag_pw == "1" && !server_pw_hash.is_empty() {
+                    let has_pw_bypass = is_admin || {
+                        let db = self.db.lock().await;
+                        permissions::has_permission(
+                            &db,
+                            &uid,
+                            0,
+                            "b_virtualserver_join_ignore_password",
+                        )
+                    };
+                    if !has_pw_bypass {
+                        let client_pw = cmd
+                            .get("serverpassword")
+                            .or_else(|| cmd.get("password"))
+                            .unwrap_or("");
+                        let mut hasher = Sha1::new();
+                        hasher.update(client_pw.as_bytes());
+                        let client_hash = BASE64_STANDARD.encode(hasher.finalize());
+                        if client_hash != server_pw_hash && client_pw != server_pw_hash {
+                            info!("Client {} failed server password verification", clid);
+                            let mut err_resp = Command::new("error");
+                            err_resp.set("id", "520");
+                            err_resp.set("msg", "invalid server password");
+                            if let Some(rc) = cmd.get("return_code") {
+                                err_resp.set("return_code", rc);
+                            }
+                            self.send_encrypted_command(peer, &err_resp).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+
                 // 1. initserver
                 let mut initserver = Command::new("initserver");
-                {
-                    let db = self.db.lock().await;
-                    let name = db
-                        .get_property("virtualserver_name")
-                        .unwrap_or(None)
-                        .unwrap_or_else(|| "Nano-TS3 Minimal Server".into());
-                    let welcome = db
-                        .get_property("virtualserver_welcomemessage")
-                        .unwrap_or(None)
-                        .unwrap_or_else(|| "Welcome to Nano-TS3 Server!".into());
-                    initserver.set("virtualserver_name", name);
-                    initserver.set("virtualserver_welcomemessage", welcome);
-                }
+                initserver.set(
+                    "virtualserver_name",
+                    props
+                        .get("virtualserver_name")
+                        .map(|s| s.as_str())
+                        .unwrap_or("Nano-TS3 Minimal Server"),
+                );
+                initserver.set(
+                    "virtualserver_welcomemessage",
+                    props
+                        .get("virtualserver_welcomemessage")
+                        .map(|s| s.as_str())
+                        .unwrap_or("Welcome to Nano-TS3 Server!"),
+                );
                 initserver.set("virtualserver_platform", "Windows");
                 initserver.set("virtualserver_version", "3.13.7 [Build: 1600000000]");
-                initserver.set("virtualserver_maxclients", "32");
+                initserver.set(
+                    "virtualserver_maxclients",
+                    props
+                        .get("virtualserver_maxclients")
+                        .map(|s| s.as_str())
+                        .unwrap_or("32"),
+                );
                 initserver.set("virtualserver_created", "1600000000");
-                // Voice relay forwards codec frames verbatim and supports
-                // both encrypted and plaintext channels, so the client may
-                // pick encryption per channel (mode 0 = individual).
-                initserver.set("virtualserver_codec_encryption_mode", "0");
-                initserver.set("virtualserver_hostmessage", "");
-                initserver.set("virtualserver_hostmessage_mode", "0");
-                initserver.set("virtualserver_default_server_group", "8");
-                initserver.set("virtualserver_default_channel_group", "8");
-                initserver.set("virtualserver_default_channel_admin_group", "5");
+                initserver.set(
+                    "virtualserver_codec_encryption_mode",
+                    props
+                        .get("virtualserver_codec_encryption_mode")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                initserver.set(
+                    "virtualserver_hostmessage",
+                    props
+                        .get("virtualserver_hostmessage")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                initserver.set(
+                    "virtualserver_hostmessage_mode",
+                    props
+                        .get("virtualserver_hostmessage_mode")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                initserver.set(
+                    "virtualserver_default_server_group",
+                    props
+                        .get("virtualserver_default_server_group")
+                        .map(|s| s.as_str())
+                        .unwrap_or("8"),
+                );
+                initserver.set(
+                    "virtualserver_default_channel_group",
+                    props
+                        .get("virtualserver_default_channel_group")
+                        .map(|s| s.as_str())
+                        .unwrap_or("8"),
+                );
+                initserver.set(
+                    "virtualserver_default_channel_admin_group",
+                    props
+                        .get("virtualserver_default_channel_admin_group")
+                        .map(|s| s.as_str())
+                        .unwrap_or("5"),
+                );
                 initserver.set("virtualserver_id", "1");
                 let ask_privilege = {
                     let db = self.db.lock().await;
@@ -1470,18 +1756,77 @@ impl Server {
                     "virtualserver_ask_for_privilegekey",
                     if ask_privilege { "1" } else { "0" },
                 );
-                initserver.set("virtualserver_hostbanner_url", "");
-                initserver.set("virtualserver_hostbanner_gfx_url", "");
-                initserver.set("virtualserver_hostbanner_gfx_interval", "0");
+                initserver.set(
+                    "virtualserver_flag_password",
+                    flag_pw,
+                );
+                initserver.set(
+                    "virtualserver_hostbanner_url",
+                    props
+                        .get("virtualserver_hostbanner_url")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                initserver.set(
+                    "virtualserver_hostbanner_gfx_url",
+                    props
+                        .get("virtualserver_hostbanner_gfx_url")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                initserver.set(
+                    "virtualserver_hostbanner_gfx_interval",
+                    props
+                        .get("virtualserver_hostbanner_gfx_interval")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                initserver.set(
+                    "virtualserver_hostbanner_mode",
+                    props
+                        .get("virtualserver_hostbanner_mode")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
                 initserver.set(
                     "virtualserver_priority_speaker_dimm_modificator",
                     "-18.0000",
                 );
-                initserver.set("virtualserver_hostbutton_tooltip", "");
-                initserver.set("virtualserver_hostbutton_url", "");
-                initserver.set("virtualserver_hostbutton_gfx_url", "");
-                initserver.set("virtualserver_name_phonetic", "");
-                initserver.set("virtualserver_icon_id", "0");
+                initserver.set(
+                    "virtualserver_hostbutton_tooltip",
+                    props
+                        .get("virtualserver_hostbutton_tooltip")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                initserver.set(
+                    "virtualserver_hostbutton_url",
+                    props
+                        .get("virtualserver_hostbutton_url")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                initserver.set(
+                    "virtualserver_hostbutton_gfx_url",
+                    props
+                        .get("virtualserver_hostbutton_gfx_url")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                initserver.set(
+                    "virtualserver_name_phonetic",
+                    props
+                        .get("virtualserver_name_phonetic")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                initserver.set(
+                    "virtualserver_icon_id",
+                    props
+                        .get("virtualserver_icon_id")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
                 initserver.set("virtualserver_hostbanner_mode", "0");
                 initserver.set("virtualserver_channel_temp_delete_delay_default", "0");
                 initserver.set("virtualserver_unique_identifier", "nano_ts3_vserver_1");
@@ -1644,7 +1989,7 @@ impl Server {
 
                 // 6. Publish channel-group names, followed by the baseline
                 // permission requirements that the client uses for actions.
-                self.send_channel_group_list(peer).await?;
+                self.send_channel_group_list(peer, true).await?;
                 self.send_encrypted_raw(peer, permissions::get_client_needed_permissions_wire())
                     .await?;
 
@@ -2167,8 +2512,313 @@ impl Server {
                     };
                     !is_admin && has_key
                 };
-                let updated = build_server_updated(ask_for_privilege_key, port);
+                let props = {
+                    let db = self.db.lock().await;
+                    db.get_all_properties().unwrap_or_default()
+                };
+                let updated = build_server_updated(ask_for_privilege_key, port, &props);
                 self.send_encrypted_command(peer, &updated).await?;
+
+                let mut err_resp = Command::new("error");
+                err_resp.set("id", "0");
+                err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "serveredit" => {
+                let (caller_uid, caller_name, is_admin) = {
+                    let state = self.state.lock().await;
+                    match state.get_client(&peer) {
+                        Some(c) => (c.uid.clone(), c.nickname.clone(), c.is_admin),
+                        None => (String::new(), "Admin".to_string(), false),
+                    }
+                };
+
+                let edit_perms: &[(&str, &str)] = &[
+                    ("virtualserver_name", "b_virtualserver_modify_name"),
+                    ("virtualserver_name_phonetic", "b_virtualserver_modify_name"),
+                    ("virtualserver_welcomemessage", "b_virtualserver_modify_welcomemessage"),
+                    ("virtualserver_password", "b_virtualserver_modify_password"),
+                    ("virtualserver_flag_password", "b_virtualserver_modify_password"),
+                    ("virtualserver_icon_id", "b_virtualserver_modify_icon_id"),
+                    ("virtualserver_maxclients", "b_virtualserver_modify_maxclients"),
+                    ("virtualserver_reserved_slots", "b_virtualserver_modify_reserved_slots"),
+                    ("virtualserver_weblist_enabled", "b_virtualserver_modify_weblist"),
+                    ("virtualserver_hostmessage", "b_virtualserver_modify_hostmessage"),
+                    ("virtualserver_hostmessage_mode", "b_virtualserver_modify_hostmessage"),
+                    ("virtualserver_hostbanner_url", "b_virtualserver_modify_hostbanner"),
+                    ("virtualserver_hostbanner_gfx_url", "b_virtualserver_modify_hostbanner"),
+                    ("virtualserver_hostbanner_gfx_interval", "b_virtualserver_modify_hostbanner"),
+                    ("virtualserver_hostbanner_mode", "b_virtualserver_modify_hostbanner"),
+                    ("virtualserver_hostbutton_tooltip", "b_virtualserver_modify_hostbutton"),
+                    ("virtualserver_hostbutton_url", "b_virtualserver_modify_hostbutton"),
+                    ("virtualserver_hostbutton_gfx_url", "b_virtualserver_modify_hostbutton"),
+                    ("virtualserver_codec_encryption_mode", "b_virtualserver_modify_codec_encryption_mode"),
+                    ("virtualserver_needed_identity_security_level", "b_virtualserver_modify_needed_identity_security_level"),
+                    ("virtualserver_default_server_group", "b_virtualserver_modify_default_servergroup"),
+                    ("virtualserver_default_channel_group", "b_virtualserver_modify_default_channelgroup"),
+                    ("virtualserver_default_channel_admin_group", "b_virtualserver_modify_default_channeladmingroup"),
+                    ("virtualserver_channel_temp_delete_delay_default", "b_virtualserver_modify_channel_temp_delete_delay_default"),
+                    ("virtualserver_min_client_version", "b_virtualserver_modify_min_client_version"),
+                    ("virtualserver_antiflood_points_tick_reduce", "b_virtualserver_modify_antiflood"),
+                    ("virtualserver_antiflood_points_needed_command_block", "b_virtualserver_modify_antiflood"),
+                    ("virtualserver_antiflood_points_needed_ip_block", "b_virtualserver_modify_antiflood"),
+                    ("virtualserver_antiflood_points_needed_plugin_block", "b_virtualserver_modify_antiflood"),
+                    ("virtualserver_log_client", "b_virtualserver_modify_log_settings"),
+                    ("virtualserver_log_query", "b_virtualserver_modify_log_settings"),
+                    ("virtualserver_log_channel", "b_virtualserver_modify_log_settings"),
+                    ("virtualserver_log_permissions", "b_virtualserver_modify_log_settings"),
+                    ("virtualserver_log_server", "b_virtualserver_modify_log_settings"),
+                    ("virtualserver_log_filetransfer", "b_virtualserver_modify_log_settings"),
+                ];
+
+                let mut err_resp = Command::new("error");
+                let mut failure: Option<u32> = None;
+
+                {
+                    let db = self.db.lock().await;
+                    for (prop, perm_name) in edit_perms {
+                        if cmd.params.contains_key(*prop) {
+                            if !is_admin && !permissions::has_permission(&db, &caller_uid, 0, perm_name) {
+                                failure = Some(permissions::perm_name_to_id(perm_name).unwrap_or(0));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(failed_id) = failure {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", failed_id.to_string());
+                } else {
+                    let mut changed = Vec::new();
+                    {
+                        let db = self.db.lock().await;
+                        for (k, v) in &cmd.params {
+                            if k.starts_with("virtualserver_") {
+                                if k == "virtualserver_password" {
+                                    if v.is_empty() {
+                                        let _ = db.set_property("virtualserver_password", "");
+                                        let _ = db.set_property("virtualserver_flag_password", "0");
+                                        changed.push(("virtualserver_flag_password".to_string(), "0".to_string()));
+                                    } else {
+                                        let mut hasher = Sha1::new();
+                                        hasher.update(v.as_bytes());
+                                        let hash = BASE64_STANDARD.encode(hasher.finalize());
+                                        let _ = db.set_property("virtualserver_password", &hash);
+                                        let _ = db.set_property("virtualserver_flag_password", "1");
+                                        changed.push(("virtualserver_flag_password".to_string(), "1".to_string()));
+                                    }
+                                } else {
+                                    let _ = db.set_property(k, v);
+                                    changed.push((k.clone(), v.clone()));
+                                }
+                            }
+                        }
+                    }
+
+                    if !changed.is_empty() {
+                        let mut notify = Command::new("notifyserveredited");
+                        notify.set("reasonid", "11");
+                        notify.set("invokerid", clid.to_string());
+                        notify.set("invokername", &caller_name);
+                        notify.set("invokeruid", &caller_uid);
+                        for (k, v) in &changed {
+                            notify.set(k, v);
+                        }
+                        let all_endpoints: Vec<SocketAddr> = {
+                            let state = self.state.lock().await;
+                            state.clients.values().map(|c| c.endpoint).collect()
+                        };
+                        for ep in all_endpoints {
+                            let _ = self.send_encrypted_command(ep, &notify).await;
+                        }
+                    }
+
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "serverinfo" => {
+                let props = {
+                    let db = self.db.lock().await;
+                    db.get_all_properties().unwrap_or_default()
+                };
+                let port = self.local_addr().map(|a| a.port()).unwrap_or(9988);
+                let (clients_online, channels_online) = {
+                    let state = self.state.lock().await;
+                    let db = self.db.lock().await;
+                    let clients = state
+                        .clients
+                        .values()
+                        .filter(|c| c.handshake_phase == HandshakePhase::Connected)
+                        .count();
+                    let channels = db.get_channels().map(|ch| ch.len()).unwrap_or(1);
+                    (clients, channels)
+                };
+
+                let mut resp = Command::new("serverinfo");
+                resp.set(
+                    "virtualserver_name",
+                    props
+                        .get("virtualserver_name")
+                        .map(|s| s.as_str())
+                        .unwrap_or("Nano-TS3 Minimal Server"),
+                );
+                resp.set(
+                    "virtualserver_welcomemessage",
+                    props
+                        .get("virtualserver_welcomemessage")
+                        .map(|s| s.as_str())
+                        .unwrap_or("Welcome to Nano-TS3 Server!"),
+                );
+                resp.set(
+                    "virtualserver_maxclients",
+                    props
+                        .get("virtualserver_maxclients")
+                        .map(|s| s.as_str())
+                        .unwrap_or("32"),
+                );
+                resp.set("virtualserver_clientsonline", clients_online.to_string());
+                resp.set("virtualserver_channelsonline", channels_online.to_string());
+                resp.set("virtualserver_uptime", "1000");
+                resp.set("virtualserver_status", "online");
+                resp.set("virtualserver_port", port.to_string());
+                resp.set(
+                    "virtualserver_flag_password",
+                    props
+                        .get("virtualserver_flag_password")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                resp.set(
+                    "virtualserver_default_server_group",
+                    props
+                        .get("virtualserver_default_server_group")
+                        .map(|s| s.as_str())
+                        .unwrap_or("8"),
+                );
+                resp.set(
+                    "virtualserver_default_channel_group",
+                    props
+                        .get("virtualserver_default_channel_group")
+                        .map(|s| s.as_str())
+                        .unwrap_or("8"),
+                );
+                resp.set(
+                    "virtualserver_default_channel_admin_group",
+                    props
+                        .get("virtualserver_default_channel_admin_group")
+                        .map(|s| s.as_str())
+                        .unwrap_or("5"),
+                );
+                resp.set(
+                    "virtualserver_hostmessage",
+                    props
+                        .get("virtualserver_hostmessage")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                resp.set(
+                    "virtualserver_hostmessage_mode",
+                    props
+                        .get("virtualserver_hostmessage_mode")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                resp.set(
+                    "virtualserver_hostbanner_url",
+                    props
+                        .get("virtualserver_hostbanner_url")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                resp.set(
+                    "virtualserver_hostbanner_gfx_url",
+                    props
+                        .get("virtualserver_hostbanner_gfx_url")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                resp.set(
+                    "virtualserver_hostbanner_gfx_interval",
+                    props
+                        .get("virtualserver_hostbanner_gfx_interval")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                resp.set(
+                    "virtualserver_hostbanner_mode",
+                    props
+                        .get("virtualserver_hostbanner_mode")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                resp.set(
+                    "virtualserver_hostbutton_tooltip",
+                    props
+                        .get("virtualserver_hostbutton_tooltip")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                resp.set(
+                    "virtualserver_hostbutton_url",
+                    props
+                        .get("virtualserver_hostbutton_url")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                resp.set(
+                    "virtualserver_hostbutton_gfx_url",
+                    props
+                        .get("virtualserver_hostbutton_gfx_url")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                );
+                resp.set(
+                    "virtualserver_icon_id",
+                    props
+                        .get("virtualserver_icon_id")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                resp.set(
+                    "virtualserver_needed_identity_security_level",
+                    props
+                        .get("virtualserver_needed_identity_security_level")
+                        .map(|s| s.as_str())
+                        .unwrap_or("8"),
+                );
+                resp.set(
+                    "virtualserver_codec_encryption_mode",
+                    props
+                        .get("virtualserver_codec_encryption_mode")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                resp.set(
+                    "virtualserver_weblist_enabled",
+                    props
+                        .get("virtualserver_weblist_enabled")
+                        .map(|s| s.as_str())
+                        .unwrap_or("1"),
+                );
+                resp.set(
+                    "virtualserver_reserved_slots",
+                    props
+                        .get("virtualserver_reserved_slots")
+                        .map(|s| s.as_str())
+                        .unwrap_or("0"),
+                );
+                self.send_encrypted_command(peer, &resp).await?;
 
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
@@ -2420,6 +3070,177 @@ impl Server {
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
+            "servergroupadd" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_servergroup_create")
+                };
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "162");
+                } else {
+                    let name = cmd.get("name").unwrap_or("New Group");
+                    let group_type: i32 = cmd.get("type").and_then(|v| v.parse().ok()).unwrap_or(1);
+                    let db = self.db.lock().await;
+                    match db.create_server_group(name, group_type) {
+                        Ok(new_sgid) => {
+                            let mut resp = Command::new("servergroupadd");
+                            resp.set("sgid", new_sgid.to_string());
+                            self.send_encrypted_command(peer, &resp).await?;
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                            drop(db);
+                            self.broadcast_server_group_list().await;
+                        }
+                        Err(_) => {
+                            err_resp.set("id", "1280");
+                            err_resp.set("msg", "database error");
+                        }
+                    }
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "servergroupdel" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_servergroup_delete")
+                };
+                let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let force = cmd.get("force").map(|v| v == "1").unwrap_or(false);
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "172");
+                } else if sgid == 6 || sgid == 7 || sgid == 8 {
+                    err_resp.set("id", "2565");
+                    err_resp.set("msg", "servergroup is not empty or is a default group");
+                } else {
+                    let db = self.db.lock().await;
+                    match db.delete_server_group(sgid, force) {
+                        Ok(true) => {
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                            drop(db);
+                            self.broadcast_server_group_list().await;
+                        }
+                        Ok(false) => {
+                            err_resp.set("id", "2565");
+                            err_resp.set("msg", "servergroup is not empty");
+                        }
+                        Err(_) => {
+                            err_resp.set("id", "1280");
+                            err_resp.set("msg", "database error");
+                        }
+                    }
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "servergrouprename" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_servergroup_create")
+                };
+                let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let name = cmd.get("name").unwrap_or("");
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "162");
+                } else if name.is_empty() {
+                    err_resp.set("id", "1538");
+                    err_resp.set("msg", "invalid parameter");
+                } else {
+                    let db = self.db.lock().await;
+                    let _ = db.rename_server_group(sgid, name);
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                    drop(db);
+                    self.broadcast_server_group_list().await;
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "servergroupcopy" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_servergroup_create")
+                };
+                let ssgid: u64 = cmd.get("ssgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let tsgid: u64 = cmd.get("tsgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let name = cmd.get("name").unwrap_or("Copy of Group");
+                let group_type: i32 = cmd.get("type").and_then(|v| v.parse().ok()).unwrap_or(1);
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "162");
+                } else {
+                    let db = self.db.lock().await;
+                    match db.copy_server_group(ssgid, tsgid, name, group_type) {
+                        Ok(target_id) => {
+                            let mut resp = Command::new("servergroupcopy");
+                            resp.set("sgid", target_id.to_string());
+                            self.send_encrypted_command(peer, &resp).await?;
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                            drop(db);
+                            self.broadcast_server_group_list().await;
+                        }
+                        Err(_) => {
+                            err_resp.set("id", "1280");
+                            err_resp.set("msg", "database error");
+                        }
+                    }
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
             "servergrouplist" => {
                 self.send_server_group_list(peer, false).await?;
 
@@ -2546,8 +3367,179 @@ impl Server {
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
+            "channelgroupadd" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_channelgroup_create")
+                };
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "163");
+                } else {
+                    let name = cmd.get("name").unwrap_or("New Group");
+                    let group_type: i32 = cmd.get("type").and_then(|v| v.parse().ok()).unwrap_or(1);
+                    let db = self.db.lock().await;
+                    match db.create_channel_group(name, group_type) {
+                        Ok(new_cgid) => {
+                            let mut resp = Command::new("channelgroupadd");
+                            resp.set("cgid", new_cgid.to_string());
+                            self.send_encrypted_command(peer, &resp).await?;
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                            drop(db);
+                            self.broadcast_channel_group_list().await;
+                        }
+                        Err(_) => {
+                            err_resp.set("id", "1280");
+                            err_resp.set("msg", "database error");
+                        }
+                    }
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "channelgroupdel" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_channelgroup_delete")
+                };
+                let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let force = cmd.get("force").map(|v| v == "1").unwrap_or(false);
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "173");
+                } else if cgid == 5 || cgid == 6 || cgid == 7 || cgid == 8 {
+                    err_resp.set("id", "2565");
+                    err_resp.set("msg", "channelgroup is not empty or is a default group");
+                } else {
+                    let db = self.db.lock().await;
+                    match db.delete_channel_group(cgid, force) {
+                        Ok(true) => {
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                            drop(db);
+                            self.broadcast_channel_group_list().await;
+                        }
+                        Ok(false) => {
+                            err_resp.set("id", "2565");
+                            err_resp.set("msg", "channelgroup is not empty");
+                        }
+                        Err(_) => {
+                            err_resp.set("id", "1280");
+                            err_resp.set("msg", "database error");
+                        }
+                    }
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "channelgrouprename" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_channelgroup_create")
+                };
+                let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let name = cmd.get("name").unwrap_or("");
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "163");
+                } else if name.is_empty() {
+                    err_resp.set("id", "1538");
+                    err_resp.set("msg", "invalid parameter");
+                } else {
+                    let db = self.db.lock().await;
+                    let _ = db.rename_channel_group(cgid, name);
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                    drop(db);
+                    self.broadcast_channel_group_list().await;
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "channelgroupcopy" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_channelgroup_create")
+                };
+                let scgid: u64 = cmd.get("scgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let tcgid: u64 = cmd.get("tcgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let name = cmd.get("name").unwrap_or("Copy of Channel Group");
+                let group_type: i32 = cmd.get("type").and_then(|v| v.parse().ok()).unwrap_or(1);
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "163");
+                } else {
+                    let db = self.db.lock().await;
+                    match db.copy_channel_group(scgid, tcgid, name, group_type) {
+                        Ok(target_id) => {
+                            let mut resp = Command::new("channelgroupcopy");
+                            resp.set("cgid", target_id.to_string());
+                            self.send_encrypted_command(peer, &resp).await?;
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                            drop(db);
+                            self.broadcast_channel_group_list().await;
+                        }
+                        Err(_) => {
+                            err_resp.set("id", "1280");
+                            err_resp.set("msg", "database error");
+                        }
+                    }
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
             "channelgrouplist" => {
-                self.send_channel_group_list(peer).await?;
+                self.send_channel_group_list(peer, false).await?;
 
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
@@ -3836,6 +4828,160 @@ impl Server {
                 }
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
+            "tokenadd" | "privilegekeyadd" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    match state.get_client(&peer) {
+                        Some(c) => (c.uid.clone(), c.is_admin),
+                        None => (String::new(), false),
+                    }
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_token_add")
+                };
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "39");
+                } else {
+                    let tokentype: i32 = cmd
+                        .get("tokentype")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let tokenid1: u64 = cmd
+                        .get("tokenid1")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(if tokentype == 0 { 6 } else { 5 });
+                    let tokenid2: u64 = cmd
+                        .get("tokenid2")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let description = cmd
+                        .get("tokendescription")
+                        .or_else(|| cmd.get("description"))
+                        .unwrap_or("");
+
+                    let rand_token: String = rand::thread_rng()
+                        .sample_iter(&rand::distributions::Alphanumeric)
+                        .take(40)
+                        .map(char::from)
+                        .collect();
+
+                    let db = self.db.lock().await;
+                    match db.add_token(&rand_token, tokentype, tokenid1, tokenid2, description) {
+                        Ok(()) => {
+                            let resp_name = if cmd.name.starts_with("privilegekey") {
+                                "privilegekeyadd"
+                            } else {
+                                "tokenadd"
+                            };
+                            let mut resp = Command::new(resp_name);
+                            resp.set("token", &rand_token);
+                            self.send_encrypted_command(peer, &resp).await?;
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                        }
+                        Err(_) => {
+                            err_resp.set("id", "1280");
+                            err_resp.set("msg", "database error");
+                        }
+                    }
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "tokenlist" | "privilegekeylist" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    match state.get_client(&peer) {
+                        Some(c) => (c.uid.clone(), c.is_admin),
+                        None => (String::new(), false),
+                    }
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_token_list")
+                };
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "38");
+                } else {
+                    let tokens = {
+                        let db = self.db.lock().await;
+                        db.list_tokens().unwrap_or_default()
+                    };
+                    if !tokens.is_empty() {
+                        let parts: Vec<String> = tokens
+                            .iter()
+                            .map(|t| {
+                                format!(
+                                    "token={} token_type={} token_id1={} token_id2={} token_created={} token_description={}",
+                                    t.token,
+                                    t.token_type,
+                                    t.token_id1,
+                                    t.token_id2,
+                                    t.created_at,
+                                    crate::command::escape(&t.description),
+                                )
+                            })
+                            .collect();
+                        let resp_name = if cmd.name.starts_with("privilegekey") {
+                            "privilegekeylist"
+                        } else {
+                            "tokenlist"
+                        };
+                        let wire = format!("{} {}", resp_name, parts.join("|"));
+                        self.send_encrypted_raw(peer, &wire).await?;
+                    }
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "tokendelete" | "privilegekeydelete" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    match state.get_client(&peer) {
+                        Some(c) => (c.uid.clone(), c.is_admin),
+                        None => (String::new(), false),
+                    }
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_token_delete")
+                };
+                let token = cmd.get("token").or_else(|| cmd.get("key")).unwrap_or("");
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "41");
+                } else if token.is_empty() {
+                    err_resp.set("id", "1538");
+                    err_resp.set("msg", "invalid parameter");
+                } else {
+                    let db = self.db.lock().await;
+                    let _ = db.delete_token(token);
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
             "tokenuse" | "privilegekeyuse" => {
                 let token = cmd.get("token").or_else(|| cmd.get("key")).unwrap_or("");
 
@@ -3847,73 +4993,227 @@ impl Server {
                     }
                 };
 
-                let redeemed = {
+                let redeemed_tok = {
                     let db = self.db.lock().await;
-                    db.redeem_privilege_key(token).unwrap_or(false)
+                    db.redeem_token(token).unwrap_or(None)
                 };
 
-                if redeemed {
-                    // Persist the identity so future reconnects are recognised
-                    // as Server Admin without asking for a privilege key again.
-                    if !client_uid.is_empty() {
-                        let db = self.db.lock().await;
-                        if let Err(e) = db.add_admin_identity(&client_uid) {
-                            warn!("Failed to persist admin identity {}: {:?}", client_uid, e);
-                        }
-                    }
-
-                    {
-                        let mut state = self.state.lock().await;
-                        if let Some(c) = state.get_client_mut(&peer) {
-                            c.is_admin = true;
-                        }
-                    }
-                    info!(
-                        "Client {} redeemed privilege key and is now Server Admin!",
-                        clid
-                    );
-
-                    let mut notify = Command::new("notifyclientupdated");
-                    notify.set("clid", clid.to_string());
-                    // Do NOT echo client_nickname here: the official client
-                    // treats it as a rename request and rejects it with
-                    // "nickname is already in use", dropping the connection.
-                    let _ = &nickname;
-                    notify.set("client_servergroups", "6");
-                    notify.set("client_channel_group_id", "5");
-                    notify.set("client_needed_serverquery_view_power", "75");
-
-                    let all_endpoints: Vec<SocketAddr> = {
-                        let state = self.state.lock().await;
-                        state.clients.values().map(|c| c.endpoint).collect()
-                    };
-                    for ep in all_endpoints {
-                        let _ = self.send_encrypted_command(ep, &notify).await;
-                    }
-
-                    // Push Server Admin and Channel Admin permissions immediately
-                    let _ = self
-                        .send_encrypted_raw(peer, permissions::get_server_admin_perms_wire())
-                        .await;
-                    let _ = self.send_channel_group_perm_list(peer, 5, false).await;
-
-                    let port = self.local_addr().map(|a| a.port()).unwrap_or(9988);
-                    let server_updated = build_server_updated(false, port);
-                    let _ = self.send_encrypted_command(peer, &server_updated).await;
-                }
-
                 let mut err_resp = Command::new("error");
-                if redeemed {
+                if let Some(tok) = redeemed_tok {
+                    let db = self.db.lock().await;
+                    if tok.token_type == 0 {
+                        // Server Group Token
+                        let _ = db.add_client_to_server_group(&client_uid, tok.token_id1);
+                        if tok.token_id1 == 6 {
+                            let _ = db.add_admin_identity(&client_uid);
+                            drop(db);
+                            {
+                                let mut state = self.state.lock().await;
+                                if let Some(c) = state.get_client_mut(&peer) {
+                                    c.is_admin = true;
+                                }
+                            }
+                            info!(
+                                "Client {} redeemed Server Admin privilege key!",
+                                clid
+                            );
+
+                            let mut notify = Command::new("notifyclientupdated");
+                            notify.set("clid", clid.to_string());
+                            let _ = &nickname;
+                            notify.set("client_servergroups", "6");
+                            notify.set("client_channel_group_id", "5");
+                            notify.set("client_needed_serverquery_view_power", "75");
+
+                            let all_endpoints: Vec<SocketAddr> = {
+                                let state = self.state.lock().await;
+                                state.clients.values().map(|c| c.endpoint).collect()
+                            };
+                            for ep in all_endpoints {
+                                let _ = self.send_encrypted_command(ep, &notify).await;
+                            }
+
+                            let _ = self
+                                .send_encrypted_raw(peer, permissions::get_server_admin_perms_wire())
+                                .await;
+                            let _ = self.send_channel_group_perm_list(peer, 5, false).await;
+
+                            let port = self.local_addr().map(|a| a.port()).unwrap_or(9988);
+                            let props = {
+                                let db = self.db.lock().await;
+                                db.get_all_properties().unwrap_or_default()
+                            };
+                            let server_updated = build_server_updated(false, port, &props);
+                            let _ = self.send_encrypted_command(peer, &server_updated).await;
+                        } else {
+                            // Non-admin server group token
+                            let groups = db.get_client_server_groups(&client_uid).unwrap_or_default();
+                            drop(db);
+                            let grp_str = groups.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(",");
+                            let mut notify = Command::new("notifyclientupdated");
+                            notify.set("clid", clid.to_string());
+                            notify.set("client_servergroups", &grp_str);
+                            let all_endpoints: Vec<SocketAddr> = {
+                                let state = self.state.lock().await;
+                                state.clients.values().map(|c| c.endpoint).collect()
+                            };
+                            for ep in all_endpoints {
+                                let _ = self.send_encrypted_command(ep, &notify).await;
+                            }
+                        }
+                    } else if tok.token_type == 1 {
+                        // Channel Group Token
+                        let cid = if tok.token_id2 > 0 { tok.token_id2 } else { 1 };
+                        let _ = db.set_client_channel_group(&client_uid, cid, tok.token_id1);
+                        drop(db);
+
+                        let mut notify = Command::new("notifyclientchannelgroupchanged");
+                        notify.set("cgid", tok.token_id1.to_string());
+                        notify.set("cid", cid.to_string());
+                        notify.set("clid", clid.to_string());
+                        notify.set("cgserverid", "0");
+                        let all_endpoints: Vec<SocketAddr> = {
+                            let state = self.state.lock().await;
+                            state.clients.values().map(|c| c.endpoint).collect()
+                        };
+                        for ep in all_endpoints {
+                            let _ = self.send_encrypted_command(ep, &notify).await;
+                        }
+                    }
+
                     err_resp.set("id", "0");
                     err_resp.set("msg", "ok");
                 } else {
-                    err_resp.set("id", "2564");
-                    err_resp.set("msg", "invalid\\sprivilege\\stoken");
+                    err_resp.set("id", "2561");
+                    err_resp.set("msg", "privilege key invalid");
                 }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
                 let _ = self.send_encrypted_command(peer, &err_resp).await;
+            }
+            "permfind" => {
+                let (caller_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    match state.get_client(&peer) {
+                        Some(c) => (c.uid.clone(), c.is_admin),
+                        None => (String::new(), false),
+                    }
+                };
+                let has_perm = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &caller_uid, 0, "b_virtualserver_permission_find")
+                };
+
+                let mut err_resp = Command::new("error");
+                if !has_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "34");
+                } else {
+                    let perm_name = if let Some(sid) = cmd.get("permsid") {
+                        sid.to_string()
+                    } else if let Some(pid_str) = cmd.get("permid") {
+                        pid_str
+                            .parse::<u32>()
+                            .ok()
+                            .and_then(permissions::perm_id_to_name)
+                            .map(str::to_string)
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
+                    let matches = {
+                        let db = self.db.lock().await;
+                        db.find_permissions(&perm_name).unwrap_or_default()
+                    };
+                    let parts: Vec<String> = matches
+                        .iter()
+                        .map(|m| {
+                            let pid = permissions::perm_name_to_id(&m.perm_id).unwrap_or(0);
+                            format!(
+                                "t={} id1={} id2={} p={} v={} n={} s={}",
+                                m.tier,
+                                m.id1,
+                                m.id2,
+                                pid,
+                                m.perm_value,
+                                if m.perm_negated { 1 } else { 0 },
+                                if m.perm_skip { 1 } else { 0 },
+                            )
+                        })
+                        .collect();
+                    let wire = if parts.is_empty() {
+                        "permfind".to_string()
+                    } else {
+                        format!("permfind {}", parts.join("|"))
+                    };
+                    self.send_encrypted_raw(peer, &wire).await?;
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "permidgetbyname" => {
+                let permsid = cmd.get("permsid").unwrap_or("");
+                let mut err_resp = Command::new("error");
+                if let Some(permid) = permissions::perm_name_to_id(permsid) {
+                    let mut resp = Command::new("permidgetbyname");
+                    resp.set("permsid", permsid);
+                    resp.set("permid", permid.to_string());
+                    self.send_encrypted_command(peer, &resp).await?;
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                } else {
+                    err_resp.set("id", "2563");
+                    err_resp.set("msg", "permission invalid");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "permnamebyid" => {
+                let permid: u32 = cmd.get("permid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let mut err_resp = Command::new("error");
+                if let Some(name) = permissions::perm_id_to_name(permid) {
+                    let mut resp = Command::new("permnamebyid");
+                    resp.set("permid", permid.to_string());
+                    resp.set("permsid", name);
+                    self.send_encrypted_command(peer, &resp).await?;
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                } else {
+                    err_resp.set("id", "2563");
+                    err_resp.set("msg", "permission invalid");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "permreset" => {
+                let is_admin = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                };
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "32800");
+                } else {
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
             }
             "clientdisconnect" | "quit" => {
                 let reason_id = cmd.get("reasonid").unwrap_or("3");
@@ -4975,7 +6275,12 @@ impl Server {
     }
 
     /// Sends the channel groups known to the server.
-    async fn send_channel_group_list(&self, peer: SocketAddr) -> Result<(), String> {
+    async fn send_channel_group_list(&self, peer: SocketAddr, notify: bool) -> Result<(), String> {
+        let name = if notify {
+            "notifychannelgrouplist"
+        } else {
+            "channelgrouplist"
+        };
         let groups = {
             let db = self.db.lock().await;
             db.get_channel_groups().unwrap_or_default()
@@ -4995,8 +6300,28 @@ impl Server {
                 )
             })
             .collect();
-        let wire = format!("notifychannelgrouplist {}", parts.join("|"));
+        let wire = format!("{} {}", name, parts.join("|"));
         self.send_encrypted_raw(peer, &wire).await
+    }
+
+    async fn broadcast_server_group_list(&self) {
+        let all_endpoints: Vec<SocketAddr> = {
+            let state = self.state.lock().await;
+            state.clients.values().map(|c| c.endpoint).collect()
+        };
+        for ep in all_endpoints {
+            let _ = self.send_server_group_list(ep, true).await;
+        }
+    }
+
+    async fn broadcast_channel_group_list(&self) {
+        let all_endpoints: Vec<SocketAddr> = {
+            let state = self.state.lock().await;
+            state.clients.values().map(|c| c.endpoint).collect()
+        };
+        for ep in all_endpoints {
+            let _ = self.send_channel_group_list(ep, true).await;
+        }
     }
 
     /// Channel group permissions from the database.

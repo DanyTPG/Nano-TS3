@@ -197,6 +197,53 @@ pub fn check_target_power(
     invoker_power >= target_needed
 }
 
+/// Checks whether the invoker is permitted to add, modify, or delete a permission.
+///
+/// Returns `Ok(())` if allowed, or `Err(failed_permid)` if insufficient.
+pub fn check_modify_permission(
+    db: &Database,
+    invoker_uid: &str,
+    cid: u64,
+    target_perm_name: &str,
+    target_value: Option<i64>,
+    is_grant: bool,
+) -> Result<(), u32> {
+    if invoker_uid.is_empty() {
+        return Ok(());
+    }
+
+    // 1. Caller's permission modify power
+    let invoker_modify_power = get_power(db, invoker_uid, cid, "i_permission_modify_power");
+
+    // 2. Needed modify power
+    let needed_perm_name = if is_grant || target_perm_name.starts_with("i_needed_modify_power_") {
+        "i_needed_modify_power_permission_modify_power".to_string()
+    } else {
+        format!("i_needed_modify_power_{}", target_perm_name)
+    };
+
+    let needed_modify_power = evaluate_permission(db, invoker_uid, cid, &needed_perm_name)
+        .unwrap_or(75);
+
+    if invoker_modify_power < needed_modify_power {
+        let failed_id = perm_name_to_id(&needed_perm_name)
+            .or_else(|| perm_name_to_id(target_perm_name))
+            .unwrap_or(32800);
+        return Err(failed_id);
+    }
+
+    // 3. Delegation ceiling: caller cannot grant a value exceeding their own modify power
+    // (except boolean 0/1 values and negative values)
+    if let Some(val) = target_value {
+        if val > 1 && val > invoker_modify_power {
+            let failed_id = perm_name_to_id(target_perm_name).unwrap_or(32800);
+            return Err(failed_id);
+        }
+    }
+
+    Ok(())
+}
+
 /// Builds the `notifyservergrouppermlist` wire payload for a server group.
 pub fn build_server_group_perm_list(db: &Database, sgid: u64, use_permsid: bool) -> String {
     let perms = db.get_server_group_perms(sgid).unwrap_or_default();
@@ -525,5 +572,28 @@ mod tests {
         // it stays 75!
         db.set_client_channel_group(uid, cid, 8).unwrap();
         assert_eq!(get_power(&db, uid, cid, "i_channel_modify_power"), 75);
+    }
+
+    #[test]
+    fn test_check_modify_permission() {
+        let db = Database::in_memory().expect("in-memory db");
+        let admin_uid = "admin_user";
+        db.add_client_to_server_group(admin_uid, 6).unwrap();
+
+        let guest_uid = "guest_user"; // defaults to group 8
+
+        let cid = 1;
+
+        // Admin (power 75) modifying b_channel_modify_name (needed 75) -> Ok
+        assert!(check_modify_permission(&db, admin_uid, cid, "b_channel_modify_name", Some(1), false).is_ok());
+
+        // Admin granting power 50 -> Ok
+        assert!(check_modify_permission(&db, admin_uid, cid, "i_channel_modify_power", Some(50), false).is_ok());
+
+        // Admin granting power 100 (exceeds admin's 75 power) -> Err
+        assert!(check_modify_permission(&db, admin_uid, cid, "i_channel_modify_power", Some(100), false).is_err());
+
+        // Guest (power 0) modifying b_channel_modify_name (needed 75) -> Err
+        assert!(check_modify_permission(&db, guest_uid, cid, "b_channel_modify_name", Some(1), false).is_err());
     }
 }
