@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     println!("=======================================================");
-    println!("             Nano-TS3 Minimal Server v0.1.0            ");
+    println!("             Nano-TS3 Minimal Server v{}            ", env!("CARGO_PKG_VERSION"));
     println!("=======================================================");
 
     let port: u16 = env::args()
