@@ -235,6 +235,17 @@ impl ServerState {
             .collect()
     }
 
+    pub fn connected_clients_count(&self) -> usize {
+        self.clients
+            .values()
+            .filter(|c| {
+                c.handshake_phase == HandshakePhase::Connected
+                    && c.disconnect_time.is_none()
+                    && c.last_activity.elapsed() < IDLE_TIMEOUT
+            })
+            .count()
+    }
+
     fn advance_clid(next: &mut u16) {
         *next = next.wrapping_add(1);
         if *next == 0 {

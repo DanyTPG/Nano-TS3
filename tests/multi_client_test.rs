@@ -25,6 +25,12 @@ struct ClientSession {
     pub uid: String,
     pub ask_for_privilege_key: bool,
     pub server_groups: String,
+    pub initserver_clientsonline: usize,
+    pub initserver_channelsonline: usize,
+    pub initserver_maxclients: usize,
+    pub initserver_reserved_slots: usize,
+    pub last_error_id: Option<String>,
+    pub last_error_msg: Option<String>,
     c2s_pid: u16,
     frag_buf: Vec<u8>,
 }
@@ -223,6 +229,12 @@ impl ClientSession {
             uid: String::new(),
             ask_for_privilege_key: false,
             server_groups: String::new(),
+            initserver_clientsonline: 0,
+            initserver_channelsonline: 0,
+            initserver_maxclients: 0,
+            initserver_reserved_slots: 0,
+            last_error_id: None,
+            last_error_msg: None,
             c2s_pid: 3,
             frag_buf: Vec::new(),
         };
@@ -236,6 +248,18 @@ impl ClientSession {
                 }
                 session.ask_for_privilege_key =
                     cmd.get("virtualserver_ask_for_privilegekey") == Some("1");
+                if let Some(co) = cmd.get("virtualserver_clientsonline").and_then(|s| s.parse().ok()) {
+                    session.initserver_clientsonline = co;
+                }
+                if let Some(ch) = cmd.get("virtualserver_channelsonline").and_then(|s| s.parse().ok()) {
+                    session.initserver_channelsonline = ch;
+                }
+                if let Some(mc) = cmd.get("virtualserver_maxclients").and_then(|s| s.parse().ok()) {
+                    session.initserver_maxclients = mc;
+                }
+                if let Some(rs) = cmd.get("virtualserver_reserved_slots").and_then(|s| s.parse().ok()) {
+                    session.initserver_reserved_slots = rs;
+                }
             }
             if cmd.name == "notifycliententerview"
                 && cmd.get("clid") == Some(session.clid.to_string().as_str())
@@ -248,6 +272,8 @@ impl ClientSession {
                 }
             }
             if cmd.name == "error" {
+                session.last_error_id = cmd.get("id").map(|s| s.to_string());
+                session.last_error_msg = cmd.get("msg").map(|s| s.to_string());
                 break;
             }
         }
@@ -2842,6 +2868,191 @@ async fn test_voice_relay_and_audio_fidelity() {
     let log_resp = listener.recv_until("logview", Duration::from_secs(3)).await.expect("logview resp");
     assert!(log_resp.get("l").is_some());
     let _ = listener.recv_until("error", Duration::from_secs(2)).await;
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_dynamic_client_counter_and_server_updated_broadcast() {
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // 1. Client 1 connects: online count in initserver must be 1
+    let mut client1 = ClientSession::connect(server_addr, "Alice").await;
+    assert_eq!(
+        client1.initserver_clientsonline, 1,
+        "Client 1 should see 1 client online"
+    );
+
+    // 2. Client 2 connects: online count in initserver must be 2
+    let mut client2 = ClientSession::connect(server_addr, "Bob").await;
+    assert_eq!(
+        client2.initserver_clientsonline, 2,
+        "Client 2 should see 2 clients online"
+    );
+
+    // Client 1 must receive notifyserverupdated with virtualserver_clientsonline = 2
+    let update1 = client1
+        .recv_until("notifyserverupdated", Duration::from_secs(3))
+        .await
+        .expect("Client 1 should receive notifyserverupdated when Client 2 connects");
+    assert_eq!(
+        update1.get("virtualserver_clientsonline"),
+        Some("2"),
+        "Client 1 should be notified that 2 clients are now online"
+    );
+
+    // 3. Client 3 connects: online count in initserver must be 3
+    let mut client3 = ClientSession::connect(server_addr, "Charlie").await;
+    assert_eq!(
+        client3.initserver_clientsonline, 3,
+        "Client 3 should see 3 clients online"
+    );
+
+    // Client 1 and Client 2 must receive notifyserverupdated with virtualserver_clientsonline = 3
+    let update2_on_c1 = client1
+        .recv_until("notifyserverupdated", Duration::from_secs(3))
+        .await
+        .expect("Client 1 should receive notifyserverupdated when Client 3 connects");
+    assert_eq!(
+        update2_on_c1.get("virtualserver_clientsonline"),
+        Some("3")
+    );
+
+    let update2_on_c2 = client2
+        .recv_until("notifyserverupdated", Duration::from_secs(3))
+        .await
+        .expect("Client 2 should receive notifyserverupdated when Client 3 connects");
+    assert_eq!(
+        update2_on_c2.get("virtualserver_clientsonline"),
+        Some("3")
+    );
+
+    // 4. Client 3 disconnects cleanly with quit
+    let mut quit_cmd = Command::new("quit");
+    quit_cmd.set("reasonmsg", "Leaving");
+    client3.send_command(&quit_cmd).await;
+    let _ = client3.recv_command(Duration::from_secs(1)).await;
+
+    // Client 1 must receive notifyserverupdated with virtualserver_clientsonline = 2
+    let update_after_c3_quit = client1
+        .recv_until("notifyserverupdated", Duration::from_secs(3))
+        .await
+        .expect("Client 1 should receive notifyserverupdated when Client 3 disconnects");
+    assert_eq!(
+        update_after_c3_quit.get("virtualserver_clientsonline"),
+        Some("2"),
+        "Client counter should decrement back to 2"
+    );
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_server_capacity_rejection_and_reserved_slots() {
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+
+    // Pre-register Admin 2 identity so they possess b_client_use_reserved_slot before connecting
+    let secret2 = p256::SecretKey::from_slice(&[42u8; 32]).expect("valid secret");
+    let der2 = encode_libtomcrypt_ecc_public(secret2.public_key().as_affine());
+    let uid2 = BASE64_STANDARD.encode(Sha1::digest(BASE64_STANDARD.encode(&der2).as_bytes()));
+    db.add_admin_identity(&uid2).expect("add admin identity");
+
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // 1. Admin 1 connects and redeems token
+    let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    let mut use_cmd = Command::new("privilegekeyuse");
+    use_cmd.set("token", &admin_token);
+    admin.send_command(&use_cmd).await;
+    let _ = admin.recv_until("error", Duration::from_secs(3)).await;
+
+    // 2. Test serveredit virtualserver_maxclients bounds:
+    // Attempting to set maxclients = 33 must be rejected with error 2817 ("max slot limit reached")
+    let mut edit_invalid = Command::new("serveredit");
+    edit_invalid.set("virtualserver_maxclients", "33");
+    admin.send_command(&edit_invalid).await;
+    let err_33 = admin
+        .recv_until("error", Duration::from_secs(3))
+        .await
+        .expect("err resp");
+    assert_eq!(
+        err_33.get("id"),
+        Some("2817"),
+        "maxclients > 32 must be rejected with error 2817"
+    );
+
+    // Configure maxclients = 3, reserved_slots = 1 (Regular capacity = 2, Reserved capacity = 1)
+    let mut edit_cmd = Command::new("serveredit");
+    edit_cmd.set("virtualserver_maxclients", "3");
+    edit_cmd.set("virtualserver_reserved_slots", "1");
+    admin.send_command(&edit_cmd).await;
+    let edit_ok = admin
+        .recv_until("error", Duration::from_secs(3))
+        .await
+        .expect("edit ok");
+    assert_eq!(edit_ok.get("id"), Some("0"));
+
+    // 3. Guest 1 connects (slot 2/3, regular slot 2/2)
+    let guest1 = ClientSession::connect(server_addr, "Guest1").await;
+    assert_eq!(guest1.initserver_clientsonline, 2);
+    assert_ne!(guest1.clid, 0);
+
+    // 4. Guest 2 (regular client without reserved slot power) attempts to connect:
+    // Regular capacity (max 3 - reserved 1 = 2) is already full!
+    // Must be cleanly rejected with error 1027 ("server maxclient reached")
+    let guest2 = ClientSession::connect(server_addr, "Guest2").await;
+    assert_eq!(guest2.clid, 0, "Guest 2 should not be admitted to the server");
+    assert_eq!(guest2.last_error_id.as_deref(), Some("1027"));
+    assert_eq!(
+        guest2.last_error_msg.as_deref(),
+        Some("server maxclient reached")
+    );
+
+    // Verify existing clients (Admin and Guest 1) are still fully connected and functional!
+    // No license error 1807, no disconnection!
+    let ping_cmd = Command::new("clientupdate");
+    admin.send_command(&ping_cmd).await;
+    let admin_ack = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin alive");
+    assert_eq!(admin_ack.get("id"), Some("0"));
+
+    // 5. Connect Admin 2 (possesses b_client_use_reserved_slot):
+    // Must successfully use the reserved slot (occupying slot 3/3)!
+    let mut admin2 = ClientSession::connect_with_secret(server_addr, "Admin2", Some(&secret2)).await;
+    assert_ne!(admin2.clid, 0, "Admin 2 should be admitted via reserved slot");
+    assert_eq!(admin2.initserver_clientsonline, 3);
+
+    // 6. Now all 3 slots (regular + reserved) are occupied.
+    // Even another client with reserved slot power (e.g. Admin 3) cannot exceed maxclients = 3!
+    let secret3 = p256::SecretKey::from_slice(&[43u8; 32]).expect("valid secret");
+    let admin3 = ClientSession::connect_with_secret(server_addr, "Admin3", Some(&secret3)).await;
+    assert_eq!(admin3.clid, 0, "Admin 3 must be rejected when server is completely full");
+    assert_eq!(admin3.last_error_id.as_deref(), Some("1027"));
+    assert_eq!(admin3.last_error_msg.as_deref(), Some("server maxclient reached"));
+
+    // Verify Admin 1, Guest 1, and Admin 2 all remain happily connected!
+    let ping2 = Command::new("clientupdate");
+    admin2.send_command(&ping2).await;
+    let ack2 = admin2
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin2 alive");
+    assert_eq!(ack2.get("id"), Some("0"));
 
     server_handle.abort();
 }

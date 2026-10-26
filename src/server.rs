@@ -15,7 +15,7 @@ use crate::command::Command;
 use crate::crypto::*;
 use crate::database::{BanRecord, ChannelEdit, ChannelRecord, Database};
 use crate::permissions;
-use crate::state::{ClientAudioState, HandshakePhase, ServerState};
+use crate::state::{ClientAudioState, HandshakePhase, ServerState, IDLE_TIMEOUT};
 
 pub struct Server {
     socket: Arc<UdpSocket>,
@@ -583,6 +583,8 @@ fn build_server_updated(
     ask_for_privilegekey: bool,
     port: u16,
     props: &HashMap<String, String>,
+    clients_online: usize,
+    channels_online: usize,
 ) -> Command {
     let mut cmd = Command::new("notifyserverupdated");
     cmd.set(
@@ -616,8 +618,8 @@ fn build_server_updated(
             .map(|s| s.as_str())
             .unwrap_or("0"),
     );
-    cmd.set("virtualserver_clientsonline", "1");
-    cmd.set("virtualserver_channelsonline", "1");
+    cmd.set("virtualserver_clientsonline", clients_online.to_string());
+    cmd.set("virtualserver_channelsonline", channels_online.to_string());
     cmd.set("virtualserver_uptime", "1000");
     cmd.set(
         "virtualserver_hostmessage",
@@ -1078,6 +1080,40 @@ impl Server {
             "Broadcast left view for vanished client {} (reason {})",
             gone_clid, reasonid
         );
+        self.broadcast_server_updated(None).await;
+    }
+
+    /// Broadcasts an updated `notifyserverupdated` packet containing dynamic
+    /// online client and channel counts to all currently connected clients.
+    pub async fn broadcast_server_updated(&self, exclude: Option<SocketAddr>) {
+        let port = self.local_addr().map(|a| a.port()).unwrap_or(9988);
+        let (props, channels_online) = {
+            let db = self.db.lock().await;
+            (
+                db.get_all_properties().unwrap_or_default(),
+                db.get_channels().map(|ch| ch.len()).unwrap_or(1),
+            )
+        };
+        let (clients_online, endpoints) = {
+            let state = self.state.lock().await;
+            let count = state.connected_clients_count();
+            let eps: Vec<SocketAddr> = state
+                .clients
+                .values()
+                .filter(|c| {
+                    c.handshake_phase == HandshakePhase::Connected
+                        && c.disconnect_time.is_none()
+                        && exclude.map_or(true, |ex| c.endpoint != ex)
+                })
+                .map(|c| c.endpoint)
+                .collect();
+            (count, eps)
+        };
+
+        let updated = build_server_updated(false, port, &props, clients_online, channels_online);
+        for ep in endpoints {
+            let _ = self.send_encrypted_command(ep, &updated).await;
+        }
     }
 
     /// Tell every connected client that the server is going away so the
@@ -1615,6 +1651,13 @@ impl Server {
                         "Banned client connection rejected: {} (uid: {}, ip: {}, reason: {})",
                         clid, uid, client_ip, reason
                     );
+                    {
+                        let mut state = self.state.lock().await;
+                        if let Some(c) = state.get_client_mut(&peer) {
+                            c.handshake_phase = HandshakePhase::Disconnected;
+                            c.disconnect_time = Some(std::time::Instant::now());
+                        }
+                    }
                     let mut err_resp = Command::new("error");
                     err_resp.set("id", "3329");
                     err_resp.set("msg", "connection failed, you are banned");
@@ -1662,6 +1705,13 @@ impl Server {
                         let client_hash = BASE64_STANDARD.encode(hasher.finalize());
                         if client_hash != server_pw_hash && client_pw != server_pw_hash {
                             info!("Client {} failed server password verification", clid);
+                            {
+                                let mut state = self.state.lock().await;
+                                if let Some(c) = state.get_client_mut(&peer) {
+                                    c.handshake_phase = HandshakePhase::Disconnected;
+                                    c.disconnect_time = Some(std::time::Instant::now());
+                                }
+                            }
                             let mut err_resp = Command::new("error");
                             err_resp.set("id", "520");
                             err_resp.set("msg", "invalid server password");
@@ -1673,6 +1723,78 @@ impl Server {
                         }
                     }
                 }
+
+                // Capacity and reserved slots check:
+                // Prevents client-side license invalidation (error 1807 / 0x70f)
+                // and accurately enforces virtualserver_maxclients and virtualserver_reserved_slots.
+                let max_clients: usize = props
+                    .get("virtualserver_maxclients")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(32);
+                let reserved_slots: usize = props
+                    .get("virtualserver_reserved_slots")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                let active_clients = {
+                    let state = self.state.lock().await;
+                    state
+                        .clients
+                        .values()
+                        .filter(|c| {
+                            c.clid != clid
+                                && c.handshake_phase == HandshakePhase::Connected
+                                && c.disconnect_time.is_none()
+                                && c.last_activity.elapsed() < IDLE_TIMEOUT
+                        })
+                        .count()
+                };
+
+                let has_reserved_slot = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(
+                        &db,
+                        &uid,
+                        0,
+                        "b_client_use_reserved_slot",
+                    )
+                };
+
+                let regular_capacity = max_clients.saturating_sub(reserved_slots);
+                let is_full = if active_clients >= max_clients {
+                    true
+                } else if active_clients >= regular_capacity {
+                    !has_reserved_slot
+                } else {
+                    false
+                };
+
+                if is_full {
+                    info!(
+                        "Server full! Rejecting client {} (uid: {}): active={}, max={}, reserved={}, has_reserved={}",
+                        clid, uid, active_clients, max_clients, reserved_slots, has_reserved_slot
+                    );
+                    {
+                        let mut state = self.state.lock().await;
+                        if let Some(c) = state.get_client_mut(&peer) {
+                            c.handshake_phase = HandshakePhase::Disconnected;
+                            c.disconnect_time = Some(std::time::Instant::now());
+                        }
+                    }
+                    let mut err_resp = Command::new("error");
+                    err_resp.set("id", "1027");
+                    err_resp.set("msg", "server maxclient reached");
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    self.send_encrypted_command(peer, &err_resp).await?;
+                    return Ok(());
+                }
+
+                let channels_count = {
+                    let db = self.db.lock().await;
+                    db.get_channels().map(|ch| ch.len()).unwrap_or(1)
+                };
 
                 // 1. initserver
                 let mut initserver = Command::new("initserver");
@@ -1830,8 +1952,9 @@ impl Server {
                 initserver.set("virtualserver_hostbanner_mode", "0");
                 initserver.set("virtualserver_channel_temp_delete_delay_default", "0");
                 initserver.set("virtualserver_unique_identifier", "nano_ts3_vserver_1");
-                initserver.set("virtualserver_channelsonline", "1");
-                initserver.set("virtualserver_clientsonline", "1");
+                initserver.set("virtualserver_channelsonline", channels_count.to_string());
+                initserver.set("virtualserver_clientsonline", (active_clients + 1).to_string());
+                initserver.set("virtualserver_reserved_slots", reserved_slots.to_string());
                 initserver.set("virtualserver_queryclientsonline", "0");
                 initserver.set("virtualserver_query_client_connections", "0");
                 initserver.set("virtualserver_client_connections", "0");
@@ -2045,6 +2168,7 @@ impl Server {
                     "Client {} ({}) successfully entered the server!",
                     clid, peer
                 );
+                self.broadcast_server_updated(Some(peer)).await;
             }
             "clientupdate" => {
                 let (notify, recipients) = {
@@ -2516,7 +2640,21 @@ impl Server {
                     let db = self.db.lock().await;
                     db.get_all_properties().unwrap_or_default()
                 };
-                let updated = build_server_updated(ask_for_privilege_key, port, &props);
+                let (clients_online, channels_online) = {
+                    let state = self.state.lock().await;
+                    let db = self.db.lock().await;
+                    (
+                        state.connected_clients_count(),
+                        db.get_channels().map(|ch| ch.len()).unwrap_or(1),
+                    )
+                };
+                let updated = build_server_updated(
+                    ask_for_privilege_key,
+                    port,
+                    &props,
+                    clients_online,
+                    channels_online,
+                );
                 self.send_encrypted_command(peer, &updated).await?;
 
                 let mut err_resp = Command::new("error");
@@ -2593,7 +2731,21 @@ impl Server {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
                     err_resp.set("failed_permid", failed_id.to_string());
-                } else {
+                } else if let Some(max_str) = cmd.params.get("virtualserver_maxclients") {
+                    if let Ok(val) = max_str.parse::<usize>() {
+                        if val > 32 {
+                            err_resp.set("id", "2817");
+                            err_resp.set("msg", "max slot limit reached");
+                            if let Some(rc) = cmd.get("return_code") {
+                                err_resp.set("return_code", rc);
+                            }
+                            self.send_encrypted_command(peer, &err_resp).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+
+                if failure.is_none() {
                     let mut changed = Vec::new();
                     {
                         let db = self.db.lock().await;
@@ -2636,6 +2788,7 @@ impl Server {
                         for ep in all_endpoints {
                             let _ = self.send_encrypted_command(ep, &notify).await;
                         }
+                        self.broadcast_server_updated(None).await;
                     }
 
                     err_resp.set("id", "0");
@@ -2656,11 +2809,7 @@ impl Server {
                 let (clients_online, channels_online) = {
                     let state = self.state.lock().await;
                     let db = self.db.lock().await;
-                    let clients = state
-                        .clients
-                        .values()
-                        .filter(|c| c.handshake_phase == HandshakePhase::Connected)
-                        .count();
+                    let clients = state.connected_clients_count();
                     let channels = db.get_channels().map(|ch| ch.len()).unwrap_or(1);
                     (clients, channels)
                 };
@@ -5045,7 +5194,21 @@ impl Server {
                                 let db = self.db.lock().await;
                                 db.get_all_properties().unwrap_or_default()
                             };
-                            let server_updated = build_server_updated(false, port, &props);
+                            let (clients_online, channels_online) = {
+                                let state = self.state.lock().await;
+                                let db = self.db.lock().await;
+                                (
+                                    state.connected_clients_count(),
+                                    db.get_channels().map(|ch| ch.len()).unwrap_or(1),
+                                )
+                            };
+                            let server_updated = build_server_updated(
+                                false,
+                                port,
+                                &props,
+                                clients_online,
+                                channels_online,
+                            );
                             let _ = self.send_encrypted_command(peer, &server_updated).await;
                         } else {
                             // Non-admin server group token
@@ -5268,6 +5431,7 @@ impl Server {
                 }
 
                 info!("Client {} disconnecting (reason {})", clid, reason_id);
+                self.broadcast_server_updated(None).await;
             }
             "clientkick" => {
                 let reason_id = cmd.get("reasonid").unwrap_or("4");
@@ -5463,6 +5627,7 @@ impl Server {
                                     "Client {} kicked {} ({}) from server",
                                     clid, target_clid, target_nick
                                 );
+                                self.broadcast_server_updated(None).await;
                                 err_resp.set("id", "0");
                                 err_resp.set("msg", "ok");
                             } else {
@@ -5663,6 +5828,7 @@ impl Server {
                                 "Client {} banned {} ({}) ban_id={}",
                                 clid, target_clid, target_nick, ban_id
                             );
+                            self.broadcast_server_updated(None).await;
                         } else {
                             info!(
                                 "Client {} added ban for uid {} ban_id={}",
