@@ -821,7 +821,8 @@ async fn test_channel_edit_and_delete() {
         .recv_until("error", Duration::from_secs(2))
         .await
         .expect("guest edit error");
-    assert_eq!(guest_err.get("id"), Some("2563"));
+    assert_eq!(guest_err.get("id"), Some("2568"));
+    assert_eq!(guest_err.get("failed_permid"), Some("112"));
 
     // 4. Admin edits channel -> success and broadcast with reasonid=10
     let mut admin_edit = Command::new("channeledit");
@@ -1762,6 +1763,447 @@ async fn test_channel_password_edit_and_connection_info_default_clid() {
     assert_eq!(self_info.get("clid"), Some(guest.clid.to_string().as_str()));
     assert!(self_info.get("connection_client_ip").is_some());
     assert!(self_info.get("connection_client_port").is_some());
+
+    server_handle.abort();
+}
+
+/// Tests the channel permissions tab:
+/// - channelpermlist
+/// - channeladdperm
+/// - channeldelperm
+/// - permoverview
+/// - verifying clientmove gate enforced by channel permissions
+#[tokio::test]
+async fn test_channel_permissions_tab_and_permoverview() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "Admin").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgrade notification");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut guest = ClientSession::connect(server_addr, "Guest").await;
+    let _ = guest
+        .recv_until("notifycliententerview", Duration::from_secs(2))
+        .await;
+
+    // 1. Create SecuredArea channel
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "SecuredArea");
+    create.set("channel_flag_permanent", "1");
+    admin.send_command(&create).await;
+    let created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let cid = created.get("cid").expect("cid").to_string();
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // 2. Query channel permissions list via channelpermlist (initially empty)
+    let mut get_perms = Command::new("channelpermlist");
+    get_perms.set("cid", &cid);
+    admin.send_command(&get_perms).await;
+    let empty_perms_err = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("channelpermlist response");
+    assert_eq!(empty_perms_err.get("id"), Some("0"));
+
+    // 3. Add channel permission: i_channel_needed_join_power = 75
+    let mut add_perm = Command::new("channeladdperm");
+    add_perm.set("cid", &cid);
+    add_perm.set("permsid", "i_channel_needed_join_power");
+    add_perm.set("permvalue", "75");
+    admin.send_command(&add_perm).await;
+    let add_err = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("channeladdperm ok");
+    assert_eq!(add_err.get("id"), Some("0"));
+
+    // 4. Query channelpermlist again, should return the added permission
+    let mut get_perms2 = Command::new("channelpermlist");
+    get_perms2.set("cid", &cid);
+    admin.send_command(&get_perms2).await;
+    let permlist_resp = admin
+        .recv_until("notifychannelpermlist", Duration::from_secs(2))
+        .await
+        .expect("channelpermlist entry");
+    assert_eq!(permlist_resp.get("cid"), Some(cid.as_str()));
+    assert_eq!(permlist_resp.get("permid"), Some("140")); // i_channel_needed_join_power
+    assert_eq!(permlist_resp.get("permvalue"), Some("75"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // 5. Guest tries to join SecuredArea -> fails with 2568 (insufficient client permissions)
+    let mut guest_join = Command::new("clientmove");
+    guest_join.set("cid", &cid);
+    guest_join.set("clid", "0");
+    guest.send_command(&guest_join).await;
+    let join_err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("guest join error");
+    assert_eq!(join_err.get("id"), Some("2568"));
+    assert_eq!(join_err.get("failed_permid"), Some("140"));
+
+    // 6. Admin CAN join because admin has join_power = 75 (Server Admin)
+    let mut admin_join = Command::new("clientmove");
+    admin_join.set("cid", &cid);
+    admin_join.set("clid", "0");
+    admin.send_command(&admin_join).await;
+    let admin_moved = admin
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("admin moved successfully");
+    assert_eq!(admin_moved.get("ctid"), Some(cid.as_str()));
+
+    // 7. Delete channel permission via channeldelperm
+    let mut del_perm = Command::new("channeldelperm");
+    del_perm.set("cid", &cid);
+    del_perm.set("permsid", "i_channel_needed_join_power");
+    admin.send_command(&del_perm).await;
+    let del_err = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("channeldelperm ok");
+    assert_eq!(del_err.get("id"), Some("0"));
+
+    // 8. Now Guest can join SecuredArea
+    let mut guest_join_again = Command::new("clientmove");
+    guest_join_again.set("cid", &cid);
+    guest_join_again.set("clid", "0");
+    guest.send_command(&guest_join_again).await;
+    let guest_moved = guest
+        .recv_until("notifyclientmoved", Duration::from_secs(2))
+        .await
+        .expect("guest moved successfully after perm deleted");
+    assert_eq!(guest_moved.get("ctid"), Some(cid.as_str()));
+
+    // 9. Test permoverview command
+    let mut perm_overview = Command::new("permoverview");
+    perm_overview.set("cid", &cid);
+    perm_overview.set("cldbid", "1");
+    perm_overview.set("permsid", "b_channel_modify_make_permanent");
+    admin.send_command(&perm_overview).await;
+    let overview_reply = admin
+        .recv_until("notifypermoverview", Duration::from_secs(2))
+        .await
+        .expect("permoverview notification");
+    assert!(overview_reply.get("t").is_some());
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    server_handle.abort();
+}
+
+/// End-to-end test verifying all 4 tabs of the Channel Edit Dialog:
+/// - Tab 1 (Standard): Name rename, phonetic name, password set/verify/clear, topic, description, icon ID
+/// - Tab 2 (Audio): Codecs (Opus Voice, Opus Music), quality, latency factor, unencrypted voice toggle
+/// - Tab 3 (Permissions): Talk power, subscribe power, permission checks, channeladdperm/channeldelperm/channelpermlist
+/// - Tab 4 (Advanced): Permanence flags, default channel switch, channel ordering, client limits enforcement (777), family limits, delete delay
+#[tokio::test]
+async fn test_edit_channel_all_tabs_end_to_end() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // 1. Connect Admin and Guest
+    let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgraded");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut guest = ClientSession::connect(server_addr, "GuestUser").await;
+    let _ = guest.recv_until("notifycliententerview", Duration::from_secs(2)).await;
+
+    // 2. Create channel "TabsTestChannel"
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "TabsTestChannel");
+    create.set("channel_flag_permanent", "1");
+    admin.send_command(&create).await;
+    let created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let cid = created.get("cid").expect("cid").to_string();
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // ==========================================
+    // TAB 1: STANDARD TAB
+    // ==========================================
+    // A. channelgetdescription
+    let mut get_desc = Command::new("channelgetdescription");
+    get_desc.set("cid", &cid);
+    admin.send_command(&get_desc).await;
+    let init_desc = admin
+        .recv_until("notifychanneledited", Duration::from_secs(2))
+        .await
+        .expect("channelgetdescription response");
+    assert_eq!(init_desc.get("reasonid"), Some("9"));
+    assert_eq!(init_desc.get("channel_description"), Some(""));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // B. Edit Standard tab fields: name, phonetic, password, topic, description, icon_id
+    let mut edit_std = Command::new("channeledit");
+    edit_std.set("cid", &cid);
+    edit_std.set("channel_name", "StandardTabRenamed");
+    edit_std.set("channel_name_phonetic", "StdPhonetic");
+    edit_std.set("channel_password", "myChannelSecret");
+    edit_std.set("channel_topic", "StandardTopicTest");
+    edit_std.set("channel_description", "FullChannelDescriptionHere");
+    edit_std.set("channel_icon_id", "67890");
+    admin.send_command(&edit_std).await;
+
+    let std_edited = admin
+        .recv_until("notifychanneledited", Duration::from_secs(2))
+        .await
+        .expect("standard tab edit broadcast");
+    assert_eq!(std_edited.get("reasonid"), Some("10"));
+    assert_eq!(std_edited.get("channel_name"), Some("StandardTabRenamed"));
+    assert_eq!(std_edited.get("channel_name_phonetic"), Some("StdPhonetic"));
+    assert_eq!(std_edited.get("channel_flag_password"), Some("1"));
+    assert_eq!(std_edited.get("channel_topic"), Some("StandardTopicTest"));
+    assert_eq!(std_edited.get("channel_description"), Some("FullChannelDescriptionHere"));
+    assert_eq!(std_edited.get("channel_icon_id"), Some("67890"));
+    let _ = admin.recv_until("notifychannelpasswordchanged", Duration::from_secs(2)).await.expect("pw notification");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // C. Verify guest cannot join without password
+    let mut move_no_pw = Command::new("clientmove");
+    move_no_pw.set("cid", &cid);
+    move_no_pw.set("clid", "0");
+    guest.send_command(&move_no_pw).await;
+    let pw_err = guest.recv_until("error", Duration::from_secs(2)).await.expect("err");
+    assert_eq!(pw_err.get("id"), Some("781"), "channel_invalid_password");
+
+    // D. Guest joins with correct password
+    let mut move_with_pw = Command::new("clientmove");
+    move_with_pw.set("cid", &cid);
+    move_with_pw.set("clid", "0");
+    move_with_pw.set("cpw", "myChannelSecret");
+    guest.send_command(&move_with_pw).await;
+    let guest_moved = guest.recv_until("notifyclientmoved", Duration::from_secs(2)).await.expect("moved");
+    assert_eq!(guest_moved.get("ctid"), Some(cid.as_str()));
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+
+    // E. Clear password via channel_flag_password=0
+    let mut clear_pw = Command::new("channeledit");
+    clear_pw.set("cid", &cid);
+    clear_pw.set("channel_flag_password", "0");
+    admin.send_command(&clear_pw).await;
+    let cleared_edited = admin.recv_until("notifychanneledited", Duration::from_secs(2)).await.expect("cleared");
+    assert_eq!(cleared_edited.get("channel_flag_password"), Some("0"));
+    let _ = admin.recv_until("notifychannelpasswordchanged", Duration::from_secs(2)).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // Move guest out and back in with no password
+    let mut move_out = Command::new("clientmove");
+    move_out.set("cid", "1");
+    move_out.set("clid", "0");
+    guest.send_command(&move_out).await;
+    let _ = guest.recv_until("notifyclientmoved", Duration::from_secs(2)).await;
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut move_in_free = Command::new("clientmove");
+    move_in_free.set("cid", &cid);
+    move_in_free.set("clid", "0");
+    guest.send_command(&move_in_free).await;
+    let free_moved = guest.recv_until("notifyclientmoved", Duration::from_secs(2)).await.expect("free moved");
+    assert_eq!(free_moved.get("ctid"), Some(cid.as_str()));
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+
+    // ==========================================
+    // TAB 2: AUDIO TAB
+    // ==========================================
+    // Edit codec=4 (Opus Voice), quality=7, latency=2, unencrypted=1
+    let mut edit_audio1 = Command::new("channeledit");
+    edit_audio1.set("cid", &cid);
+    edit_audio1.set("channel_codec", "4");
+    edit_audio1.set("channel_codec_quality", "7");
+    edit_audio1.set("channel_codec_latency_factor", "2");
+    edit_audio1.set("channel_codec_is_unencrypted", "1");
+    admin.send_command(&edit_audio1).await;
+
+    let audio1_edited = admin.recv_until("notifychanneledited", Duration::from_secs(2)).await.expect("audio edit 1");
+    assert_eq!(audio1_edited.get("channel_codec"), Some("4"));
+    assert_eq!(audio1_edited.get("channel_codec_quality"), Some("7"));
+    assert_eq!(audio1_edited.get("channel_codec_latency_factor"), Some("2"));
+    assert_eq!(audio1_edited.get("channel_codec_is_unencrypted"), Some("1"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // Edit codec=5 (Opus Music), quality=10, latency=5, unencrypted=0
+    let mut edit_audio2 = Command::new("channeledit");
+    edit_audio2.set("cid", &cid);
+    edit_audio2.set("channel_codec", "5");
+    edit_audio2.set("channel_codec_quality", "10");
+    edit_audio2.set("channel_codec_latency_factor", "5");
+    edit_audio2.set("channel_codec_is_unencrypted", "0");
+    admin.send_command(&edit_audio2).await;
+
+    let audio2_edited = admin.recv_until("notifychanneledited", Duration::from_secs(2)).await.expect("audio edit 2");
+    assert_eq!(audio2_edited.get("channel_codec"), Some("5"));
+    assert_eq!(audio2_edited.get("channel_codec_quality"), Some("10"));
+    assert_eq!(audio2_edited.get("channel_codec_latency_factor"), Some("5"));
+    assert_eq!(audio2_edited.get("channel_codec_is_unencrypted"), Some("0"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // ==========================================
+    // TAB 3: PERMISSIONS TAB
+    // ==========================================
+    // A. Powers in channeledit: needed_talk_power=30, needed_subscribe_power=15
+    let mut edit_powers = Command::new("channeledit");
+    edit_powers.set("cid", &cid);
+    edit_powers.set("channel_needed_talk_power", "30");
+    edit_powers.set("channel_needed_subscribe_power", "15");
+    admin.send_command(&edit_powers).await;
+
+    let powers_edited = admin.recv_until("notifychanneledited", Duration::from_secs(2)).await.expect("powers edit");
+    assert_eq!(powers_edited.get("channel_needed_talk_power"), Some("30"));
+    assert_eq!(powers_edited.get("channel_needed_subscribe_power"), Some("15"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // B. Guest attempts unauthorized channeledit -> rejected with 2568
+    let mut guest_unauth = Command::new("channeledit");
+    guest_unauth.set("cid", &cid);
+    guest_unauth.set("channel_topic", "HackedTopic");
+    guest.send_command(&guest_unauth).await;
+    let unauth_err = guest.recv_until("error", Duration::from_secs(2)).await.expect("unauth error");
+    assert_eq!(unauth_err.get("id"), Some("2568"));
+    assert_eq!(unauth_err.get("failed_permid"), Some("113")); // b_channel_modify_topic
+
+    // C. Advanced permissions via channeladdperm / channelpermlist / channeldelperm
+    let mut add_perm = Command::new("channeladdperm");
+    add_perm.set("cid", &cid);
+    add_perm.set("permsid", "i_channel_needed_modify_power");
+    add_perm.set("permvalue", "70");
+    admin.send_command(&add_perm).await;
+    let add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("add ok");
+    assert_eq!(add_ok.get("id"), Some("0"));
+
+    let mut get_perms = Command::new("channelpermlist");
+    get_perms.set("cid", &cid);
+    admin.send_command(&get_perms).await;
+    let perms_list = admin.recv_until("notifychannelpermlist", Duration::from_secs(2)).await.expect("permlist");
+    assert_eq!(perms_list.get("cid"), Some(cid.as_str()));
+    assert_eq!(perms_list.get("permid"), Some("125")); // i_channel_needed_modify_power
+    assert_eq!(perms_list.get("permvalue"), Some("70"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut del_perm = Command::new("channeldelperm");
+    del_perm.set("cid", &cid);
+    del_perm.set("permsid", "i_channel_needed_modify_power");
+    admin.send_command(&del_perm).await;
+    let del_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("del ok");
+    assert_eq!(del_ok.get("id"), Some("0"));
+
+    // ==========================================
+    // TAB 4: ADVANCED TAB
+    // ==========================================
+    // A. Permanence: change to semi-permanent
+    let mut edit_perm = Command::new("channeledit");
+    edit_perm.set("cid", &cid);
+    edit_perm.set("channel_flag_semi_permanent", "1");
+    admin.send_command(&edit_perm).await;
+    let perm_edited = admin.recv_until("notifychanneledited", Duration::from_secs(2)).await.expect("semi-perm");
+    assert_eq!(perm_edited.get("channel_flag_semi_permanent"), Some("1"));
+    assert_eq!(perm_edited.get("channel_flag_permanent"), Some("0"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // B. Limits: maxclients=1, maxfamilyclients=2, delete_delay=45
+    let mut edit_limits = Command::new("channeledit");
+    edit_limits.set("cid", &cid);
+    edit_limits.set("channel_flag_maxclients_unlimited", "0");
+    edit_limits.set("channel_maxclients", "1");
+    edit_limits.set("channel_flag_maxfamilyclients_unlimited", "0");
+    edit_limits.set("channel_maxfamilyclients", "2");
+    edit_limits.set("channel_delete_delay", "45");
+    admin.send_command(&edit_limits).await;
+
+    let limits_edited = admin.recv_until("notifychanneledited", Duration::from_secs(2)).await.expect("limits edit");
+    assert_eq!(limits_edited.get("channel_flag_maxclients_unlimited"), Some("0"));
+    assert_eq!(limits_edited.get("channel_maxclients"), Some("1"));
+    assert_eq!(limits_edited.get("channel_flag_maxfamilyclients_unlimited"), Some("0"));
+    assert_eq!(limits_edited.get("channel_maxfamilyclients"), Some("2"));
+    assert_eq!(limits_edited.get("channel_delete_delay"), Some("45"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // Move guest to channel 1, admin joins channel (making it full: 1/1)
+    let mut move_guest_1 = Command::new("clientmove");
+    move_guest_1.set("cid", "1");
+    move_guest_1.set("clid", "0");
+    guest.send_command(&move_guest_1).await;
+    let _ = guest.recv_until("notifyclientmoved", Duration::from_secs(2)).await;
+    let _ = guest.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut admin_join = Command::new("clientmove");
+    admin_join.set("cid", &cid);
+    admin_join.set("clid", "0");
+    admin.send_command(&admin_join).await;
+    let _ = admin.recv_until("notifyclientmoved", Duration::from_secs(2)).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // Guest tries to join full channel -> error 777
+    let mut guest_join_full = Command::new("clientmove");
+    guest_join_full.set("cid", &cid);
+    guest_join_full.set("clid", "0");
+    guest.send_command(&guest_join_full).await;
+    let full_err = guest.recv_until("error", Duration::from_secs(2)).await.expect("full error");
+    assert_eq!(full_err.get("id"), Some("777"), "channel maxclients reached");
+
+    // C. Default channel toggle
+    let mut create_def = Command::new("channelcreate");
+    create_def.set("channel_name", "NewDefaultCandidate");
+    create_def.set("channel_flag_permanent", "1");
+    admin.send_command(&create_def).await;
+    let def_created = admin.recv_until("notifychannelcreated", Duration::from_secs(2)).await.expect("def channel created");
+    let def_cid = def_created.get("cid").expect("def cid").to_string();
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut make_default = Command::new("channeledit");
+    make_default.set("cid", &def_cid);
+    make_default.set("channel_flag_default", "1");
+    admin.send_command(&make_default).await;
+    let def_edited = admin.recv_until("notifychanneledited", Duration::from_secs(2)).await.expect("def edited");
+    assert_eq!(def_edited.get("channel_flag_default"), Some("1"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // D. Channel ordering: reposition def_cid after channel 1
+    let mut reorder = Command::new("channeledit");
+    reorder.set("cid", &def_cid);
+    reorder.set("channel_order", "1");
+    admin.send_command(&reorder).await;
+    let order_edited = admin.recv_until("notifychanneledited", Duration::from_secs(2)).await.expect("order edited");
+    assert!(order_edited.get("channel_order").is_some());
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
 
     server_handle.abort();
 }

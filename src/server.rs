@@ -1656,9 +1656,9 @@ impl Server {
                     self.send_encrypted_raw(peer, permissions::get_server_admin_perms_wire())
                         .await?;
                 }
-                self.send_channel_group_perm_list(peer, 8).await?;
+                self.send_channel_group_perm_list(peer, 8, false).await?;
                 if is_admin {
-                    self.send_channel_group_perm_list(peer, 5).await?;
+                    self.send_channel_group_perm_list(peer, 5, false).await?;
                 }
 
                 // Send channel and client permission hints to enable client
@@ -2045,10 +2045,15 @@ impl Server {
                         .unwrap_or_else(|| ("User".to_string(), String::new(), false))
                 };
 
-                // Moving another client requires admin rights.
+                // Moving another client requires move power.
                 let moves_others = target_clids.iter().any(|t| *t != clid);
+                let can_move = !moves_others || sender_admin || {
+                    let db = self.db.lock().await;
+                    let move_power = permissions::get_power(&db, &sender_uid, 0, "i_client_move_power");
+                    move_power >= 50
+                };
                 let mut err_resp = Command::new("error");
-                if moves_others && !sender_admin {
+                if !can_move {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
                     err_resp.set("failed_permid", "43"); // i_client_move_power
@@ -2069,12 +2074,13 @@ impl Server {
                     };
 
                     // Joining a password-protected channel requires the right
-                    // `cpw` for self-moves. Admin-driven moves bypass it, like
-                    // the official server's i_client_move_power and
-                    // b_channel_join_ignore_password.
+                    // `cpw` for self-moves. Admin-driven moves or b_channel_join_ignore_password bypass it.
                     let is_password_ok = if channel_password.is_empty() {
                         true
-                    } else if sender_admin {
+                    } else if {
+                        let db = self.db.lock().await;
+                        permissions::has_permission(&db, &sender_uid, new_cid, "b_channel_join_ignore_password")
+                    } {
                         true
                     } else {
                         cmd.get("cpw")
@@ -2083,8 +2089,22 @@ impl Server {
                             .unwrap_or(false)
                     };
 
-                    if is_password_ok
-                    {
+                    let can_join_power = sender_admin || {
+                        let db = self.db.lock().await;
+                        let needed_join = permissions::get_power(&db, &sender_uid, new_cid, "i_channel_needed_join_power");
+                        let join_power = permissions::get_power(&db, &sender_uid, new_cid, "i_channel_join_power");
+                        join_power >= needed_join
+                    };
+
+                    if !can_join_power {
+                        err_resp.set("id", "2568");
+                        err_resp.set("msg", "insufficient client permissions");
+                        err_resp.set("failed_permid", "140"); // i_channel_needed_join_power
+                    } else if !is_password_ok {
+                        // 781 = ERROR_channel_invalid_password
+                        err_resp.set("id", "781");
+                        err_resp.set("msg", "invalid channel password");
+                    } else {
                         let (occupants, already_there) = {
                             let state = self.state.lock().await;
                             let occupants = state.clients_in_channel(new_cid).len() as i64;
@@ -2100,10 +2120,15 @@ impl Server {
                                 .count() as i64;
                             (occupants, already_there)
                         };
+                        let can_ignore_maxclients = sender_admin || {
+                            let db = self.db.lock().await;
+                            permissions::has_permission(&db, &sender_uid, new_cid, "b_channel_join_ignore_maxclients")
+                        };
                         let arrivals = target_clids.len() as i64 - already_there;
                         if !max_unlimited
                             && max_clients >= 0
                             && occupants + arrivals > max_clients
+                            && !can_ignore_maxclients
                         {
                             // 777 = ERROR_channel_maxclients_reached
                             err_resp.set("id", "777");
@@ -2122,10 +2147,6 @@ impl Server {
                             err_resp.set("id", "0");
                             err_resp.set("msg", "ok");
                         }
-                    } else {
-                        // 781 = ERROR_channel_invalid_password
-                        err_resp.set("id", "781");
-                        err_resp.set("msg", "invalid channel password");
                     }
                 }
                 if let Some(rc) = cmd.get("return_code") {
@@ -2430,18 +2451,96 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "servergrouppermlist" => {
-                let sgid = cmd.get("sgid").unwrap_or("6");
-                if sgid == "6" {
-                    self.send_encrypted_raw(peer, permissions::get_server_admin_perms_wire())
-                        .await?;
-                } else {
-                    self.send_encrypted_raw(peer, permissions::get_guest_perms_wire())
-                        .await?;
-                }
+                let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(6);
+                let use_permsid = cmd.params.contains_key("permsid");
+                self.send_server_group_perm_list(peer, sgid, use_permsid).await?;
 
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
                 err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "servergroupaddperm" => {
+                let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let param_sets = cmd.parse_piped_param_sets();
+                let is_admin = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    let db = self.db.lock().await;
+                    for pset in param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val: i64 = pset
+                            .get("permvalue")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        let neg = pset.get("permnegated").map(|v| v == "1").unwrap_or(false);
+                        let skip = pset.get("permskip").map(|v| v == "1").unwrap_or(false);
+
+                        if let Some(pname) = perm_name {
+                            let _ = db.set_server_group_perm(sgid, &pname, val, neg, skip);
+                        }
+                    }
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "servergroupdelperm" => {
+                let sgid: u64 = cmd.get("sgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let param_sets = cmd.parse_piped_param_sets();
+                let is_admin = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    let db = self.db.lock().await;
+                    for pset in param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        if let Some(pname) = perm_name {
+                            let _ = db.del_server_group_perm(sgid, &pname);
+                        }
+                    }
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
@@ -2459,12 +2558,408 @@ impl Server {
                 self.send_encrypted_command(peer, &err_resp).await?;
             }
             "channelgrouppermlist" => {
-                let cgid: u16 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(8);
-                self.send_channel_group_perm_list(peer, cgid).await?;
+                let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(8);
+                let use_permsid = cmd.params.contains_key("permsid");
+                self.send_channel_group_perm_list(peer, cgid, use_permsid).await?;
 
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
                 err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "channelgroupaddperm" => {
+                let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let param_sets = cmd.parse_piped_param_sets();
+                let (uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+
+                let mut err_resp = Command::new("error");
+                let mut permission_ok = is_admin;
+                if !permission_ok {
+                    let db = self.db.lock().await;
+                    let mod_power =
+                        permissions::get_power(&db, &uid, 0, "i_group_modify_power");
+                    permission_ok = mod_power >= 50;
+                }
+                if !permission_ok {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    let db = self.db.lock().await;
+                    for pset in param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val: i64 = pset
+                            .get("permvalue")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        let neg = pset.get("permnegated").map(|v| v == "1").unwrap_or(false);
+                        let skip = pset.get("permskip").map(|v| v == "1").unwrap_or(false);
+
+                        if let Some(pname) = perm_name {
+                            let _ = db.set_channel_group_perm(cgid, &pname, val, neg, skip);
+                        }
+                    }
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "channelgroupdelperm" => {
+                let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let param_sets = cmd.parse_piped_param_sets();
+                let is_admin = {
+                    let state = self.state.lock().await;
+                    state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    let db = self.db.lock().await;
+                    for pset in param_sets {
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        if let Some(pname) = perm_name {
+                            let _ = db.del_channel_group_perm(cgid, &pname);
+                        }
+                    }
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "channelpermlist" => {
+                let cid: u64 = cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let use_permsid = cmd.params.contains_key("permsid");
+                let (has_list_perm, is_admin) = {
+                    let (uid, is_adm) = {
+                        let state = self.state.lock().await;
+                        state
+                            .get_client(&peer)
+                            .map(|c| (c.uid.clone(), c.is_admin))
+                            .unwrap_or_default()
+                    };
+                    let db = self.db.lock().await;
+                    let has_p = permissions::has_permission(
+                        &db,
+                        &uid,
+                        cid,
+                        "b_virtualserver_channel_permission_list",
+                    );
+                    (has_p, is_adm)
+                };
+
+                let mut err_resp = Command::new("error");
+                if !is_admin && !has_list_perm {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    let wire = {
+                        let db = self.db.lock().await;
+                        permissions::build_channel_perm_list(&db, cid, use_permsid)
+                    };
+                    if wire != "notifychannelpermlist" {
+                        self.send_encrypted_raw(peer, &wire).await?;
+                    }
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "channeladdperm" => {
+                let (uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let param_sets = cmd.parse_piped_param_sets();
+                let default_cid: u64 =
+                    cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+                let mut err_resp = Command::new("error");
+                let mut permission_ok = is_admin;
+                if !permission_ok {
+                    let db = self.db.lock().await;
+                    let mod_power = permissions::get_power(
+                        &db,
+                        &uid,
+                        default_cid,
+                        "i_channel_permission_modify_power",
+                    );
+                    let needed = permissions::get_power(
+                        &db,
+                        &uid,
+                        default_cid,
+                        "i_channel_needed_permission_modify_power",
+                    );
+                    permission_ok = mod_power >= needed && mod_power > 0;
+                }
+
+                if !permission_ok {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    let db = self.db.lock().await;
+                    for pset in param_sets {
+                        let cid = pset
+                            .get("cid")
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(default_cid);
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        let val: i64 = pset
+                            .get("permvalue")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        let neg = pset.get("permnegated").map(|v| v == "1").unwrap_or(false);
+                        let skip = pset.get("permskip").map(|v| v == "1").unwrap_or(false);
+
+                        if let Some(pname) = perm_name {
+                            let _ = db.set_channel_perm(cid, &pname, val, neg, skip);
+                        }
+                    }
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "channeldelperm" => {
+                let (uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+                let param_sets = cmd.parse_piped_param_sets();
+                let default_cid: u64 =
+                    cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+                let mut err_resp = Command::new("error");
+                let mut permission_ok = is_admin;
+                if !permission_ok {
+                    let db = self.db.lock().await;
+                    let mod_power = permissions::get_power(
+                        &db,
+                        &uid,
+                        default_cid,
+                        "i_channel_permission_modify_power",
+                    );
+                    let needed = permissions::get_power(
+                        &db,
+                        &uid,
+                        default_cid,
+                        "i_channel_needed_permission_modify_power",
+                    );
+                    permission_ok = mod_power >= needed && mod_power > 0;
+                }
+
+                if !permission_ok {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    let db = self.db.lock().await;
+                    for pset in param_sets {
+                        let cid = pset
+                            .get("cid")
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(default_cid);
+                        let perm_name = if let Some(sid) = pset.get("permsid") {
+                            Some(sid.clone())
+                        } else if let Some(pid_str) = pset.get("permid") {
+                            pid_str
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(permissions::perm_id_to_name)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        if let Some(pname) = perm_name {
+                            let _ = db.del_channel_perm(cid, &pname);
+                        }
+                    }
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "permoverview" => {
+                let cid: u64 = cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(1);
+                let cldbid: u64 = cmd
+                    .get("cldbid")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(clid as u64);
+                let filter_permid: u32 = if let Some(sid) = cmd.get("permsid") {
+                    permissions::perm_name_to_id(sid).unwrap_or(0)
+                } else if let Some(pid_str) = cmd.get("permid") {
+                    pid_str.parse().unwrap_or(0)
+                } else {
+                    0
+                };
+
+                let target_uid = {
+                    let state = self.state.lock().await;
+                    state
+                        .clients
+                        .values()
+                        .find(|c| c.clid as u64 == cldbid)
+                        .map(|c| c.uid.clone())
+                        .unwrap_or_else(|| {
+                            state
+                                .get_client(&peer)
+                                .map(|c| c.uid.clone())
+                                .unwrap_or_default()
+                        })
+                };
+
+                let wire = {
+                    let db = self.db.lock().await;
+                    permissions::build_permission_overview(
+                        &db,
+                        &target_uid,
+                        cldbid,
+                        cid,
+                        filter_permid,
+                    )
+                };
+                if wire != "notifypermoverview" {
+                    self.send_encrypted_raw(peer, &wire).await?;
+                }
+
+                let mut err_resp = Command::new("error");
+                err_resp.set("id", "0");
+                err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "setclientchannelgroup" => {
+                let cgid: u64 = cmd.get("cgid").and_then(|v| v.parse().ok()).unwrap_or(8);
+                let cid: u64 = cmd.get("cid").and_then(|v| v.parse().ok()).unwrap_or(1);
+                let cldbid: u64 = cmd
+                    .get("cldbid")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(clid as u64);
+
+                let (invoker_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_default()
+                };
+
+                let (target_clid, target_uid) = {
+                    let state = self.state.lock().await;
+                    state
+                        .clients
+                        .values()
+                        .find(|c| c.clid as u64 == cldbid)
+                        .map(|c| (c.clid, c.uid.clone()))
+                        .unwrap_or((cldbid as u16, String::new()))
+                };
+
+                let mut err_resp = Command::new("error");
+                let can_set = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::check_power(
+                        &db,
+                        &invoker_uid,
+                        cid,
+                        "i_group_member_add_power",
+                        50,
+                    )
+                };
+
+                if !can_set {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                } else {
+                    {
+                        let db = self.db.lock().await;
+                        let _ = db.set_client_channel_group(&target_uid, cid, cgid);
+                    }
+
+                    // Notify clients in channel
+                    let mut notify = Command::new("notifyclientchannelgroupchanged");
+                    notify.set("cgid", cgid.to_string());
+                    notify.set("cid", cid.to_string());
+                    notify.set("clid", target_clid.to_string());
+                    notify.set("cgserverid", "0");
+
+                    let recipients: Vec<SocketAddr> = {
+                        let state = self.state.lock().await;
+                        state
+                            .clients
+                            .values()
+                            .filter(|c| c.handshake_phase == HandshakePhase::Connected)
+                            .map(|c| c.endpoint)
+                            .collect()
+                    };
+                    for r in recipients {
+                        let _ = self.send_encrypted_command(r, &notify).await;
+                    }
+
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
@@ -2545,20 +3040,20 @@ impl Server {
                 };
 
                 let mut err_resp = Command::new("error");
-                // Creating channels is admin-only. 2568 with `failed_permid`
-                // mirrors the official server; the client resolves the
-                // permission name and shows the proper "insufficient
-                // permissions" dialog instead of disconnecting.
-                let failed_permid = if cmd.get("channel_flag_permanent") == Some("1") {
-                    "89" // b_channel_create_permanent
+                let (perm_name, failed_permid) = if cmd.get("channel_flag_permanent") == Some("1") {
+                    ("b_channel_create_permanent", "89")
                 } else if cmd.get("channel_flag_semi_permanent") == Some("1") {
-                    "90" // b_channel_create_semi_permanent
+                    ("b_channel_create_semi_permanent", "90")
                 } else if cmd.get("channel_flag_temporary") == Some("1") {
-                    "91" // b_channel_create_temporary
+                    ("b_channel_create_temporary", "91")
                 } else {
-                    "89"
+                    ("b_channel_create_permanent", "89")
                 };
-                if !is_admin {
+                let can_create = is_admin || {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(&db, &invoker_uid, 0, perm_name)
+                };
+                if !can_create {
                     err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
                     err_resp.set("failed_permid", failed_permid);
@@ -2604,6 +3099,7 @@ impl Server {
                                 );
                             }
                         }
+                        let _ = db.set_client_channel_group(&invoker_uid, cid, 5);
                     }
 
                     if cid > 0 {
@@ -2676,69 +3172,119 @@ impl Server {
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
-                    err_resp.set("id", "2563");
-                    err_resp.set("msg", "insufficient client permissions");
-                } else if let Some(cid) = cid {
+                if let Some(target_cid) = cid {
                     match parse_channel_edit(&cmd) {
                         Err(reason) => {
                             err_resp.set("id", "1024");
                             err_resp.set("msg", reason);
                         }
                         Ok(edit) => {
-                            let result = {
+                            let (can_edit, failed_permid) = if is_admin {
+                                (true, None)
+                            } else {
                                 let db = self.db.lock().await;
-                                db.edit_channel(cid, &edit)
+                                let mod_power = permissions::get_power(&db, &uid, target_cid, "i_channel_modify_power");
+                                let needed = permissions::get_power(&db, &uid, target_cid, "i_channel_needed_modify_power");
+                                if mod_power < needed {
+                                    (false, Some("125")) // i_channel_needed_modify_power
+                                } else if edit.name.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_name") {
+                                    (false, Some("112"))
+                                } else if edit.topic.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_topic") {
+                                    (false, Some("113"))
+                                } else if edit.description.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_description") {
+                                    (false, Some("114"))
+                                } else if edit.password.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_password") {
+                                    (false, Some("115"))
+                                } else if edit.codec.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_codec") {
+                                    (false, Some("117"))
+                                } else if edit.codec_quality.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_codec_quality") {
+                                    (false, Some("118"))
+                                } else if edit.codec_latency_factor.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_codec_latency_factor") {
+                                    (false, Some("119"))
+                                } else if (edit.max_clients.is_some() || edit.max_clients_unlimited.is_some()) && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_maxclients") {
+                                    (false, Some("120"))
+                                } else if (edit.max_family_clients.is_some() || edit.max_family_clients_unlimited.is_some() || edit.max_family_clients_inherited.is_some()) && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_maxfamilyclients") {
+                                    (false, Some("121"))
+                                } else if edit.order_after.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_sortorder") {
+                                    (false, Some("122"))
+                                } else if edit.needed_talk_power.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_needed_talk_power") {
+                                    (false, Some("123"))
+                                } else if edit.is_default.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_make_default") {
+                                    (false, Some("108"))
+                                } else if edit.is_permanent.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_make_permanent") {
+                                    (false, Some("109"))
+                                } else if edit.is_semi_permanent.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_make_semi_permanent") {
+                                    (false, Some("110"))
+                                } else if edit.codec_is_unencrypted.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_make_codec_encrypted") {
+                                    (false, Some("126"))
+                                } else if edit.delete_delay.is_some() && !permissions::has_permission(&db, &uid, target_cid, "b_channel_modify_temp_delete_delay") {
+                                    (false, Some("127"))
+                                } else {
+                                    (true, None)
+                                }
                             };
-                            match result {
-                                Ok(Some(channel)) => {
-                                    let notify = build_channel_edited_notification(
-                                        &channel,
-                                        &edit,
-                                        clid,
-                                        &nickname,
-                                        &uid,
-                                    );
-                                    let recipients: Vec<SocketAddr> = {
-                                        let state = self.state.lock().await;
-                                        state
-                                            .clients
-                                            .values()
-                                            .filter(|client| {
-                                                client.handshake_phase == HandshakePhase::Connected
-                                            })
-                                            .map(|client| client.endpoint)
-                                            .collect()
-                                    };
-                                    for recipient in &recipients {
-                                        let _ =
-                                            self.send_encrypted_command(*recipient, &notify).await;
-                                    }
-                                    if edit.password.is_some() {
-                                        let mut pw_notify = Command::new("notifychannelpasswordchanged");
-                                        pw_notify.set("cid", cid.to_string());
+
+                            if !can_edit {
+                                err_resp.set("id", "2568");
+                                err_resp.set("msg", "insufficient client permissions");
+                                if let Some(fpid) = failed_permid {
+                                    err_resp.set("failed_permid", fpid);
+                                }
+                            } else {
+                                let result = {
+                                    let db = self.db.lock().await;
+                                    db.edit_channel(target_cid, &edit)
+                                };
+                                match result {
+                                    Ok(Some(channel)) => {
+                                        let notify = build_channel_edited_notification(
+                                            &channel,
+                                            &edit,
+                                            clid,
+                                            &nickname,
+                                            &uid,
+                                        );
+                                        let recipients: Vec<SocketAddr> = {
+                                            let state = self.state.lock().await;
+                                            state
+                                                .clients
+                                                .values()
+                                                .filter(|client| {
+                                                    client.handshake_phase == HandshakePhase::Connected
+                                                })
+                                                .map(|client| client.endpoint)
+                                                .collect()
+                                        };
                                         for recipient in &recipients {
-                                            let _ = self
-                                                .send_encrypted_command(*recipient, &pw_notify)
-                                                .await;
+                                            let _ =
+                                                self.send_encrypted_command(*recipient, &notify).await;
                                         }
+                                        if edit.password.is_some() {
+                                            let mut pw_notify = Command::new("notifychannelpasswordchanged");
+                                            pw_notify.set("cid", target_cid.to_string());
+                                            for recipient in &recipients {
+                                                let _ = self
+                                                    .send_encrypted_command(*recipient, &pw_notify)
+                                                    .await;
+                                            }
+                                        }
+                                        err_resp.set("id", "0");
+                                        err_resp.set("msg", "ok");
                                     }
-                                    err_resp.set("id", "0");
-                                    err_resp.set("msg", "ok");
-                                }
-                                Ok(None) => {
-                                    err_resp.set("id", "1024");
-                                    err_resp.set("msg", "invalid channel");
-                                }
-                                Err(e) => {
-                                    warn!("Failed to edit channel {}: {:?}", cid, e);
-                                    err_resp.set("id", "1024");
-                                    if cmd.get("channel_order").is_some() {
-                                        err_resp.set("msg", "invalid channel order");
-                                    } else if cmd.get("channel_name").is_some() {
-                                        err_resp.set("msg", "channel name already in use");
-                                    } else {
-                                        err_resp.set("msg", "invalid channel configuration");
+                                    Ok(None) => {
+                                        err_resp.set("id", "1024");
+                                        err_resp.set("msg", "invalid channel");
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to edit channel {}: {:?}", target_cid, e);
+                                        err_resp.set("id", "1024");
+                                        if cmd.get("channel_order").is_some() {
+                                            err_resp.set("msg", "invalid channel order");
+                                        } else if cmd.get("channel_name").is_some() {
+                                            err_resp.set("msg", "channel name already in use");
+                                        } else {
+                                            err_resp.set("msg", "invalid channel configuration");
+                                        }
                                     }
                                 }
                             }
@@ -2768,10 +3314,24 @@ impl Server {
                         })
                         .unwrap_or_else(|| ("User".to_string(), String::new(), false))
                 };
-                let mut err_resp = Command::new("error");
+                let can_delete = is_admin || {
+                    if let Some(target_cid) = cid {
+                        let db = self.db.lock().await;
+                        let del_power = permissions::get_power(&db, &uid, target_cid, "i_channel_delete_power");
+                        let needed = permissions::get_power(&db, &uid, target_cid, "i_channel_needed_delete_power");
+                        del_power >= needed && (
+                            permissions::has_permission(&db, &uid, target_cid, "b_channel_delete_permanent")
+                            || permissions::has_permission(&db, &uid, target_cid, "b_channel_delete_semi_permanent")
+                            || permissions::has_permission(&db, &uid, target_cid, "b_channel_delete_temporary")
+                        )
+                    } else {
+                        false
+                    }
+                };
 
-                if !is_admin {
-                    err_resp.set("id", "2563");
+                let mut err_resp = Command::new("error");
+                if !can_delete {
+                    err_resp.set("id", "2568");
                     err_resp.set("msg", "insufficient client permissions");
                 } else if let Some(cid) = cid {
                     let (channel_exists, is_default, default_cid) = {
@@ -2976,7 +3536,7 @@ impl Server {
                     let _ = self
                         .send_encrypted_raw(peer, permissions::get_server_admin_perms_wire())
                         .await;
-                    let _ = self.send_channel_group_perm_list(peer, 5).await;
+                    let _ = self.send_channel_group_perm_list(peer, 5, false).await;
 
                     let port = self.local_addr().map(|a| a.port()).unwrap_or(9988);
                     let server_updated = build_server_updated(false, port);
@@ -3062,10 +3622,7 @@ impl Server {
                 };
 
                 let mut err_resp = Command::new("error");
-                if !is_admin {
-                    err_resp.set("id", "2563");
-                    err_resp.set("msg", "insufficient client permissions");
-                } else if let Some(target_clid) = target_clid {
+                if let Some(target_clid) = target_clid {
                     let target_info = {
                         let state = self.state.lock().await;
                         state
@@ -3075,7 +3632,14 @@ impl Server {
                                 c.clid == target_clid
                                     && c.handshake_phase == HandshakePhase::Connected
                             })
-                            .map(|c| (c.endpoint, c.current_channel_id, c.nickname.clone()))
+                            .map(|c| {
+                                (
+                                    c.endpoint,
+                                    c.current_channel_id,
+                                    c.nickname.clone(),
+                                    c.uid.clone(),
+                                )
+                            })
                     };
 
                     match target_info {
@@ -3083,8 +3647,34 @@ impl Server {
                             err_resp.set("id", "512");
                             err_resp.set("msg", "invalid clientID");
                         }
-                        Some((target_ep, old_cid, target_nick)) => {
-                            if reason_id == "4" {
+                        Some((target_ep, old_cid, target_nick, target_uid)) => {
+                            let can_kick = is_admin || {
+                                let db = self.db.lock().await;
+                                if reason_id == "4" {
+                                    permissions::check_target_power(
+                                        &db,
+                                        &invoker_uid,
+                                        &target_uid,
+                                        old_cid,
+                                        "i_client_kick_from_channel_power",
+                                        "i_client_needed_kick_from_channel_power",
+                                    )
+                                } else {
+                                    permissions::check_target_power(
+                                        &db,
+                                        &invoker_uid,
+                                        &target_uid,
+                                        0,
+                                        "i_client_kick_from_server_power",
+                                        "i_client_needed_kick_from_server_power",
+                                    )
+                                }
+                            };
+
+                            if !can_kick {
+                                err_resp.set("id", "2568");
+                                err_resp.set("msg", "insufficient client permissions");
+                            } else if reason_id == "4" {
                                 // Channel Kick -> move to default channel
                                 let default_cid = {
                                     let db = self.db.lock().await;
@@ -4025,31 +4615,60 @@ impl Server {
         self.send_encrypted_raw(peer, &wire).await
     }
 
-    /// Sends the channel groups the official client knows about (Guest and
-    /// Channel Admin), all in one command for the same reason.
+    /// Sends the channel groups known to the server.
     async fn send_channel_group_list(&self, peer: SocketAddr) -> Result<(), String> {
-        let wire = "notifychannelgrouplist cgid=5 name=Channel\\sAdmin type=1 iconid=100 savedb=1 sortid=0 namemode=0 n_modifyp=75 n_member_addp=50 n_member_removep=50|cgid=8 name=Guest type=1 iconid=0 savedb=0 sortid=0 namemode=0 n_modifyp=75 n_member_addp=0 n_member_removep=0";
-        self.send_encrypted_raw(peer, wire).await
+        let groups = {
+            let db = self.db.lock().await;
+            db.get_channel_groups().unwrap_or_default()
+        };
+        let parts: Vec<String> = groups
+            .into_iter()
+            .map(|g| {
+                format!(
+                    "cgid={} name={} type={} iconid={} savedb={} sortid=0 namemode=0 n_modifyp=75 n_member_addp={} n_member_removep={}",
+                    g.group_id,
+                    crate::command::escape(&g.name),
+                    g.group_type,
+                    g.icon_id,
+                    if g.save_db { 1 } else { 0 },
+                    if g.group_id == 5 { 50 } else { 0 },
+                    if g.group_id == 5 { 50 } else { 0 },
+                )
+            })
+            .collect();
+        let wire = format!("notifychannelgrouplist {}", parts.join("|"));
+        self.send_encrypted_raw(peer, &wire).await
     }
 
-    /// Channel group permissions as reported by an official 3.13.7 server.
+    /// Channel group permissions from the database.
     async fn send_channel_group_perm_list(
         &self,
         peer: SocketAddr,
-        cgid: u16,
+        cgid: u64,
+        use_permsid: bool,
     ) -> Result<(), String> {
-        let wire = match cgid {
-            5 => {
-                "notifychannelgrouppermlist cgid=5 permid=99 permvalue=1 permnegated=0 permskip=0|permid=111 permvalue=1 permnegated=0 permskip=0|permid=112 permvalue=1 permnegated=0 permskip=0|permid=113 permvalue=1 permnegated=0 permskip=0|permid=114 permvalue=1 permnegated=0 permskip=0|permid=115 permvalue=1 permnegated=0 permskip=0|permid=117 permvalue=1 permnegated=0 permskip=0|permid=118 permvalue=1 permnegated=0 permskip=0|permid=119 permvalue=1 permnegated=0 permskip=0|permid=120 permvalue=1 permnegated=0 permskip=0|permid=121 permvalue=1 permnegated=0 permskip=0|permid=123 permvalue=1 permnegated=0 permskip=0|permid=124 permvalue=50 permnegated=0 permskip=0|permid=125 permvalue=50 permnegated=0 permskip=0|permid=126 permvalue=1 permnegated=0 permskip=0|permid=128 permvalue=1 permnegated=0 permskip=0|permid=129 permvalue=1 permnegated=0 permskip=0|permid=130 permvalue=1 permnegated=0 permskip=0|permid=131 permvalue=1 permnegated=0 permskip=0|permid=132 permvalue=50 permnegated=0 permskip=0|permid=133 permvalue=50 permnegated=0 permskip=0|permid=143 permvalue=50 permnegated=0 permskip=0|permid=145 permvalue=100 permnegated=0 permskip=0|permid=148 permvalue=1 permnegated=0 permskip=0|permid=149 permvalue=40 permnegated=0 permskip=0|permid=165 permvalue=75 permnegated=0 permskip=0|permid=166 permvalue=50 permnegated=0 permskip=0|permid=167 permvalue=50 permnegated=0 permskip=0|permid=168 permvalue=50 permnegated=0 permskip=0|permid=169 permvalue=50 permnegated=0 permskip=0|permid=186 permvalue=1 permnegated=0 permskip=0|permid=200 permvalue=50 permnegated=0 permskip=0|permid=201 permvalue=50 permnegated=0 permskip=0|permid=204 permvalue=50 permnegated=0 permskip=0|permid=207 permvalue=25 permnegated=0 permskip=0|permid=221 permvalue=60 permnegated=0 permskip=0|permid=225 permvalue=1 permnegated=0 permskip=0"
-            }
-            _ => {
-                "notifychannelgrouppermlist cgid=8 permid=149 permvalue=10 permnegated=0 permskip=0|permid=165 permvalue=75 permnegated=0 permskip=0"
-            }
+        let wire = {
+            let db = self.db.lock().await;
+            permissions::build_channel_group_perm_list(&db, cgid, use_permsid)
         };
-        self.send_encrypted_raw(peer, wire).await
+        self.send_encrypted_raw(peer, &wire).await
     }
 
-    /// Sends the two server groups as one multi-part command. `notify`
+    /// Server group permissions from the database.
+    async fn send_server_group_perm_list(
+        &self,
+        peer: SocketAddr,
+        sgid: u64,
+        use_permsid: bool,
+    ) -> Result<(), String> {
+        let wire = {
+            let db = self.db.lock().await;
+            permissions::build_server_group_perm_list(&db, sgid, use_permsid)
+        };
+        self.send_encrypted_raw(peer, &wire).await
+    }
+
+    /// Sends the server groups as one multi-part command. `notify`
     /// selects the unsolicited `notifyservergrouplist` form; the plain
     /// `servergrouplist` form is the response to a client query.
     async fn send_server_group_list(&self, peer: SocketAddr, notify: bool) -> Result<(), String> {
@@ -4058,10 +4677,26 @@ impl Server {
         } else {
             "servergrouplist"
         };
-        let wire = format!(
-            "{} sgid=6 name=Server\\sAdmin type=1 iconid=300 savedb=1 sortid=0 namemode=0 n_modifyp=75 n_member_addp=75 n_member_removep=75|sgid=8 name=Guest type=1 iconid=0 savedb=0 sortid=0 namemode=0 n_modifyp=75 n_member_addp=0 n_member_removep=0",
-            name
-        );
+        let groups = {
+            let db = self.db.lock().await;
+            db.get_server_groups().unwrap_or_default()
+        };
+        let parts: Vec<String> = groups
+            .into_iter()
+            .map(|g| {
+                format!(
+                    "sgid={} name={} type={} iconid={} savedb={} sortid=0 namemode=0 n_modifyp=75 n_member_addp={} n_member_removep={}",
+                    g.group_id,
+                    crate::command::escape(&g.name),
+                    g.group_type,
+                    g.icon_id,
+                    if g.save_db { 1 } else { 0 },
+                    if g.group_id == 6 { 75 } else { 0 },
+                    if g.group_id == 6 { 75 } else { 0 },
+                )
+            })
+            .collect();
+        let wire = format!("{} {}", name, parts.join("|"));
         self.send_encrypted_raw(peer, &wire).await
     }
 

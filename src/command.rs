@@ -121,6 +121,50 @@ impl Command {
             raw: trimmed.to_string(),
         })
     }
+
+    /// Parses piped parameter sets if the command contains `|`.
+    /// E.g. `channeladdperm cid=16 permid=1 val=10|permid=2 val=20` returns a vector of
+    /// parameter maps, with common prefix parameters (`cid=16`) propagated to subsequent items.
+    pub fn parse_piped_param_sets(&self) -> Vec<HashMap<String, String>> {
+        let trimmed = self.raw.trim();
+        let Some((_name, rest)) = trimmed.split_once(char::is_whitespace) else {
+            return vec![self.params.clone()];
+        };
+        if !rest.contains('|') {
+            return vec![self.params.clone()];
+        }
+        let items: Vec<&str> = rest.split('|').collect();
+        let mut results = Vec::new();
+        let mut base_common = HashMap::new();
+        for (idx, item) in items.iter().enumerate() {
+            let mut map = if idx == 0 {
+                HashMap::new()
+            } else {
+                base_common.clone()
+            };
+            for part in item.split_whitespace() {
+                if let Some((k, v)) = part.split_once('=') {
+                    map.insert(unescape(k), unescape(v));
+                } else {
+                    map.insert(unescape(part), String::new());
+                }
+            }
+            if idx == 0 {
+                for (k, v) in &map {
+                    if k != "permid"
+                        && k != "permsid"
+                        && k != "permvalue"
+                        && k != "permnegated"
+                        && k != "permskip"
+                    {
+                        base_common.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            results.push(map);
+        }
+        results
+    }
 }
 
 #[cfg(test)]

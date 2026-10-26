@@ -81,6 +81,23 @@ pub struct BanRecord {
     pub enforcements: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRecord {
+    pub group_id: u64,
+    pub name: String,
+    pub group_type: i64,
+    pub icon_id: i64,
+    pub save_db: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermRecord {
+    pub perm_id: String,
+    pub perm_value: i64,
+    pub perm_negated: bool,
+    pub perm_skip: bool,
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -161,6 +178,81 @@ impl Database {
                 invokeruid TEXT NOT NULL DEFAULT '',
                 reason TEXT NOT NULL DEFAULT '',
                 enforcements INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS groups_server (
+                group_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                type INTEGER NOT NULL DEFAULT 1,
+                icon_id INTEGER NOT NULL DEFAULT 0,
+                save_db INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS groups_channel (
+                group_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                type INTEGER NOT NULL DEFAULT 1,
+                icon_id INTEGER NOT NULL DEFAULT 0,
+                save_db INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS group_server_to_client (
+                group_id INTEGER NOT NULL,
+                client_uid TEXT NOT NULL,
+                PRIMARY KEY(group_id, client_uid)
+            );
+
+            CREATE TABLE IF NOT EXISTS group_channel_to_client (
+                group_id INTEGER NOT NULL,
+                cid INTEGER NOT NULL,
+                client_uid TEXT NOT NULL,
+                PRIMARY KEY(cid, client_uid)
+            );
+
+            CREATE TABLE IF NOT EXISTS perm_server_group (
+                group_id INTEGER NOT NULL,
+                perm_id TEXT NOT NULL,
+                perm_value INTEGER NOT NULL,
+                perm_negated INTEGER NOT NULL DEFAULT 0,
+                perm_skip INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(group_id, perm_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS perm_channel_groups (
+                group_id INTEGER NOT NULL,
+                perm_id TEXT NOT NULL,
+                perm_value INTEGER NOT NULL,
+                perm_negated INTEGER NOT NULL DEFAULT 0,
+                perm_skip INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(group_id, perm_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS perm_channel (
+                cid INTEGER NOT NULL,
+                perm_id TEXT NOT NULL,
+                perm_value INTEGER NOT NULL,
+                perm_negated INTEGER NOT NULL DEFAULT 0,
+                perm_skip INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(cid, perm_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS perm_client (
+                client_uid TEXT NOT NULL,
+                perm_id TEXT NOT NULL,
+                perm_value INTEGER NOT NULL,
+                perm_negated INTEGER NOT NULL DEFAULT 0,
+                perm_skip INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(client_uid, perm_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS perm_channel_clients (
+                cid INTEGER NOT NULL,
+                client_uid TEXT NOT NULL,
+                perm_id TEXT NOT NULL,
+                perm_value INTEGER NOT NULL,
+                perm_negated INTEGER NOT NULL DEFAULT 0,
+                perm_skip INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(cid, client_uid, perm_id)
             );
             ",
         )?;
@@ -247,6 +339,89 @@ impl Database {
             ],
         )?;
 
+        // Seed default server groups
+        let sg_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM groups_server", [], |row| row.get(0))?;
+        if sg_count == 0 {
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO groups_server (group_id, name, type, icon_id, save_db) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for grp in crate::default_permissions::DEFAULT_SERVER_GROUPS {
+                let icon_id = match grp.id {
+                    6 => 300,
+                    _ => 0,
+                };
+                let save_db = if grp.id == 8 { 0 } else { 1 };
+                stmt.execute(params![grp.id, grp.name, grp.group_type, icon_id, save_db])?;
+            }
+        }
+
+        // Seed default server group perms
+        let sg_perm_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM perm_server_group", [], |row| row.get(0))?;
+        if sg_perm_count == 0 {
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO perm_server_group (group_id, perm_id, perm_value, perm_negated, perm_skip) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for p in crate::default_permissions::DEFAULT_SERVER_GROUP_PERMS {
+                stmt.execute(params![
+                    p.group_id,
+                    p.perm_id,
+                    p.value,
+                    p.negated as i64,
+                    p.skip as i64
+                ])?;
+            }
+        }
+
+        // Seed default channel groups
+        let cg_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM groups_channel", [], |row| row.get(0))?;
+        if cg_count == 0 {
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO groups_channel (group_id, name, type, icon_id, save_db) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for grp in crate::default_permissions::DEFAULT_CHANNEL_GROUPS {
+                let icon_id = match grp.id {
+                    5 => 100,
+                    6 => 200,
+                    7 => 600,
+                    _ => 0,
+                };
+                let save_db = if grp.id == 8 { 0 } else { 1 };
+                stmt.execute(params![grp.id, grp.name, grp.group_type, icon_id, save_db])?;
+            }
+        }
+
+        // Seed default channel group perms
+        let cg_perm_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM perm_channel_groups", [], |row| row.get(0))?;
+        if cg_perm_count == 0 {
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO perm_channel_groups (group_id, perm_id, perm_value, perm_negated, perm_skip) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for p in crate::default_permissions::DEFAULT_CHANNEL_GROUP_PERMS {
+                stmt.execute(params![
+                    p.group_id,
+                    p.perm_id,
+                    p.value,
+                    p.negated as i64,
+                    p.skip as i64
+                ])?;
+            }
+        }
+
+        // Migrate any existing admin identities into group_server_to_client (Server Admin)
+        self.conn.execute(
+            "INSERT OR IGNORE INTO group_server_to_client (group_id, client_uid)
+             SELECT 6, client_uid FROM admin_identities",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -309,6 +484,14 @@ impl Database {
 
     /// Checks if a client UID is a known Server Admin.
     pub fn is_admin_identity(&self, uid: &str) -> Result<bool> {
+        let in_group: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM group_server_to_client WHERE client_uid = ?1 AND group_id = 6",
+            params![uid],
+            |row| row.get(0),
+        )?;
+        if in_group > 0 {
+            return Ok(true);
+        }
         let mut stmt = self
             .conn
             .prepare("SELECT COUNT(*) FROM admin_identities WHERE client_uid = ?1")?;
@@ -326,7 +509,342 @@ impl Database {
             "INSERT OR IGNORE INTO admin_identities (client_uid, created_at) VALUES (?1, ?2)",
             params![uid, now],
         )?;
+        let _ = self.add_client_to_server_group(uid, 6);
         Ok(())
+    }
+
+    // --- Group & Permission accessors ---
+
+    pub fn get_client_server_groups(&self, uid: &str) -> Result<Vec<u64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id FROM group_server_to_client WHERE client_uid = ?1 ORDER BY group_id",
+        )?;
+        let rows = stmt.query_map(params![uid], |row| row.get::<_, u64>(0))?;
+        let groups = rows.collect::<Result<Vec<_>, _>>()?;
+        if groups.is_empty() {
+            // Default server group is 8 (Guest)
+            Ok(vec![8])
+        } else {
+            Ok(groups)
+        }
+    }
+
+    pub fn set_client_server_groups(&self, uid: &str, groups: &[u64]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM group_server_to_client WHERE client_uid = ?1",
+            params![uid],
+        )?;
+        for &gid in groups {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO group_server_to_client (group_id, client_uid) VALUES (?1, ?2)",
+                params![gid, uid],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn add_client_to_server_group(&self, uid: &str, group_id: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO group_server_to_client (group_id, client_uid) VALUES (?1, ?2)",
+            params![group_id, uid],
+        )?;
+        // If adding to a non-guest group, remove from Guest group (8)
+        if group_id != 8 {
+            self.conn.execute(
+                "DELETE FROM group_server_to_client WHERE client_uid = ?1 AND group_id = 8",
+                params![uid],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_client_from_server_group(&self, uid: &str, group_id: u64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM group_server_to_client WHERE client_uid = ?1 AND group_id = ?2",
+            params![uid, group_id],
+        )?;
+        // If no server groups left, assign Guest group (8)
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM group_server_to_client WHERE client_uid = ?1",
+            params![uid],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO group_server_to_client (group_id, client_uid) VALUES (8, ?1)",
+                params![uid],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_client_channel_group(&self, uid: &str, cid: u64) -> Result<u64> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id FROM group_channel_to_client WHERE cid = ?1 AND client_uid = ?2",
+        )?;
+        let res = stmt.query_row(params![cid, uid], |row| row.get::<_, u64>(0));
+        match res {
+            Ok(cgid) => Ok(cgid),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(8), // Guest
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn set_client_channel_group(&self, uid: &str, cid: u64, group_id: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO group_channel_to_client (group_id, cid, client_uid) VALUES (?1, ?2, ?3)
+             ON CONFLICT(cid, client_uid) DO UPDATE SET group_id = excluded.group_id",
+            params![group_id, cid, uid],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_server_groups(&self) -> Result<Vec<GroupRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, name, type, icon_id, save_db FROM groups_server ORDER BY group_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GroupRecord {
+                group_id: row.get(0)?,
+                name: row.get(1)?,
+                group_type: row.get(2)?,
+                icon_id: row.get(3)?,
+                save_db: row.get::<_, i64>(4)? == 1,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_channel_groups(&self) -> Result<Vec<GroupRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, name, type, icon_id, save_db FROM groups_channel ORDER BY group_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GroupRecord {
+                group_id: row.get(0)?,
+                name: row.get(1)?,
+                group_type: row.get(2)?,
+                icon_id: row.get(3)?,
+                save_db: row.get::<_, i64>(4)? == 1,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_server_group_perms(&self, group_id: u64) -> Result<Vec<PermRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT perm_id, perm_value, perm_negated, perm_skip FROM perm_server_group WHERE group_id = ?1 ORDER BY perm_id",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| {
+            Ok(PermRecord {
+                perm_id: row.get(0)?,
+                perm_value: row.get(1)?,
+                perm_negated: row.get::<_, i64>(2)? == 1,
+                perm_skip: row.get::<_, i64>(3)? == 1,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_server_group_perm(
+        &self,
+        group_id: u64,
+        perm_id: &str,
+        value: i64,
+        negated: bool,
+        skip: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO perm_server_group (group_id, perm_id, perm_value, perm_negated, perm_skip)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(group_id, perm_id) DO UPDATE SET
+                 perm_value = excluded.perm_value,
+                 perm_negated = excluded.perm_negated,
+                 perm_skip = excluded.perm_skip",
+            params![group_id, perm_id, value, negated as i64, skip as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn del_server_group_perm(&self, group_id: u64, perm_id: &str) -> Result<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM perm_server_group WHERE group_id = ?1 AND perm_id = ?2",
+            params![group_id, perm_id],
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn get_channel_group_perms(&self, group_id: u64) -> Result<Vec<PermRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT perm_id, perm_value, perm_negated, perm_skip FROM perm_channel_groups WHERE group_id = ?1 ORDER BY perm_id",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| {
+            Ok(PermRecord {
+                perm_id: row.get(0)?,
+                perm_value: row.get(1)?,
+                perm_negated: row.get::<_, i64>(2)? == 1,
+                perm_skip: row.get::<_, i64>(3)? == 1,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_channel_group_perm(
+        &self,
+        group_id: u64,
+        perm_id: &str,
+        value: i64,
+        negated: bool,
+        skip: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO perm_channel_groups (group_id, perm_id, perm_value, perm_negated, perm_skip)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(group_id, perm_id) DO UPDATE SET
+                 perm_value = excluded.perm_value,
+                 perm_negated = excluded.perm_negated,
+                 perm_skip = excluded.perm_skip",
+            params![group_id, perm_id, value, negated as i64, skip as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn del_channel_group_perm(&self, group_id: u64, perm_id: &str) -> Result<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM perm_channel_groups WHERE group_id = ?1 AND perm_id = ?2",
+            params![group_id, perm_id],
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn get_channel_perms(&self, cid: u64) -> Result<Vec<PermRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT perm_id, perm_value, perm_negated, perm_skip FROM perm_channel WHERE cid = ?1 ORDER BY perm_id",
+        )?;
+        let rows = stmt.query_map(params![cid], |row| {
+            Ok(PermRecord {
+                perm_id: row.get(0)?,
+                perm_value: row.get(1)?,
+                perm_negated: row.get::<_, i64>(2)? == 1,
+                perm_skip: row.get::<_, i64>(3)? == 1,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_channel_perm(
+        &self,
+        cid: u64,
+        perm_id: &str,
+        value: i64,
+        negated: bool,
+        skip: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO perm_channel (cid, perm_id, perm_value, perm_negated, perm_skip)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(cid, perm_id) DO UPDATE SET
+                 perm_value = excluded.perm_value,
+                 perm_negated = excluded.perm_negated,
+                 perm_skip = excluded.perm_skip",
+            params![cid, perm_id, value, negated as i64, skip as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn del_channel_perm(&self, cid: u64, perm_id: &str) -> Result<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM perm_channel WHERE cid = ?1 AND perm_id = ?2",
+            params![cid, perm_id],
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn get_client_perms(&self, uid: &str) -> Result<Vec<PermRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT perm_id, perm_value, perm_negated, perm_skip FROM perm_client WHERE client_uid = ?1 ORDER BY perm_id",
+        )?;
+        let rows = stmt.query_map(params![uid], |row| {
+            Ok(PermRecord {
+                perm_id: row.get(0)?,
+                perm_value: row.get(1)?,
+                perm_negated: row.get::<_, i64>(2)? == 1,
+                perm_skip: row.get::<_, i64>(3)? == 1,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_client_perm(
+        &self,
+        uid: &str,
+        perm_id: &str,
+        value: i64,
+        negated: bool,
+        skip: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO perm_client (client_uid, perm_id, perm_value, perm_negated, perm_skip)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(client_uid, perm_id) DO UPDATE SET
+                 perm_value = excluded.perm_value,
+                 perm_negated = excluded.perm_negated,
+                 perm_skip = excluded.perm_skip",
+            params![uid, perm_id, value, negated as i64, skip as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn del_client_perm(&self, uid: &str, perm_id: &str) -> Result<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM perm_client WHERE client_uid = ?1 AND perm_id = ?2",
+            params![uid, perm_id],
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn get_channel_client_perms(&self, cid: u64, uid: &str) -> Result<Vec<PermRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT perm_id, perm_value, perm_negated, perm_skip FROM perm_channel_clients WHERE cid = ?1 AND client_uid = ?2 ORDER BY perm_id",
+        )?;
+        let rows = stmt.query_map(params![cid, uid], |row| {
+            Ok(PermRecord {
+                perm_id: row.get(0)?,
+                perm_value: row.get(1)?,
+                perm_negated: row.get::<_, i64>(2)? == 1,
+                perm_skip: row.get::<_, i64>(3)? == 1,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_channel_client_perm(
+        &self,
+        cid: u64,
+        uid: &str,
+        perm_id: &str,
+        value: i64,
+        negated: bool,
+        skip: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO perm_channel_clients (cid, client_uid, perm_id, perm_value, perm_negated, perm_skip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(cid, client_uid, perm_id) DO UPDATE SET
+                 perm_value = excluded.perm_value,
+                 perm_negated = excluded.perm_negated,
+                 perm_skip = excluded.perm_skip",
+            params![cid, uid, perm_id, value, negated as i64, skip as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn del_channel_client_perm(&self, cid: u64, uid: &str, perm_id: &str) -> Result<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM perm_channel_clients WHERE cid = ?1 AND client_uid = ?2 AND perm_id = ?3",
+            params![cid, uid, perm_id],
+        )?;
+        Ok(count > 0)
     }
 
     /// Fetches all channels from the database.
@@ -848,6 +1366,54 @@ mod tests {
         assert_eq!(channels_after.len(), 2);
         assert_eq!(channels_after[1].cid, new_cid);
         assert_eq!(channels_after[1].name, "Gaming Lounge");
+    }
+
+    #[test]
+    fn test_permissions_seeding_and_crud() {
+        let db = Database::in_memory().expect("failed to open in-memory db");
+
+        // Server groups check
+        let sg = db.get_server_groups().expect("failed to get server groups");
+        assert_eq!(sg.len(), 3);
+        assert!(sg.iter().any(|g| g.group_id == 6 && g.name == "Server Admin"));
+        assert!(sg.iter().any(|g| g.group_id == 7 && g.name == "Normal"));
+        assert!(sg.iter().any(|g| g.group_id == 8 && g.name == "Guest"));
+
+        // Channel groups check
+        let cg = db.get_channel_groups().expect("failed to get channel groups");
+        assert_eq!(cg.len(), 4);
+        assert!(cg.iter().any(|g| g.group_id == 5 && g.name == "Channel Admin"));
+        assert!(cg.iter().any(|g| g.group_id == 6 && g.name == "Operator"));
+        assert!(cg.iter().any(|g| g.group_id == 7 && g.name == "Voice"));
+        assert!(cg.iter().any(|g| g.group_id == 8 && g.name == "Guest"));
+
+        // Verify seeded perms count
+        let sa_perms = db.get_server_group_perms(6).expect("sa perms");
+        assert_eq!(sa_perms.len(), 413);
+        let guest_perms = db.get_server_group_perms(8).expect("guest perms");
+        assert_eq!(guest_perms.len(), 31);
+        let ca_perms = db.get_channel_group_perms(5).expect("ca perms");
+        assert_eq!(ca_perms.len(), 33);
+
+        // Client group assignment
+        assert_eq!(db.get_client_server_groups("user_1").unwrap(), vec![8]);
+        db.add_client_to_server_group("user_1", 6).unwrap();
+        assert_eq!(db.get_client_server_groups("user_1").unwrap(), vec![6]);
+
+        // Channel group assignment
+        assert_eq!(db.get_client_channel_group("user_1", 1).unwrap(), 8);
+        db.set_client_channel_group("user_1", 1, 5).unwrap();
+        assert_eq!(db.get_client_channel_group("user_1", 1).unwrap(), 5);
+
+        // Channel perms CRUD
+        assert_eq!(db.get_channel_perms(1).unwrap().len(), 0);
+        db.set_channel_perm(1, "i_channel_needed_join_power", 25, false, false).unwrap();
+        let cp = db.get_channel_perms(1).unwrap();
+        assert_eq!(cp.len(), 1);
+        assert_eq!(cp[0].perm_id, "i_channel_needed_join_power");
+        assert_eq!(cp[0].perm_value, 25);
+        assert!(db.del_channel_perm(1, "i_channel_needed_join_power").unwrap());
+        assert_eq!(db.get_channel_perms(1).unwrap().len(), 0);
     }
 
     #[test]

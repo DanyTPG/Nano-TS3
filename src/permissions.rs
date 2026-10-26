@@ -45,3 +45,485 @@ pub fn get_guest_perms_wire() -> &'static str {
         "notifyservergrouppermlist sgid=8 permid=40 permvalue=1 permnegated=0 permskip=0|permid=83 permvalue=0 permnegated=0 permskip=0|permid=87 permvalue=1 permnegated=0 permskip=0|permid=91 permvalue=1 permnegated=0 permskip=0|permid=92 permvalue=1 permnegated=0 permskip=0|permid=94 permvalue=1 permnegated=0 permskip=0|permid=96 permvalue=1 permnegated=0 permskip=0|permid=98 permvalue=7 permnegated=0 permskip=0|permid=99 permvalue=1 permnegated=0 permskip=0|permid=100 permvalue=1 permnegated=0 permskip=0|permid=104 permvalue=1 permnegated=0 permskip=0|permid=134 permvalue=1 permnegated=0 permskip=0|permid=135 permvalue=1 permnegated=0 permskip=0|permid=136 permvalue=1 permnegated=0 permskip=0|permid=149 permvalue=15 permnegated=0 permskip=0|permid=165 permvalue=75 permnegated=0 permskip=0|permid=176 permvalue=0 permnegated=0 permskip=0|permid=178 permvalue=200000 permnegated=0 permskip=0|permid=179 permvalue=-1 permnegated=0 permskip=0|permid=187 permvalue=1 permnegated=0 permskip=0|permid=191 permvalue=1 permnegated=0 permskip=0|permid=196 permvalue=75 permnegated=0 permskip=0|permid=199 permvalue=25 permnegated=0 permskip=0|permid=201 permvalue=25 permnegated=0 permskip=0|permid=203 permvalue=25 permnegated=0 permskip=0|permid=205 permvalue=25 permnegated=0 permskip=0|permid=219 permvalue=1 permnegated=0 permskip=0|permid=237 permvalue=25 permnegated=0 permskip=0|permid=243 permvalue=25 permnegated=0 permskip=0|permid=247 permvalue=-1 permnegated=0 permskip=0|permid=248 permvalue=-1 permnegated=0 permskip=0".to_string()
     })
 }
+
+use crate::database::Database;
+pub use crate::permission_catalog::{perm_id_to_name, perm_name_to_id};
+
+/// Evaluates a specific permission for a client in a given channel using the official 5-tier evaluation algorithm.
+pub fn evaluate_permission(
+    db: &Database,
+    client_uid: &str,
+    cid: u64,
+    perm_name: &str,
+) -> Option<i64> {
+    // Tier 1: Server Groups
+    let server_groups = db
+        .get_client_server_groups(client_uid)
+        .unwrap_or_else(|_| vec![8]);
+    let mut t1_val: Option<i64> = None;
+    let mut t1_has_negated = false;
+    let mut t1_min_negated: i64 = i64::MAX;
+    let mut t1_max_val: i64 = i64::MIN;
+    let mut skip = false;
+
+    for &sgid in &server_groups {
+        if let Ok(perms) = db.get_server_group_perms(sgid) {
+            for p in perms {
+                if p.perm_id == perm_name {
+                    if p.perm_skip {
+                        skip = true;
+                    }
+                    if p.perm_negated {
+                        t1_has_negated = true;
+                        if p.perm_value < t1_min_negated {
+                            t1_min_negated = p.perm_value;
+                        }
+                    } else if p.perm_value > t1_max_val {
+                        t1_max_val = p.perm_value;
+                    }
+                }
+            }
+        }
+    }
+
+    if t1_has_negated {
+        t1_val = Some(t1_min_negated);
+    } else if t1_max_val != i64::MIN {
+        t1_val = Some(t1_max_val);
+    }
+
+    // Check if b_client_skip_channelgroup_permissions is set in Tier 1
+    if !skip {
+        for &sgid in &server_groups {
+            if let Ok(perms) = db.get_server_group_perms(sgid) {
+                for p in perms {
+                    if p.perm_id == "b_client_skip_channelgroup_permissions" && p.perm_value > 0 {
+                        skip = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut current_val = t1_val;
+
+    // Tier 2: Client Specific Permissions
+    if let Ok(client_perms) = db.get_client_perms(client_uid) {
+        for p in client_perms {
+            if p.perm_id == "b_client_skip_channelgroup_permissions" && p.perm_value > 0 {
+                skip = true;
+            }
+            if p.perm_id == perm_name {
+                current_val = Some(p.perm_value);
+                if p.perm_skip {
+                    skip = true;
+                }
+            }
+        }
+    }
+
+    // Tier 3: Channel Specific Permissions (skipped if skip is true)
+    if !skip && cid > 0 {
+        if let Ok(ch_perms) = db.get_channel_perms(cid) {
+            for p in ch_perms {
+                if p.perm_id == perm_name {
+                    current_val = Some(p.perm_value);
+                }
+            }
+        }
+    }
+
+    // Tier 4: Channel Groups (skipped if skip is true)
+    if !skip && cid > 0 {
+        let cgid = db.get_client_channel_group(client_uid, cid).unwrap_or(8);
+        if let Ok(cg_perms) = db.get_channel_group_perms(cgid) {
+            for p in cg_perms {
+                if p.perm_id == perm_name {
+                    current_val = Some(p.perm_value);
+                }
+            }
+        }
+    }
+
+    // Tier 5: Channel and Client Specific Permissions (always applied, ignores skip)
+    if cid > 0 {
+        if let Ok(cc_perms) = db.get_channel_client_perms(cid, client_uid) {
+            for p in cc_perms {
+                if p.perm_id == perm_name {
+                    current_val = Some(p.perm_value);
+                }
+            }
+        }
+    }
+
+    current_val
+}
+
+/// Checks if a boolean permission evaluates to true (> 0).
+pub fn has_permission(db: &Database, client_uid: &str, cid: u64, perm_name: &str) -> bool {
+    evaluate_permission(db, client_uid, cid, perm_name)
+        .map(|v| v > 0)
+        .unwrap_or(false)
+}
+
+/// Retrieves the effective integer value of a permission (or 0 if not set).
+pub fn get_power(db: &Database, client_uid: &str, cid: u64, perm_name: &str) -> i64 {
+    evaluate_permission(db, client_uid, cid, perm_name).unwrap_or(0)
+}
+
+/// Checks if the client's power permission is greater than or equal to the needed power.
+pub fn check_power(
+    db: &Database,
+    client_uid: &str,
+    cid: u64,
+    power_perm: &str,
+    needed_power: i64,
+) -> bool {
+    let power = get_power(db, client_uid, cid, power_perm);
+    power >= needed_power
+}
+
+/// Checks if the invoker's power is sufficient against the target client's needed power.
+pub fn check_target_power(
+    db: &Database,
+    invoker_uid: &str,
+    target_uid: &str,
+    cid: u64,
+    power_perm: &str,
+    needed_power_perm: &str,
+) -> bool {
+    let invoker_power = get_power(db, invoker_uid, cid, power_perm);
+    let target_needed = get_power(db, target_uid, cid, needed_power_perm);
+    invoker_power >= target_needed
+}
+
+/// Builds the `notifyservergrouppermlist` wire payload for a server group.
+pub fn build_server_group_perm_list(db: &Database, sgid: u64, use_permsid: bool) -> String {
+    let perms = db.get_server_group_perms(sgid).unwrap_or_default();
+    if perms.is_empty() {
+        return format!("notifyservergrouppermlist sgid={}", sgid);
+    }
+    let parts: Vec<String> = perms
+        .into_iter()
+        .map(|p| {
+            let id_part = if use_permsid {
+                format!("permsid={}", p.perm_id)
+            } else {
+                let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+                format!("permid={}", pid)
+            };
+            format!(
+                "sgid={} {} permvalue={} permnegated={} permskip={}",
+                sgid,
+                id_part,
+                p.perm_value,
+                if p.perm_negated { 1 } else { 0 },
+                if p.perm_skip { 1 } else { 0 },
+            )
+        })
+        .collect();
+    format!("notifyservergrouppermlist {}", parts.join("|"))
+}
+
+/// Builds the `notifychannelgrouppermlist` wire payload for a channel group.
+pub fn build_channel_group_perm_list(db: &Database, cgid: u64, use_permsid: bool) -> String {
+    let perms = db.get_channel_group_perms(cgid).unwrap_or_default();
+    if perms.is_empty() {
+        return format!("notifychannelgrouppermlist cgid={}", cgid);
+    }
+    let parts: Vec<String> = perms
+        .into_iter()
+        .map(|p| {
+            let id_part = if use_permsid {
+                format!("permsid={}", p.perm_id)
+            } else {
+                let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+                format!("permid={}", pid)
+            };
+            format!(
+                "cgid={} {} permvalue={} permnegated={} permskip={}",
+                cgid,
+                id_part,
+                p.perm_value,
+                if p.perm_negated { 1 } else { 0 },
+                if p.perm_skip { 1 } else { 0 },
+            )
+        })
+        .collect();
+    format!("notifychannelgrouppermlist {}", parts.join("|"))
+}
+
+/// Builds the `notifychannelpermlist` wire payload for a channel.
+pub fn build_channel_perm_list(db: &Database, cid: u64, use_permsid: bool) -> String {
+    let perms = db.get_channel_perms(cid).unwrap_or_default();
+    if perms.is_empty() {
+        return "notifychannelpermlist".to_string();
+    }
+    let parts: Vec<String> = perms
+        .into_iter()
+        .map(|p| {
+            let id_part = if use_permsid {
+                format!("permsid={}", p.perm_id)
+            } else {
+                let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+                format!("permid={}", pid)
+            };
+            format!(
+                "cid={} {} permvalue={} permnegated={} permskip={}",
+                cid,
+                id_part,
+                p.perm_value,
+                if p.perm_negated { 1 } else { 0 },
+                if p.perm_skip { 1 } else { 0 },
+            )
+        })
+        .collect();
+    format!("notifychannelpermlist {}", parts.join("|"))
+}
+
+/// Builds the `notifyclientpermlist` wire payload for a client.
+pub fn build_client_perm_list(
+    db: &Database,
+    cldbid: u64,
+    client_uid: &str,
+    use_permsid: bool,
+) -> String {
+    let perms = db.get_client_perms(client_uid).unwrap_or_default();
+    if perms.is_empty() {
+        return format!("notifyclientpermlist cldbid={}", cldbid);
+    }
+    let parts: Vec<String> = perms
+        .into_iter()
+        .map(|p| {
+            let id_part = if use_permsid {
+                format!("permsid={}", p.perm_id)
+            } else {
+                let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+                format!("permid={}", pid)
+            };
+            format!(
+                "cldbid={} {} permvalue={} permnegated={} permskip={}",
+                cldbid,
+                id_part,
+                p.perm_value,
+                if p.perm_negated { 1 } else { 0 },
+                if p.perm_skip { 1 } else { 0 },
+            )
+        })
+        .collect();
+    format!("notifyclientpermlist {}", parts.join("|"))
+}
+
+/// Builds the `notifychannelclientpermlist` wire payload for a client in a channel.
+pub fn build_channel_client_perm_list(
+    db: &Database,
+    cid: u64,
+    cldbid: u64,
+    client_uid: &str,
+    use_permsid: bool,
+) -> String {
+    let perms = db.get_channel_client_perms(cid, client_uid).unwrap_or_default();
+    if perms.is_empty() {
+        return format!("notifychannelclientpermlist cid={} cldbid={}", cid, cldbid);
+    }
+    let parts: Vec<String> = perms
+        .into_iter()
+        .map(|p| {
+            let id_part = if use_permsid {
+                format!("permsid={}", p.perm_id)
+            } else {
+                let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+                format!("permid={}", pid)
+            };
+            format!(
+                "cid={} cldbid={} {} permvalue={} permnegated={} permskip={}",
+                cid,
+                cldbid,
+                id_part,
+                p.perm_value,
+                if p.perm_negated { 1 } else { 0 },
+                if p.perm_skip { 1 } else { 0 },
+            )
+        })
+        .collect();
+    format!("notifychannelclientpermlist {}", parts.join("|"))
+}
+
+/// Builds the `notifypermoverview` wire payload across all 5 tiers.
+pub fn build_permission_overview(
+    db: &Database,
+    client_uid: &str,
+    cldbid: u64,
+    cid: u64,
+    filter_permid: u32,
+) -> String {
+    let mut rows: Vec<String> = Vec::new();
+
+    // Tier 1: Server groups (t=0, id1=sgid, id2=0)
+    let sgs = db
+        .get_client_server_groups(client_uid)
+        .unwrap_or_else(|_| vec![8]);
+    for sgid in sgs {
+        if let Ok(perms) = db.get_server_group_perms(sgid) {
+            for p in perms {
+                let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+                if filter_permid == 0 || filter_permid == pid {
+                    rows.push(format!(
+                        "t=0 id1={} id2=0 p={} v={} n={} s={}",
+                        sgid,
+                        pid,
+                        p.perm_value,
+                        if p.perm_negated { 1 } else { 0 },
+                        if p.perm_skip { 1 } else { 0 },
+                    ));
+                }
+            }
+        }
+    }
+
+    // Tier 2: Client perms (t=1, id1=cldbid, id2=0)
+    if let Ok(perms) = db.get_client_perms(client_uid) {
+        for p in perms {
+            let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+            if filter_permid == 0 || filter_permid == pid {
+                rows.push(format!(
+                    "t=1 id1={} id2=0 p={} v={} n={} s={}",
+                    cldbid,
+                    pid,
+                    p.perm_value,
+                    if p.perm_negated { 1 } else { 0 },
+                    if p.perm_skip { 1 } else { 0 },
+                ));
+            }
+        }
+    }
+
+    // Tier 3: Channel perms (t=2, id1=cid, id2=0)
+    if cid > 0 {
+        if let Ok(perms) = db.get_channel_perms(cid) {
+            for p in perms {
+                let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+                if filter_permid == 0 || filter_permid == pid {
+                    rows.push(format!(
+                        "t=2 id1={} id2=0 p={} v={} n={} s={}",
+                        cid,
+                        pid,
+                        p.perm_value,
+                        if p.perm_negated { 1 } else { 0 },
+                        if p.perm_skip { 1 } else { 0 },
+                    ));
+                }
+            }
+        }
+    }
+
+    // Tier 4: Channel group (t=3, id1=cgid, id2=0)
+    if cid > 0 {
+        let cgid = db.get_client_channel_group(client_uid, cid).unwrap_or(8);
+        if let Ok(perms) = db.get_channel_group_perms(cgid) {
+            for p in perms {
+                let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+                if filter_permid == 0 || filter_permid == pid {
+                    rows.push(format!(
+                        "t=3 id1={} id2=0 p={} v={} n={} s={}",
+                        cgid,
+                        pid,
+                        p.perm_value,
+                        if p.perm_negated { 1 } else { 0 },
+                        if p.perm_skip { 1 } else { 0 },
+                    ));
+                }
+            }
+        }
+    }
+
+    // Tier 5: Channel-client perms (t=4, id1=cid, id2=cldbid)
+    if cid > 0 {
+        if let Ok(perms) = db.get_channel_client_perms(cid, client_uid) {
+            for p in perms {
+                let pid = perm_name_to_id(&p.perm_id).unwrap_or(0);
+                if filter_permid == 0 || filter_permid == pid {
+                    rows.push(format!(
+                        "t=4 id1={} id2={} p={} v={} n={} s={}",
+                        cid,
+                        cldbid,
+                        pid,
+                        p.perm_value,
+                        if p.perm_negated { 1 } else { 0 },
+                        if p.perm_skip { 1 } else { 0 },
+                    ));
+                }
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        "notifypermoverview".to_string()
+    } else {
+        format!("notifypermoverview {}", rows.join("|"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_five_tier_permission_evaluation() {
+        let db = Database::in_memory().expect("in-memory db");
+
+        let uid = "test_user_eval";
+        let cid = 1;
+
+        // Default: Guest (server group 8)
+        assert_eq!(
+            evaluate_permission(&db, uid, cid, "b_channel_modify_name"),
+            None
+        );
+        assert!(!has_permission(&db, uid, cid, "b_channel_modify_name"));
+        assert_eq!(get_power(&db, uid, cid, "i_channel_modify_power"), 0);
+
+        // Tier 4: Give user Channel Admin in channel 1
+        db.set_client_channel_group(uid, cid, 5).unwrap();
+        assert_eq!(
+            evaluate_permission(&db, uid, cid, "b_channel_modify_name"),
+            Some(1)
+        );
+        assert!(has_permission(&db, uid, cid, "b_channel_modify_name"));
+        assert_eq!(get_power(&db, uid, cid, "i_channel_delete_power"), 50);
+
+        // In channel 2, user should still be Guest
+        assert_eq!(
+            evaluate_permission(&db, uid, 2, "b_channel_modify_name"),
+            None
+        );
+
+        // Tier 3: Channel permission for a perm not in Channel Group (e.g. i_channel_needed_join_power)
+        db.set_channel_perm(cid, "i_channel_needed_join_power", 25, false, false).unwrap();
+        assert_eq!(get_power(&db, uid, cid, "i_channel_needed_join_power"), 25);
+
+        // Tier 5: Channel-Client permission overrides Channel Group (Tier 4)
+        db.set_channel_client_perm(cid, uid, "i_channel_delete_power", 80, false, false).unwrap();
+        assert_eq!(get_power(&db, uid, cid, "i_channel_delete_power"), 80);
+
+        // Power comparison
+        assert!(check_power(&db, uid, cid, "i_channel_delete_power", 75));
+        assert!(!check_power(&db, uid, cid, "i_channel_delete_power", 90));
+    }
+
+    #[test]
+    fn test_server_admin_skip_channelgroup() {
+        let db = Database::in_memory().expect("in-memory db");
+        let uid = "admin_user";
+        db.add_client_to_server_group(uid, 6).unwrap();
+
+        let cid = 1;
+        // Server admin has power 75
+        assert_eq!(get_power(&db, uid, cid, "i_channel_modify_power"), 75);
+
+        // Channel group 8 (Guest) has 0, but because Server Admin skips channel group perms,
+        // it stays 75!
+        db.set_client_channel_group(uid, cid, 8).unwrap();
+        assert_eq!(get_power(&db, uid, cid, "i_channel_modify_power"), 75);
+    }
+}
