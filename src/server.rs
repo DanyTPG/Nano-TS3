@@ -2660,7 +2660,11 @@ impl Server {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let target_clients: Vec<(u16, SocketAddr)> = {
+                    let is_admin = {
+                        let state = self.state.lock().await;
+                        state.get_client(&peer).map(|c| c.is_admin).unwrap_or(false)
+                    };
+                    let target_clients: Vec<(u16, SocketAddr, String)> = {
                         let state = self.state.lock().await;
                         targets
                             .iter()
@@ -2672,7 +2676,7 @@ impl Server {
                                         c.clid == *target
                                             && c.handshake_phase == HandshakePhase::Connected
                                     })
-                                    .map(|c| (*target, c.endpoint))
+                                    .map(|c| (*target, c.endpoint, c.uid.clone()))
                             })
                             .collect()
                     };
@@ -2680,7 +2684,42 @@ impl Server {
                         err_resp.set("id", "512");
                         err_resp.set("msg", "invalid clientID");
                     } else {
-                        for (target_clid, ep) in &target_clients {
+                        let can_pm = is_admin || {
+                            let db = self.db.lock().await;
+                            let mut allowed = true;
+                            for (_, _, target_uid) in &target_clients {
+                                if !permissions::check_target_power(
+                                    &db,
+                                    &invoker_uid,
+                                    target_uid,
+                                    0,
+                                    "i_client_private_textmessage_power",
+                                    "i_client_needed_private_textmessage_power",
+                                ) {
+                                    allowed = false;
+                                    break;
+                                }
+                            }
+                            allowed
+                        };
+
+                        if !can_pm {
+                            err_resp.set("id", "2568");
+                            err_resp.set("msg", "insufficient client permissions");
+                            err_resp.set(
+                                "failed_permid",
+                                permissions::perm_name_to_id("i_client_needed_private_textmessage_power")
+                                    .unwrap_or(0)
+                                    .to_string(),
+                            );
+                            if let Some(rc) = cmd.get("return_code") {
+                                err_resp.set("return_code", rc);
+                            }
+                            self.send_encrypted_command(peer, &err_resp).await?;
+                            return Ok(());
+                        }
+
+                        for (target_clid, ep, _) in &target_clients {
                             let mut target_notify = notify.clone();
                             target_notify.set("target", target_clid.to_string());
                             let _ = self.send_encrypted_command(*ep, &target_notify).await;
@@ -6020,44 +6059,67 @@ impl Server {
                 let target_clid: Option<u16> = cmd.get("clid").and_then(|v| v.parse().ok());
                 let poke_msg = cmd.get("msg").unwrap_or("").to_string();
 
-                let (invoker_nickname, invoker_uid) = {
+                let (invoker_nickname, invoker_uid, is_admin) = {
                     let state = self.state.lock().await;
                     state
                         .get_client(&peer)
-                        .map(|c| (c.nickname.clone(), c.uid.clone()))
-                        .unwrap_or_else(|| ("User".to_string(), String::new()))
+                        .map(|c| (c.nickname.clone(), c.uid.clone(), c.is_admin))
+                        .unwrap_or_else(|| ("User".to_string(), String::new(), false))
                 };
 
                 let mut err_resp = Command::new("error");
-                let target_ep = {
+                let target_info = {
                     let state = self.state.lock().await;
-                    target_clid.and_then(|target_clid| {
+                    target_clid.and_then(|t_clid| {
                         state
                             .clients
                             .values()
                             .find(|c| {
-                                c.clid == target_clid
+                                c.clid == t_clid
                                     && c.handshake_phase == HandshakePhase::Connected
                             })
-                            .map(|c| c.endpoint)
+                            .map(|c| (c.endpoint, c.uid.clone()))
                     })
                 };
 
-                match target_ep {
-                    Some(target_ep) => {
-                        let mut poke = Command::new("notifyclientpoke");
-                        poke.set("invokerid", clid.to_string());
-                        poke.set("invokername", &invoker_nickname);
-                        poke.set("invokeruid", &invoker_uid);
-                        poke.set("msg", &poke_msg);
-                        let _ = self.send_encrypted_command(target_ep, &poke).await;
+                match target_info {
+                    Some((target_ep, target_uid)) => {
+                        let can_poke = is_admin || {
+                            let db = self.db.lock().await;
+                            permissions::check_target_power(
+                                &db,
+                                &invoker_uid,
+                                &target_uid,
+                                0,
+                                "i_client_poke_power",
+                                "i_client_needed_poke_power",
+                            )
+                        };
 
-                        info!(
-                            "Client {} ({}) poked client {} with message '{}'",
-                            clid, invoker_nickname, target_clid.unwrap(), poke_msg
-                        );
-                        err_resp.set("id", "0");
-                        err_resp.set("msg", "ok");
+                        if !can_poke {
+                            err_resp.set("id", "2568");
+                            err_resp.set("msg", "insufficient client permissions");
+                            err_resp.set(
+                                "failed_permid",
+                                permissions::perm_name_to_id("i_client_needed_poke_power")
+                                    .unwrap_or(0)
+                                    .to_string(),
+                            );
+                        } else {
+                            let mut poke = Command::new("notifyclientpoke");
+                            poke.set("invokerid", clid.to_string());
+                            poke.set("invokername", &invoker_nickname);
+                            poke.set("invokeruid", &invoker_uid);
+                            poke.set("msg", &poke_msg);
+                            let _ = self.send_encrypted_command(target_ep, &poke).await;
+
+                            info!(
+                                "Client {} ({}) poked client {} with message '{}'",
+                                clid, invoker_nickname, target_clid.unwrap(), poke_msg
+                            );
+                            err_resp.set("id", "0");
+                            err_resp.set("msg", "ok");
+                        }
                     }
                     None => {
                         err_resp.set("id", "512");

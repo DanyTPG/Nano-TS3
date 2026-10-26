@@ -196,6 +196,8 @@ pub static DEFAULT_SERVER_GROUP_PERMS: &[DefaultPermDef] = &[
     DefaultPermDef { group_id: 6, perm_id: "i_client_needed_kick_from_server_power", value: 75, negated: false, skip: false },
     DefaultPermDef { group_id: 6, perm_id: "i_client_needed_move_power", value: 75, negated: false, skip: false },
     DefaultPermDef { group_id: 6, perm_id: "i_client_needed_permission_modify_power", value: 75, negated: false, skip: false },
+    DefaultPermDef { group_id: 6, perm_id: "i_client_needed_poke_power", value: 75, negated: false, skip: false },
+    DefaultPermDef { group_id: 6, perm_id: "i_client_needed_private_textmessage_power", value: 75, negated: false, skip: false },
     DefaultPermDef { group_id: 6, perm_id: "i_client_needed_serverquery_view_power", value: 75, negated: false, skip: false },
     DefaultPermDef { group_id: 6, perm_id: "i_client_permission_modify_power", value: 75, negated: false, skip: false },
     DefaultPermDef { group_id: 6, perm_id: "i_client_poke_power", value: 75, negated: false, skip: false },

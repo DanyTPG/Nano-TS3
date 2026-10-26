@@ -2071,7 +2071,7 @@ mod tests {
 
         // Verify seeded perms count
         let sa_perms = db.get_server_group_perms(6).expect("sa perms");
-        assert_eq!(sa_perms.len(), 413);
+        assert_eq!(sa_perms.len(), 415);
         let guest_perms = db.get_server_group_perms(8).expect("guest perms");
         assert_eq!(guest_perms.len(), 31);
         let ca_perms = db.get_channel_group_perms(5).expect("ca perms");
