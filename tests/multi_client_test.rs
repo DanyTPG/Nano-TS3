@@ -3410,3 +3410,60 @@ async fn test_anti_flood_command_throttling_and_ip_ban() {
 
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn test_channel_needed_subscribe_power_enforcement() {
+    let db = Database::in_memory().expect("db");
+    let secret_cid = db.create_channel("SecretStaffRoom", "").unwrap();
+    db.edit_channel(
+        secret_cid,
+        &nano_ts3::database::ChannelEdit {
+            needed_subscribe_power: Some(75),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let admin_token = db.get_or_create_initial_admin_token().unwrap().unwrap();
+
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind");
+    let server_addr = server.local_addr().expect("local addr");
+
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // 1. Connect Admin and claim privilege key
+    let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    assert_ne!(admin.clid, 0);
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // 2. Admin moves into SecretStaffRoom
+    let mut move_cmd = Command::new("clientmove");
+    move_cmd.set("cid", secret_cid.to_string());
+    admin.send_command(&move_cmd).await;
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // 3. Guest connects
+    let mut guest = ClientSession::connect(server_addr, "GuestUser").await;
+    assert_ne!(guest.clid, 0);
+
+    // 4. Guest attempts to subscribe to SecretStaffRoom -> rejected with 2568
+    let mut sub_cmd = Command::new("channelsubscribe");
+    sub_cmd.set("cid", secret_cid.to_string());
+    guest.send_command(&sub_cmd).await;
+    let sub_err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("channelsubscribe error");
+    assert_eq!(sub_err.get("id"), Some("2568"), "Subscribe must fail with 2568");
+    assert_eq!(
+        sub_err.get("failed_permid"),
+        Some("142"),
+        "Failed permid must be 142 (i_channel_needed_subscribe_power)"
+    );
+
+    server_handle.abort();
+}

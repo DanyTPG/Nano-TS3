@@ -2246,6 +2246,24 @@ impl Server {
                 self.send_client_group_membership(peer, clid, is_admin)
                     .await?;
 
+                let allowed_cids: std::collections::HashSet<u64> = {
+                    let db = self.db.lock().await;
+                    let channels = db.get_channels().unwrap_or_default();
+                    if is_admin {
+                        channels.into_iter().map(|ch| ch.cid).collect()
+                    } else {
+                        let power = permissions::get_power(&db, &uid, 0, "i_channel_subscribe_power");
+                        let mut cids = std::collections::HashSet::new();
+                        cids.insert(target_cid);
+                        for ch in channels {
+                            if power >= ch.needed_subscribe_power {
+                                cids.insert(ch.cid);
+                            }
+                        }
+                        cids
+                    }
+                };
+
                 // 3. Tell the newcomer about everybody who is already online.
                 let existing_clients: Vec<(u16, String, String, u64, bool, ClientAudioState, bool, String)> = {
                     let state = self.state.lock().await;
@@ -2275,6 +2293,9 @@ impl Server {
                 for (other_clid, other_uid, other_nick, other_cid, other_admin, other_audio, other_away, other_away_msg) in
                     &existing_clients
                 {
+                    if !allowed_cids.contains(other_cid) {
+                        continue;
+                    }
                     let view = build_client_enter_view(
                         "0",
                         *other_clid,
@@ -2291,22 +2312,11 @@ impl Server {
                 }
 
                 // 4. Announce the newcomer to all other connected clients.
-                // The connect flow above hands the newcomer every existing
-                // client's view, so mirror that in its own subscription
-                // state: it is effectively subscribed to every channel until
-                // it explicitly changes that.
+                // Store initial allowed subscription state.
                 {
-                    let all_cids = {
-                        let db = self.db.lock().await;
-                        db.get_channels()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|ch| ch.cid)
-                            .collect::<Vec<_>>()
-                    };
                     let mut state = self.state.lock().await;
                     if let Some(c) = state.get_client_mut(&peer) {
-                        c.subscribed_channels.extend(all_cids);
+                        c.subscribed_channels.extend(allowed_cids);
                     }
                 }
 
@@ -2466,12 +2476,25 @@ impl Server {
             "channelsubscribeall" | "channelunsubscribeall" => {
                 let subscribe = cmd.name == "channelsubscribeall";
                 let channel_ids = {
+                    let (invoker_uid, is_admin, current_cid) = {
+                        let state = self.state.lock().await;
+                        state
+                            .get_client(&peer)
+                            .map(|c| (c.uid.clone(), c.is_admin, c.current_channel_id))
+                            .unwrap_or_else(|| (String::new(), false, 1))
+                    };
                     let db = self.db.lock().await;
-                    db.get_channels()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|channel| channel.cid)
-                        .collect::<Vec<_>>()
+                    let channels = db.get_channels().unwrap_or_default();
+                    if !subscribe || is_admin {
+                        channels.into_iter().map(|channel| channel.cid).collect::<Vec<_>>()
+                    } else {
+                        let power = permissions::get_power(&db, &invoker_uid, 0, "i_channel_subscribe_power");
+                        channels
+                            .into_iter()
+                            .filter(|channel| channel.cid == current_cid || power >= channel.needed_subscribe_power)
+                            .map(|channel| channel.cid)
+                            .collect::<Vec<_>>()
+                    }
                 };
 
                 let (notification_name, notification_ids, own_clid) = {
@@ -2547,18 +2570,57 @@ impl Server {
             "channelsubscribe" | "channelunsubscribe" => {
                 let subscribe = cmd.name == "channelsubscribe";
                 let requested = parse_channel_ids(&cmd);
-                let available = {
+                let (channels_map, user_subscribe_power, is_admin, current_cid) = {
+                    let (invoker_uid, is_admin, current_cid) = {
+                        let state = self.state.lock().await;
+                        state
+                            .get_client(&peer)
+                            .map(|c| (c.uid.clone(), c.is_admin, c.current_channel_id))
+                            .unwrap_or_else(|| (String::new(), false, 1))
+                    };
                     let db = self.db.lock().await;
-                    db.get_channels()
-                        .unwrap_or_default()
+                    let channels = db.get_channels().unwrap_or_default();
+                    let map: std::collections::HashMap<u64, i64> = channels
                         .into_iter()
-                        .map(|channel| channel.cid)
-                        .collect::<std::collections::BTreeSet<_>>()
+                        .map(|ch| (ch.cid, ch.needed_subscribe_power))
+                        .collect();
+                    let power = if is_admin {
+                        100
+                    } else {
+                        permissions::get_power(&db, &invoker_uid, 0, "i_channel_subscribe_power")
+                    };
+                    (map, power, is_admin, current_cid)
                 };
+
                 let requested = requested
                     .into_iter()
-                    .filter(|cid| available.contains(cid))
+                    .filter(|cid| channels_map.contains_key(cid))
                     .collect::<Vec<_>>();
+
+                if subscribe && requested.len() == 1 {
+                    let target_cid = requested[0];
+                    let needed = channels_map.get(&target_cid).copied().unwrap_or(0);
+                    if !is_admin && target_cid != current_cid && user_subscribe_power < needed {
+                        let mut err_resp = Command::new("error");
+                        err_resp.set("id", "2568");
+                        err_resp.set("msg", "insufficient client permissions");
+                        err_resp.set("failed_permid", "142"); // i_channel_needed_subscribe_power
+                        if let Some(rc) = cmd.get("return_code") {
+                            err_resp.set("return_code", rc);
+                        }
+                        self.send_encrypted_command(peer, &err_resp).await?;
+                        return Ok(());
+                    }
+                }
+
+                let requested: Vec<u64> = if subscribe && !is_admin {
+                    requested
+                        .into_iter()
+                        .filter(|cid| *cid == current_cid || user_subscribe_power >= channels_map.get(cid).copied().unwrap_or(0))
+                        .collect()
+                } else {
+                    requested
+                };
 
                 let (notification_name, notification_ids, own_clid) = {
                     let mut state = self.state.lock().await;
@@ -4892,29 +4954,48 @@ impl Server {
             }
             "channelgetdescription" => {
                 let cid: u64 = cmd.get("cid").and_then(|s| s.parse().ok()).unwrap_or(1);
-                let desc = {
-                    let db = self.db.lock().await;
-                    let channels = db.get_channels().unwrap_or_default();
-                    channels
-                        .into_iter()
-                        .find(|ch| ch.cid == cid)
-                        .map(|ch| ch.description)
-                        .unwrap_or_default()
+                let (invoker_uid, is_admin) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.uid.clone(), c.is_admin))
+                        .unwrap_or_else(|| (String::new(), false))
                 };
-                // The protocol answers `channelgetdescription` with the low
-                // priority `notifychanneledited` update. A response named
-                // `channelgetdescription` is ignored by the 3.6.2 client,
-                // which leaves Edit Channel and Delete Channel without the
-                // description snapshot their dialogs wait for.
-                let mut resp = Command::new("notifychanneledited");
-                resp.set("cid", cid.to_string());
-                resp.set("reasonid", "9"); // Channelupdate
-                resp.set("channel_description", &desc);
-                self.send_encrypted_command(peer, &resp).await?;
-
+                let can_view_desc = is_admin || {
+                    let db = self.db.lock().await;
+                    let needed_power = permissions::get_power(&db, &invoker_uid, cid, "i_channel_needed_description_view_power");
+                    let view_power = permissions::get_power(&db, &invoker_uid, cid, "i_channel_description_view_power");
+                    view_power >= needed_power
+                };
                 let mut err_resp = Command::new("error");
-                err_resp.set("id", "0");
-                err_resp.set("msg", "ok");
+                if !can_view_desc {
+                    err_resp.set("id", "2568");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "144"); // i_channel_needed_description_view_power
+                } else {
+                    let desc = {
+                        let db = self.db.lock().await;
+                        let channels = db.get_channels().unwrap_or_default();
+                        channels
+                            .into_iter()
+                            .find(|ch| ch.cid == cid)
+                            .map(|ch| ch.description)
+                            .unwrap_or_default()
+                    };
+                    // The protocol answers `channelgetdescription` with the low
+                    // priority `notifychanneledited` update. A response named
+                    // `channelgetdescription` is ignored by the 3.6.2 client,
+                    // which leaves Edit Channel and Delete Channel without the
+                    // description snapshot their dialogs wait for.
+                    let mut resp = Command::new("notifychanneledited");
+                    resp.set("cid", cid.to_string());
+                    resp.set("reasonid", "9"); // Channelupdate
+                    resp.set("channel_description", &desc);
+                    self.send_encrypted_command(peer, &resp).await?;
+
+                    err_resp.set("id", "0");
+                    err_resp.set("msg", "ok");
+                }
                 if let Some(rc) = cmd.get("return_code") {
                     err_resp.set("return_code", rc);
                 }
