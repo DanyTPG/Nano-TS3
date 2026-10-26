@@ -2207,3 +2207,205 @@ async fn test_edit_channel_all_tabs_end_to_end() {
 
     server_handle.abort();
 }
+
+/// Tests that all 5 tiers of the TeamSpeak 3 permission engine support
+/// full CRUD operations over the client wire protocol:
+/// - Tier 1: Server Groups (servergroupaddperm, servergrouppermlist, servergroupdelperm, servergroupaddclient, servergroupdelclient)
+/// - Tier 2: Client Permissions (clientaddperm, clientpermlist, clientdelperm)
+/// - Tier 3: Channel Permissions (channeladdperm, channelpermlist, channeldelperm)
+/// - Tier 4: Channel Groups (channelgroupaddperm, channelgrouppermlist, channelgroupdelperm, setclientchannelgroup)
+/// - Tier 5: Channel-Client Permissions (channelclientaddperm, channelclientpermlist, channelclientdelperm)
+#[tokio::test]
+async fn test_all_five_tiers_wire_crud() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let server_addr = server.local_addr().expect("local addr failed");
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut admin = ClientSession::connect(server_addr, "AdminUser").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgraded");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut guest = ClientSession::connect(server_addr, "GuestUser").await;
+    let _ = guest.recv_until("notifycliententerview", Duration::from_secs(2)).await;
+    let guest_clid = guest.clid.to_string();
+
+    // Create a channel for channel-scoped tiers
+    let mut create = Command::new("channelcreate");
+    create.set("channel_name", "TierChannel");
+    create.set("channel_flag_permanent", "1");
+    admin.send_command(&create).await;
+    let created = admin
+        .recv_until("notifychannelcreated", Duration::from_secs(2))
+        .await
+        .expect("channel created");
+    let cid = created.get("cid").expect("cid").to_string();
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // --- Tier 1: Server Groups ---
+    let mut sg_add = Command::new("servergroupaddperm");
+    sg_add.set("sgid", "7");
+    sg_add.set("permsid", "b_channel_modify_name");
+    sg_add.set("permvalue", "1");
+    admin.send_command(&sg_add).await;
+    let sg_add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sg add ok");
+    assert_eq!(sg_add_ok.get("id"), Some("0"));
+
+    let mut sg_list = Command::new("servergrouppermlist");
+    sg_list.set("sgid", "7");
+    sg_list.set("permsid", "1");
+    admin.send_command(&sg_list).await;
+    let sg_resp = admin.recv_until("notifyservergrouppermlist", Duration::from_secs(2)).await.expect("sg list");
+    assert_eq!(sg_resp.get("sgid"), Some("7"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut sg_del = Command::new("servergroupdelperm");
+    sg_del.set("sgid", "7");
+    sg_del.set("permsid", "b_channel_modify_name");
+    admin.send_command(&sg_del).await;
+    let sg_del_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sg del ok");
+    assert_eq!(sg_del_ok.get("id"), Some("0"));
+
+    // --- Tier 2: Client Specific Permissions ---
+    let mut client_add = Command::new("clientaddperm");
+    client_add.set("cldbid", &guest_clid);
+    client_add.set("permsid", "i_channel_join_power");
+    client_add.set("permvalue", "60");
+    admin.send_command(&client_add).await;
+    let client_add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("client add ok");
+    assert_eq!(client_add_ok.get("id"), Some("0"));
+
+    let mut client_list = Command::new("clientpermlist");
+    client_list.set("cldbid", &guest_clid);
+    client_list.set("permsid", "1");
+    admin.send_command(&client_list).await;
+    let client_resp = admin.recv_until("notifyclientpermlist", Duration::from_secs(2)).await.expect("client list");
+    assert_eq!(client_resp.get("cldbid"), Some(guest_clid.as_str()));
+    assert_eq!(client_resp.get("permsid"), Some("i_channel_join_power"));
+    assert_eq!(client_resp.get("permvalue"), Some("60"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut client_del = Command::new("clientdelperm");
+    client_del.set("cldbid", &guest_clid);
+    client_del.set("permsid", "i_channel_join_power");
+    admin.send_command(&client_del).await;
+    let client_del_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("client del ok");
+    assert_eq!(client_del_ok.get("id"), Some("0"));
+
+    // --- Tier 3: Channel Permissions ---
+    let mut ch_add = Command::new("channeladdperm");
+    ch_add.set("cid", &cid);
+    ch_add.set("permsid", "i_channel_needed_join_power");
+    ch_add.set("permvalue", "50");
+    admin.send_command(&ch_add).await;
+    let ch_add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("ch add ok");
+    assert_eq!(ch_add_ok.get("id"), Some("0"));
+
+    let mut ch_list = Command::new("channelpermlist");
+    ch_list.set("cid", &cid);
+    admin.send_command(&ch_list).await;
+    let ch_resp = admin.recv_until("notifychannelpermlist", Duration::from_secs(2)).await.expect("ch list");
+    assert_eq!(ch_resp.get("cid"), Some(cid.as_str()));
+    assert_eq!(ch_resp.get("permid"), Some("140"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut ch_del = Command::new("channeldelperm");
+    ch_del.set("cid", &cid);
+    ch_del.set("permsid", "i_channel_needed_join_power");
+    admin.send_command(&ch_del).await;
+    let ch_del_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("ch del ok");
+    assert_eq!(ch_del_ok.get("id"), Some("0"));
+
+    // --- Tier 4: Channel Groups ---
+    let mut cg_add = Command::new("channelgroupaddperm");
+    cg_add.set("cgid", "7");
+    cg_add.set("permsid", "b_channel_modify_topic");
+    cg_add.set("permvalue", "1");
+    admin.send_command(&cg_add).await;
+    let cg_add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("cg add ok");
+    assert_eq!(cg_add_ok.get("id"), Some("0"));
+
+    let mut cg_list = Command::new("channelgrouppermlist");
+    cg_list.set("cgid", "7");
+    cg_list.set("permsid", "1");
+    admin.send_command(&cg_list).await;
+    let cg_resp = admin.recv_until("notifychannelgrouppermlist", Duration::from_secs(2)).await.expect("cg list");
+    assert_eq!(cg_resp.get("cgid"), Some("7"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut cg_del = Command::new("channelgroupdelperm");
+    cg_del.set("cgid", "7");
+    cg_del.set("permsid", "b_channel_modify_topic");
+    admin.send_command(&cg_del).await;
+    let cg_del_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("cg del ok");
+    assert_eq!(cg_del_ok.get("id"), Some("0"));
+
+    let mut set_cg = Command::new("setclientchannelgroup");
+    set_cg.set("cgid", "5"); // Channel Admin
+    set_cg.set("cid", &cid);
+    set_cg.set("cldbid", &guest_clid);
+    admin.send_command(&set_cg).await;
+    let set_cg_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("set cg ok");
+    assert_eq!(set_cg_ok.get("id"), Some("0"));
+
+    // --- Tier 5: Channel-Client Permissions ---
+    let mut cc_add = Command::new("channelclientaddperm");
+    cc_add.set("cid", &cid);
+    cc_add.set("cldbid", &guest_clid);
+    cc_add.set("permsid", "i_client_talk_power");
+    cc_add.set("permvalue", "85");
+    admin.send_command(&cc_add).await;
+    let cc_add_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("cc add ok");
+    assert_eq!(cc_add_ok.get("id"), Some("0"));
+
+    let mut cc_list = Command::new("channelclientpermlist");
+    cc_list.set("cid", &cid);
+    cc_list.set("cldbid", &guest_clid);
+    cc_list.set("permsid", "1");
+    admin.send_command(&cc_list).await;
+    let cc_resp = admin.recv_until("notifychannelclientpermlist", Duration::from_secs(2)).await.expect("cc list");
+    assert_eq!(cc_resp.get("cid"), Some(cid.as_str()));
+    assert_eq!(cc_resp.get("cldbid"), Some(guest_clid.as_str()));
+    assert_eq!(cc_resp.get("permsid"), Some("i_client_talk_power"));
+    assert_eq!(cc_resp.get("permvalue"), Some("85"));
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    let mut cc_del = Command::new("channelclientdelperm");
+    cc_del.set("cid", &cid);
+    cc_del.set("cldbid", &guest_clid);
+    cc_del.set("permsid", "i_client_talk_power");
+    admin.send_command(&cc_del).await;
+    let cc_del_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("cc del ok");
+    assert_eq!(cc_del_ok.get("id"), Some("0"));
+
+    // --- Server Group Client Assignment ---
+    let mut sg_add_cl = Command::new("servergroupaddclient");
+    sg_add_cl.set("sgid", "6");
+    sg_add_cl.set("cldbid", &guest_clid);
+    admin.send_command(&sg_add_cl).await;
+    let sg_add_cl_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sg add cl ok");
+    assert_eq!(sg_add_cl_ok.get("id"), Some("0"));
+
+    let mut sg_del_cl = Command::new("servergroupdelclient");
+    sg_del_cl.set("sgid", "6");
+    sg_del_cl.set("cldbid", &guest_clid);
+    admin.send_command(&sg_del_cl).await;
+    let sg_del_cl_ok = admin.recv_until("error", Duration::from_secs(2)).await.expect("sg del cl ok");
+    assert_eq!(sg_del_cl_ok.get("id"), Some("0"));
+
+    server_handle.abort();
+}
