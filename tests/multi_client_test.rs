@@ -3618,3 +3618,84 @@ async fn test_poke_and_private_message_and_channel_delete_power_enforcement() {
 
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn test_server_connection_info() {
+    let db = Database::in_memory().expect("failed to open in-memory db");
+    let admin_token = db
+        .get_or_create_initial_admin_token()
+        .expect("token error")
+        .unwrap();
+    let server = Server::bind("127.0.0.1:0", db).await.expect("bind failed");
+    let addr = server.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+
+    let mut admin = ClientSession::connect(addr, "Admin").await;
+    let mut token_cmd = Command::new("privilegekeyuse");
+    token_cmd.set("token", &admin_token);
+    admin.send_command(&token_cmd).await;
+    admin
+        .recv_until("notifyclientupdated", Duration::from_secs(2))
+        .await
+        .expect("admin upgraded");
+    let _ = admin.recv_until("error", Duration::from_secs(2)).await;
+
+    // Send serverrequestconnectioninfo
+    let mut req = Command::new("serverrequestconnectioninfo");
+    req.set("return_code", "test_rc_123");
+    admin.send_command(&req).await;
+
+    let notify = admin
+        .recv_until("notifyserverconnectioninfo", Duration::from_secs(2))
+        .await
+        .expect("admin receives notifyserverconnectioninfo");
+
+    // Verify all mandatory statistics required by TS3 client UI
+    assert!(notify.get("connection_packets_sent_total").is_some());
+    assert!(notify.get("connection_bytes_sent_total").is_some());
+    assert!(notify.get("connection_packets_received_total").is_some());
+    assert!(notify.get("connection_bytes_received_total").is_some());
+    assert!(notify.get("connection_bandwidth_sent_last_second_total").is_some());
+    assert!(notify.get("connection_bandwidth_sent_last_minute_total").is_some());
+    assert!(notify.get("connection_bandwidth_received_last_second_total").is_some());
+    assert!(notify.get("connection_bandwidth_received_last_minute_total").is_some());
+    assert!(notify.get("connection_connected_time").is_some());
+    assert_eq!(notify.get("connection_packetloss_total"), Some("0.0000"));
+    assert_eq!(notify.get("connection_ping"), Some("0.0000"));
+    assert_eq!(notify.get("connection_filetransfer_bandwidth_sent"), Some("0"));
+    assert_eq!(notify.get("connection_filetransfer_bandwidth_received"), Some("0"));
+    assert_eq!(notify.get("connection_filetransfer_bytes_sent_total"), Some("0"));
+    assert_eq!(notify.get("connection_filetransfer_bytes_received_total"), Some("0"));
+
+    let err = admin
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("admin receives error response");
+    assert_eq!(err.get("id"), Some("0"));
+    assert_eq!(err.get("return_code"), Some("test_rc_123"));
+
+    // Verify alias serverconnectioninforequest
+    let req_alias = Command::new("serverconnectioninforequest");
+    admin.send_command(&req_alias).await;
+    let notify_alias = admin
+        .recv_until("notifyserverconnectioninfo", Duration::from_secs(2))
+        .await
+        .expect("admin receives notifyserverconnectioninfo via alias");
+    assert!(notify_alias.get("connection_packets_sent_total").is_some());
+
+    // Verify Guest without b_virtualserver_connectioninfo_view is rejected with error 2560
+    let mut guest = ClientSession::connect(addr, "Guest").await;
+    let req_guest = Command::new("serverrequestconnectioninfo");
+    guest.send_command(&req_guest).await;
+    let guest_err = guest
+        .recv_until("error", Duration::from_secs(2))
+        .await
+        .expect("guest receives error response");
+    assert_eq!(guest_err.get("id"), Some("2560"));
+    assert_eq!(guest_err.get("failed_permid"), Some("26"));
+
+    server_handle.abort();
+}

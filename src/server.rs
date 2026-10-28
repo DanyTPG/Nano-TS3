@@ -17,10 +17,129 @@ use crate::database::{BanRecord, ChannelEdit, ChannelRecord, Database};
 use crate::permissions;
 use crate::state::{ClientAudioState, FloodAction, HandshakePhase, ServerState, IDLE_TIMEOUT};
 
+#[derive(Debug, Clone, Copy)]
+struct BandwidthBucket {
+    timestamp_sec: u64,
+    bytes_sent: u64,
+    bytes_recv: u64,
+}
+
+#[derive(Debug)]
+struct BandwidthTracker {
+    buckets: [BandwidthBucket; 60],
+}
+
+impl BandwidthTracker {
+    fn new() -> Self {
+        Self {
+            buckets: [BandwidthBucket {
+                timestamp_sec: 0,
+                bytes_sent: 0,
+                bytes_recv: 0,
+            }; 60],
+        }
+    }
+
+    fn record_sent(&mut self, now_sec: u64, bytes: u64) {
+        let idx = (now_sec % 60) as usize;
+        let bucket = &mut self.buckets[idx];
+        if bucket.timestamp_sec != now_sec {
+            bucket.timestamp_sec = now_sec;
+            bucket.bytes_sent = bytes;
+            bucket.bytes_recv = 0;
+        } else {
+            bucket.bytes_sent = bucket.bytes_sent.saturating_add(bytes);
+        }
+    }
+
+    fn record_recv(&mut self, now_sec: u64, bytes: u64) {
+        let idx = (now_sec % 60) as usize;
+        let bucket = &mut self.buckets[idx];
+        if bucket.timestamp_sec != now_sec {
+            bucket.timestamp_sec = now_sec;
+            bucket.bytes_sent = 0;
+            bucket.bytes_recv = bytes;
+        } else {
+            bucket.bytes_recv = bucket.bytes_recv.saturating_add(bytes);
+        }
+    }
+
+    fn get_bandwidth(&self, now_sec: u64) -> (u64, u64, u64, u64) {
+        let mut sent_last_sec: u64 = 0;
+        let mut recv_last_sec: u64 = 0;
+        let mut sent_last_min: u64 = 0;
+        let mut recv_last_min: u64 = 0;
+
+        for bucket in &self.buckets {
+            if bucket.timestamp_sec == now_sec {
+                sent_last_sec = bucket.bytes_sent;
+                recv_last_sec = bucket.bytes_recv;
+            }
+            if bucket.timestamp_sec + 60 > now_sec && bucket.timestamp_sec <= now_sec {
+                sent_last_min = sent_last_min.saturating_add(bucket.bytes_sent);
+                recv_last_min = recv_last_min.saturating_add(bucket.bytes_recv);
+            }
+        }
+
+        (sent_last_sec, sent_last_min / 60, recv_last_sec, recv_last_min / 60)
+    }
+}
+
+#[derive(Debug)]
+pub struct ServerNetworkStats {
+    pub start_time: std::time::Instant,
+    pub packets_sent: std::sync::atomic::AtomicU64,
+    pub bytes_sent: std::sync::atomic::AtomicU64,
+    pub packets_received: std::sync::atomic::AtomicU64,
+    pub bytes_received: std::sync::atomic::AtomicU64,
+    bandwidth_history: std::sync::Mutex<BandwidthTracker>,
+}
+
+impl ServerNetworkStats {
+    pub fn new() -> Self {
+        Self {
+            start_time: std::time::Instant::now(),
+            packets_sent: std::sync::atomic::AtomicU64::new(0),
+            bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            packets_received: std::sync::atomic::AtomicU64::new(0),
+            bytes_received: std::sync::atomic::AtomicU64::new(0),
+            bandwidth_history: std::sync::Mutex::new(BandwidthTracker::new()),
+        }
+    }
+
+    pub fn record_sent(&self, bytes: u64) {
+        self.packets_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_sent.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        let now_sec = self.start_time.elapsed().as_secs();
+        if let Ok(mut tracker) = self.bandwidth_history.lock() {
+            tracker.record_sent(now_sec, bytes);
+        }
+    }
+
+    pub fn record_recv(&self, bytes: u64) {
+        self.packets_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_received.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        let now_sec = self.start_time.elapsed().as_secs();
+        if let Ok(mut tracker) = self.bandwidth_history.lock() {
+            tracker.record_recv(now_sec, bytes);
+        }
+    }
+
+    pub fn get_bandwidth(&self) -> (u64, u64, u64, u64) {
+        let now_sec = self.start_time.elapsed().as_secs();
+        if let Ok(tracker) = self.bandwidth_history.lock() {
+            tracker.get_bandwidth(now_sec)
+        } else {
+            (0, 0, 0, 0)
+        }
+    }
+}
+
 pub struct Server {
     socket: Arc<UdpSocket>,
     state: Arc<Mutex<ServerState>>,
     db: Arc<Mutex<Database>>,
+    stats: Arc<ServerNetworkStats>,
 }
 
 /// Builds a `notifycliententerview` command with every parameter the official
@@ -215,6 +334,111 @@ fn parse_channel_edit(cmd: &Command) -> Result<ChannelEdit, String> {
     }
 
     Ok(edit)
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(c1), Some(c2)) = (h1, h2) {
+                let hex_str = format!("{c1}{c2}");
+                if let Ok(byte) = u8::from_str_radix(&hex_str, 16) {
+                    out.push(byte as char);
+                    continue;
+                }
+                out.push('%');
+                out.push(c1);
+                out.push(c2);
+            } else {
+                out.push('%');
+                if let Some(c1) = h1 {
+                    out.push(c1);
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Resolves a requested default channel string (from clientinit / connect dialog / bookmark)
+/// against the virtual server's channel list. Supports:
+/// - Exact and case-insensitive channel name matching ("TestingRoom", "testingroom")
+/// - Leading, trailing, and nested channel paths ("/TestingRoom", "Lobby/TestingRoom", "/TestingRoom/")
+/// - Numeric channel IDs ("2", "/2", "#2", "cid:2", "id:2")
+/// - Wire-escaped strings ("Testing\\sRoom")
+/// - Quoted strings ("\"TestingRoom\"")
+/// - URL/percent-encoded names ("Testing%20Room")
+pub fn resolve_target_channel<'a>(
+    channels: &'a [ChannelRecord],
+    requested: &str,
+) -> Option<&'a ChannelRecord> {
+    let raw = requested.trim().trim_matches('"');
+    if raw.is_empty() {
+        return None;
+    }
+
+    let unescaped = crate::command::unescape(raw);
+    let pct_decoded = percent_decode(raw);
+    let pct_unescaped = percent_decode(&unescaped);
+
+    let candidates = [
+        raw,
+        unescaped.as_str(),
+        pct_decoded.as_str(),
+        pct_unescaped.as_str(),
+    ];
+
+    for cand in candidates {
+        let clean = cand.trim().trim_matches('"').trim_matches('/');
+        if clean.is_empty() {
+            continue;
+        }
+
+        // 1. Numeric CID match (e.g. "2", "/2", "#2", "cid:2", "id:2")
+        let num_str = clean
+            .strip_prefix('#')
+            .or_else(|| clean.strip_prefix("cid:"))
+            .or_else(|| clean.strip_prefix("id:"))
+            .unwrap_or(clean);
+        if let Ok(cid) = num_str.parse::<u64>() {
+            if let Some(ch) = channels.iter().find(|c| c.cid == cid) {
+                return Some(ch);
+            }
+        }
+
+        // 2. Case-insensitive match on the full clean channel name
+        if let Some(ch) = channels
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(clean))
+        {
+            return Some(ch);
+        }
+
+        // 3. Match on the leaf channel segment if a path with slashes was given (e.g. "Lobby/TestingRoom")
+        if let Some(leaf) = clean.rsplit('/').next() {
+            let leaf_clean = leaf.trim().trim_matches('"');
+            if !leaf_clean.is_empty() {
+                if let Some(ch) = channels
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(leaf_clean))
+                {
+                    return Some(ch);
+                }
+                if let Ok(cid) = leaf_clean.parse::<u64>() {
+                    if let Some(ch) = channels.iter().find(|c| c.cid == cid) {
+                        return Some(ch);
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn build_channel_notification(
@@ -578,6 +802,61 @@ fn build_connection_info(
     cmd
 }
 
+/// Builds a `notifyserverconnectioninfo` command for the Server Connection Info dialog.
+/// Missing stats cause the official client's UI to fail with "Error getting server connection data"
+/// and leave all statistics labels empty.
+fn build_server_connection_info(
+    metrics: &ServerNetworkStats,
+    ping: f64,
+    packetloss: f64,
+) -> Command {
+    let mut cmd = Command::new("notifyserverconnectioninfo");
+    let uptime = metrics.start_time.elapsed().as_secs();
+    let (bw_sent_sec, bw_sent_min, bw_recv_sec, bw_recv_min) = metrics.get_bandwidth();
+
+    cmd.set(
+        "connection_packets_sent_total",
+        metrics.packets_sent.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+    );
+    cmd.set(
+        "connection_bytes_sent_total",
+        metrics.bytes_sent.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+    );
+    cmd.set(
+        "connection_packets_received_total",
+        metrics.packets_received.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+    );
+    cmd.set(
+        "connection_bytes_received_total",
+        metrics.bytes_received.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+    );
+    cmd.set(
+        "connection_bandwidth_sent_last_second_total",
+        bw_sent_sec.to_string(),
+    );
+    cmd.set(
+        "connection_bandwidth_sent_last_minute_total",
+        bw_sent_min.to_string(),
+    );
+    cmd.set(
+        "connection_bandwidth_received_last_second_total",
+        bw_recv_sec.to_string(),
+    );
+    cmd.set(
+        "connection_bandwidth_received_last_minute_total",
+        bw_recv_min.to_string(),
+    );
+    cmd.set("connection_connected_time", uptime.to_string());
+    cmd.set("connection_packetloss_total", format!("{:.4}", packetloss));
+    cmd.set("connection_ping", format!("{:.4}", ping));
+    cmd.set("connection_filetransfer_bandwidth_sent", "0");
+    cmd.set("connection_filetransfer_bandwidth_received", "0");
+    cmd.set("connection_filetransfer_bytes_sent_total", "0");
+    cmd.set("connection_filetransfer_bytes_received_total", "0");
+
+    cmd
+}
+
 /// Builds a `notifyserverupdated` command. The official client
 /// Builds a `notifyserverupdated` command. The official client
 /// rejects the message when any of these parameters is missing.
@@ -862,7 +1141,17 @@ impl Server {
             socket: Arc::new(socket),
             state: Arc::new(Mutex::new(ServerState::new())),
             db: Arc::new(Mutex::new(db)),
+            stats: Arc::new(ServerNetworkStats::new()),
         })
+    }
+
+    pub fn stats(&self) -> Arc<ServerNetworkStats> {
+        self.stats.clone()
+    }
+
+    async fn send_udp(&self, buf: &[u8], peer: SocketAddr) -> std::io::Result<usize> {
+        self.stats.record_sent(buf.len() as u64);
+        self.socket.send_to(buf, peer).await
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
@@ -882,7 +1171,10 @@ impl Server {
             tokio::select! {
                 received = self.socket.recv_from(&mut buf) => {
                     let (len, peer) = match received {
-                        Ok(r) => r,
+                        Ok(r) => {
+                            self.stats.record_recv(r.0 as u64);
+                            r
+                        }
                         Err(e) => {
                             if e.raw_os_error() != Some(10054) {
                                 error!("UDP receive error: {:?}", e);
@@ -940,7 +1232,7 @@ impl Server {
             let mut ping = OutAck::new(Direction::S2C, PacketType::Ping, p_id);
             ping.flags(Flags::UNENCRYPTED);
             ping.mac().copy_from_slice(&mac);
-            let _ = self.socket.send_to(&ping.into_vec(), ep).await;
+            let _ = self.send_udp(&ping.into_vec(), ep).await;
         }
 
         let disappeared = {
@@ -1230,7 +1522,7 @@ impl Server {
                     let mut ack = OutAck::new(Direction::S2C, PacketType::Ping, p_id);
                     ack.flags(Flags::UNENCRYPTED);
                     ack.mac().copy_from_slice(&sm);
-                    let _ = self.socket.send_to(&ack.into_vec(), peer).await;
+                    let _ = self.send_udp(&ack.into_vec(), peer).await;
                 }
             }
             PacketType::Voice => {
@@ -1275,7 +1567,7 @@ impl Server {
                 client.handshake_phase = HandshakePhase::Init0Received;
 
                 let resp = OutS2CInit1::new(&r1, r0_rev);
-                let _ = self.socket.send_to(&resp.into_vec(), peer).await;
+                let _ = self.send_udp(&resp.into_vec(), peer).await;
             }
             C2SInitData::Init2 { .. } => {
                 info!("Handshake Init2 from {}", peer);
@@ -1285,7 +1577,7 @@ impl Server {
                 client.puzzle = Some(puzzle);
                 client.handshake_phase = HandshakePhase::Init2Received;
 
-                let _ = self.socket.send_to(&resp.into_vec(), peer).await;
+                let _ = self.send_udp(&resp.into_vec(), peer).await;
             }
             C2SInitData::Init4 { y, command, .. } => {
                 info!("Handshake Init4 from {}", peer);
@@ -1369,7 +1661,7 @@ impl Server {
                 pkt.mac().copy_from_slice(&mac);
                 pkt.data_mut().extend_from_slice(&payload);
 
-                let _ = self.socket.send_to(&pkt.into_vec(), peer).await;
+                let _ = self.send_udp(&pkt.into_vec(), peer).await;
                 info!(
                     "Sent encrypted initivexpand2 to {}, waiting for clientek!",
                     peer
@@ -1434,7 +1726,7 @@ impl Server {
                 // the early one still needs an ACK so it is not retransmitted.
                 let mut ack = OutAck::new(Direction::S2C, p_type, p_id);
                 ack.flags(Flags::UNENCRYPTED);
-                let _ = self.socket.send_to(&ack.into_vec(), peer).await;
+                let _ = self.send_udp(&ack.into_vec(), peer).await;
                 return Ok(());
             }
             if cmd.name == "clientek" {
@@ -1461,7 +1753,7 @@ impl Server {
                 let mut ack = OutAck::new(Direction::S2C, p_type, p_id);
                 ack.flags(Flags::UNENCRYPTED);
                 ack.mac().copy_from_slice(&shared_mac[..8]);
-                let _ = self.socket.send_to(&ack.into_vec(), peer).await;
+                let _ = self.send_udp(&ack.into_vec(), peer).await;
                 info!(
                     "Handshake completed! clientek processed, SharedIV established for client {}",
                     clid
@@ -1490,7 +1782,7 @@ impl Server {
         let mut ack = OutAck::new(Direction::S2C, p_type, p_id);
         ack.flags(Flags::UNENCRYPTED);
         ack.mac().copy_from_slice(&shared_mac);
-        let _ = self.socket.send_to(&ack.into_vec(), peer).await;
+        let _ = self.send_udp(&ack.into_vec(), peer).await;
 
         let flags = in_pkt.header().flags();
         let decrypted_bytes = if flags.contains(Flags::UNENCRYPTED) {
@@ -1984,17 +2276,9 @@ impl Server {
                 } else if let Some(req_ch) = cmd
                     .get("client_default_channel")
                     .or_else(|| cmd.get("default_channel"))
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.trim().is_empty())
                 {
-                    let req_clean = req_ch.strip_prefix('/').unwrap_or(req_ch);
-                    let req_last_part = req_clean.rsplit('/').next().unwrap_or(req_clean);
-                    let matched_ch = db_channels.iter().find(|c| {
-                        c.cid.to_string() == req_ch
-                            || c.name == req_ch
-                            || c.name == req_clean
-                            || c.name == req_last_part
-                    });
-                    if let Some(ch) = matched_ch {
+                    if let Some(ch) = resolve_target_channel(&db_channels, req_ch) {
                         let req_pw = cmd
                             .get("client_default_channel_password")
                             .or_else(|| cmd.get("default_channel_password"))
@@ -2012,13 +2296,28 @@ impl Server {
                             (
                                 jp >= njp,
                                 ch.password_hash.is_empty()
+                                    || req_pw == ch.password_hash
                                     || hash_channel_password(req_pw) == ch.password_hash
                                     || has_pw_bypass,
                             )
                         };
                         if join_power_ok && pw_matches {
                             target_cid = ch.cid;
+                            info!(
+                                "Client {} ({}) entering requested default channel '{}' (cid {})",
+                                clid, uid, ch.name, ch.cid
+                            );
+                        } else {
+                            warn!(
+                                "Client {} ({}) denied entry to default channel '{}' (cid {}): join_power_ok={}, pw_matches={}",
+                                clid, uid, ch.name, ch.cid, join_power_ok, pw_matches
+                            );
                         }
+                    } else {
+                        warn!(
+                            "Client {} ({}) requested unknown default channel: '{}'",
+                            clid, uid, req_ch
+                        );
                     }
                 }
 
@@ -3593,6 +3892,77 @@ impl Server {
                         return Ok(());
                     }
                 }
+
+                let mut err_resp = Command::new("error");
+                err_resp.set("id", "0");
+                err_resp.set("msg", "ok");
+                if let Some(rc) = cmd.get("return_code") {
+                    err_resp.set("return_code", rc);
+                }
+                self.send_encrypted_command(peer, &err_resp).await?;
+            }
+            "serverrequestconnectioninfo" | "serverconnectioninforequest" => {
+                let (caller_cid, caller_uid) = {
+                    let state = self.state.lock().await;
+                    state
+                        .get_client(&peer)
+                        .map(|c| (c.current_channel_id, c.uid.clone()))
+                        .unwrap_or_default()
+                };
+
+                let has_perm = {
+                    let db = self.db.lock().await;
+                    permissions::has_permission(
+                        &db,
+                        &caller_uid,
+                        caller_cid,
+                        "b_virtualserver_connectioninfo_view",
+                    )
+                };
+
+                if !has_perm {
+                    let mut err_resp = Command::new("error");
+                    err_resp.set("id", "2560");
+                    err_resp.set("msg", "insufficient client permissions");
+                    err_resp.set("failed_permid", "26");
+                    if let Some(rc) = cmd.get("return_code") {
+                        err_resp.set("return_code", rc);
+                    }
+                    self.send_encrypted_command(peer, &err_resp).await?;
+                    return Ok(());
+                }
+
+                let (avg_ping, avg_packetloss) = {
+                    let state = self.state.lock().await;
+                    let mut total_ping = 0.0;
+                    let mut ping_count = 0;
+                    let mut total_loss = 0.0;
+                    let mut loss_count = 0;
+
+                    for c in state.clients.values() {
+                        if c.handshake_phase == HandshakePhase::Connected {
+                            if let Some(p_str) = c.connection_stats.get("connection_ping") {
+                                if let Ok(p) = p_str.parse::<f64>() {
+                                    total_ping += p;
+                                    ping_count += 1;
+                                }
+                            }
+                            if let Some(l_str) = c.connection_stats.get("connection_packetloss_total") {
+                                if let Ok(l) = l_str.parse::<f64>() {
+                                    total_loss += l;
+                                    loss_count += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    let ping = if ping_count > 0 { total_ping / ping_count as f64 } else { 0.0 };
+                    let loss = if loss_count > 0 { total_loss / loss_count as f64 } else { 0.0 };
+                    (ping, loss)
+                };
+
+                let notify = build_server_connection_info(&self.stats, avg_ping, avg_packetloss);
+                self.send_encrypted_command(peer, &notify).await?;
 
                 let mut err_resp = Command::new("error");
                 err_resp.set("id", "0");
@@ -5581,6 +5951,10 @@ impl Server {
                         && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_with_needed_talk_power")
                     {
                         (false, Some(104))
+                    } else if cmd.get("channel_flag_default") == Some("1")
+                        && !permissions::has_permission(&db, &invoker_uid, 0, "b_channel_create_with_default")
+                    {
+                        (false, Some(103))
                     } else {
                         (true, None)
                     }
@@ -5764,9 +6138,11 @@ impl Server {
                                     err_resp.set("failed_permid", fpid);
                                 }
                             } else {
-                                let result = {
+                                let (prev_channels, result) = {
                                     let db = self.db.lock().await;
-                                    db.edit_channel(target_cid, &edit)
+                                    let prev = db.get_channels().unwrap_or_default();
+                                    let res = db.edit_channel(target_cid, &edit);
+                                    (prev, res)
                                 };
                                 match result {
                                     Ok(Some(channel)) => {
@@ -5792,6 +6168,42 @@ impl Server {
                                             let _ =
                                                 self.send_encrypted_command(*recipient, &notify).await;
                                         }
+
+                                        // If default channel status changed, notify other channels whose default flag flipped
+                                        if edit.is_default.is_some() {
+                                            let updated_channels = {
+                                                let db = self.db.lock().await;
+                                                db.get_channels().unwrap_or_default()
+                                            };
+                                            for updated_ch in &updated_channels {
+                                                if updated_ch.cid != target_cid {
+                                                    let prev_is_def = prev_channels
+                                                        .iter()
+                                                        .find(|c| c.cid == updated_ch.cid)
+                                                        .map(|c| c.is_default)
+                                                        .unwrap_or(false);
+                                                    if prev_is_def != updated_ch.is_default {
+                                                        let mut other_notify = Command::new("notifychanneledited");
+                                                        other_notify.set("cid", updated_ch.cid.to_string());
+                                                        other_notify.set("cpid", "0");
+                                                        other_notify.set("reasonid", "10");
+                                                        other_notify.set("invokerid", clid.to_string());
+                                                        other_notify.set("invokername", &nickname);
+                                                        other_notify.set("invokeruid", &uid);
+                                                        other_notify.set(
+                                                            "channel_flag_default",
+                                                            bool_wire(updated_ch.is_default),
+                                                        );
+                                                        for recipient in &recipients {
+                                                            let _ = self
+                                                                .send_encrypted_command(*recipient, &other_notify)
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         if edit.password.is_some() {
                                             let mut pw_notify = Command::new("notifychannelpasswordchanged");
                                             pw_notify.set("cid", target_cid.to_string());
@@ -7910,7 +8322,7 @@ impl Server {
                 out.extend_from_slice(&p_id.to_be_bytes());
                 out.push(PacketType::Voice as u8);
                 out.extend_from_slice(&body);
-                let _ = self.socket.send_to(&out, recipient).await;
+                let _ = self.send_udp(&out, recipient).await;
             } else {
                 let mut out = Vec::with_capacity(11 + 5 + audio_data.len());
                 out.extend_from_slice(&shared_mac);
@@ -7920,7 +8332,7 @@ impl Server {
                 out.extend_from_slice(&clid.to_be_bytes());
                 out.push(codec);
                 out.extend_from_slice(audio_data);
-                let _ = self.socket.send_to(&out, recipient).await;
+                let _ = self.send_udp(&out, recipient).await;
             }
         }
 
@@ -8219,7 +8631,7 @@ impl Server {
             pkt.mac().copy_from_slice(&mac);
             pkt.data_mut().extend_from_slice(&payload);
 
-            let res = self.socket.send_to(&pkt.into_vec(), peer).await;
+            let res = self.send_udp(&pkt.into_vec(), peer).await;
             let cmd_name = wire_str.split_whitespace().next().unwrap_or("");
             info!(
                 "Sent encrypted {:?} command '{}' (p_id: {}) to {}: {:?}",
@@ -8278,7 +8690,7 @@ impl Server {
                 pkt.mac().copy_from_slice(&mac);
                 pkt.data_mut().extend_from_slice(&payload);
 
-                let res = self.socket.send_to(&pkt.into_vec(), peer).await;
+                let res = self.send_udp(&pkt.into_vec(), peer).await;
                 info!(
                     "Sent fragment {}/{} of encrypted command '{}' (p_id: {}) to {}: {:?}",
                     idx + 1,
@@ -8390,5 +8802,120 @@ mod tests {
         let (text, consumed) = try_assemble_next(&mut pending, 1).expect("complete command");
         assert_eq!(consumed, 1);
         assert_eq!(text, "setconnectioninfo connection_ping=12.3456");
+    }
+
+    #[test]
+    fn test_resolve_target_channel() {
+        let channels = vec![
+            ChannelRecord {
+                cid: 1,
+                name: "Default Channel".to_string(),
+                topic: String::new(),
+                order_id: 0,
+                is_default: true,
+                description: String::new(),
+                is_permanent: true,
+                is_semi_permanent: false,
+                codec: 4,
+                codec_quality: 7,
+                max_clients: -1,
+                max_family_clients: -1,
+                needed_talk_power: 0,
+                needed_subscribe_power: 0,
+                codec_latency_factor: 1,
+                delete_delay: 0,
+                max_clients_unlimited: true,
+                max_family_clients_unlimited: true,
+                max_family_clients_inherited: false,
+                name_phonetic: String::new(),
+                icon_id: 0,
+                password_hash: String::new(),
+                codec_is_unencrypted: true,
+            },
+            ChannelRecord {
+                cid: 2,
+                name: "TestingRoom".to_string(),
+                topic: String::new(),
+                order_id: 1,
+                is_default: false,
+                description: String::new(),
+                is_permanent: true,
+                is_semi_permanent: false,
+                codec: 4,
+                codec_quality: 7,
+                max_clients: -1,
+                max_family_clients: -1,
+                needed_talk_power: 0,
+                needed_subscribe_power: 0,
+                codec_latency_factor: 1,
+                delete_delay: 0,
+                max_clients_unlimited: true,
+                max_family_clients_unlimited: true,
+                max_family_clients_inherited: false,
+                name_phonetic: String::new(),
+                icon_id: 0,
+                password_hash: String::new(),
+                codec_is_unencrypted: true,
+            },
+            ChannelRecord {
+                cid: 3,
+                name: "Gaming Lounge".to_string(),
+                topic: String::new(),
+                order_id: 2,
+                is_default: false,
+                description: String::new(),
+                is_permanent: true,
+                is_semi_permanent: false,
+                codec: 4,
+                codec_quality: 7,
+                max_clients: -1,
+                max_family_clients: -1,
+                needed_talk_power: 0,
+                needed_subscribe_power: 0,
+                codec_latency_factor: 1,
+                delete_delay: 0,
+                max_clients_unlimited: true,
+                max_family_clients_unlimited: true,
+                max_family_clients_inherited: false,
+                name_phonetic: String::new(),
+                icon_id: 0,
+                password_hash: String::new(),
+                codec_is_unencrypted: true,
+            },
+        ];
+
+        // 1. Exact & case-insensitive matching
+        assert_eq!(resolve_target_channel(&channels, "TestingRoom").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "testingroom").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "TESTINGROOM").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "tEsTiNgRoOm").map(|c| c.cid), Some(2));
+
+        // 2. Path variations with leading/trailing slashes
+        assert_eq!(resolve_target_channel(&channels, "/TestingRoom").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "/testingroom").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "TestingRoom/").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "/TestingRoom/").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "Lobby/TestingRoom").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "/Lobby/TestingRoom/").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "/Default Channel/TestingRoom").map(|c| c.cid), Some(2));
+
+        // 3. Numeric CID forms
+        assert_eq!(resolve_target_channel(&channels, "2").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "/2").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "#2").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "cid:2").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "id:2").map(|c| c.cid), Some(2));
+
+        // 4. Wire-escaped, quoted, and percent-encoded forms
+        assert_eq!(resolve_target_channel(&channels, r"Gaming\sLounge").map(|c| c.cid), Some(3));
+        assert_eq!(resolve_target_channel(&channels, "Gaming%20Lounge").map(|c| c.cid), Some(3));
+        assert_eq!(resolve_target_channel(&channels, "\"TestingRoom\"").map(|c| c.cid), Some(2));
+        assert_eq!(resolve_target_channel(&channels, "  testingroom  ").map(|c| c.cid), Some(2));
+
+        // 5. Unknown, invalid, and empty strings
+        assert!(resolve_target_channel(&channels, "NonExistent").is_none());
+        assert!(resolve_target_channel(&channels, "").is_none());
+        assert!(resolve_target_channel(&channels, "   ").is_none());
+        assert!(resolve_target_channel(&channels, "///").is_none());
     }
 }
