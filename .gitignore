@@ -2,3 +2,5 @@
 *.db
 /scratch
 *.log
+/.agents
+/docs
