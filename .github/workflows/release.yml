@@ -6,6 +6,7 @@ on:
       - main
     tags:
       - 'v*'
+      - '[0-9]*'
   pull_request:
     branches:
       - main
@@ -115,27 +116,12 @@ jobs:
             chmod +x "dist/nano-ts3-linux-aarch64-musl"
           fi
 
-          if [ -f "target/${{ matrix.target }}/release/dump_cmd" ]; then
-            cp "target/${{ matrix.target }}/release/dump_cmd" "dist/dump_cmd-${{ matrix.name }}"
-            chmod +x "dist/dump_cmd-${{ matrix.name }}"
-          fi
-          if [ -f "target/${{ matrix.target }}/release/test_cmds" ]; then
-            cp "target/${{ matrix.target }}/release/test_cmds" "dist/test_cmds-${{ matrix.name }}"
-            chmod +x "dist/test_cmds-${{ matrix.name }}"
-          fi
-
       - name: Prepare Windows standalone raw binaries (.exe)
         if: matrix.platform_type == 'windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
           Copy-Item "target/${{ matrix.target }}/release/nano-ts3.exe" "dist/nano-ts3-${{ matrix.name }}.exe"
-          if (Test-Path "target/${{ matrix.target }}/release/dump_cmd.exe") {
-            Copy-Item "target/${{ matrix.target }}/release/dump_cmd.exe" "dist/dump_cmd-${{ matrix.name }}.exe"
-          }
-          if (Test-Path "target/${{ matrix.target }}/release/test_cmds.exe") {
-            Copy-Item "target/${{ matrix.target }}/release/test_cmds.exe" "dist/test_cmds-${{ matrix.name }}.exe"
-          }
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4

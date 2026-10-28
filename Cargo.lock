@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "nano-ts3"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "aes",
  "base64 0.22.1",

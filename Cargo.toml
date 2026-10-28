@@ -1,6 +1,6 @@
 [package]
 name = "nano-ts3"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 
 [dependencies]
@@ -23,9 +23,5 @@ curve25519-dalek = { version = "4", default-features = false, features = ["alloc
 quicklz = "0.3.1"
 
 [[bin]]
-name = "dump_cmd"
-path = "src/bin/dump_cmd.rs"
-
-[[bin]]
-name = "test_cmds"
-path = "src/bin/test_cmds.rs"
+name = "nano-ts3"
+path = "src/main.rs"
